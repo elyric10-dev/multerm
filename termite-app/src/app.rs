@@ -8,9 +8,9 @@ use termite_ui::pane_layout::Rect;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
-    keyboard::ModifiersState,
+    keyboard::{Key, ModifiersState},
     window::{Window, WindowId},
 };
 
@@ -19,6 +19,21 @@ use crate::user_event::UserEvent;
 const FONT_SIZE: f32 = 15.0;
 const WINDOW_W:  f64 = 900.0;
 const WINDOW_H:  f64 = 600.0;
+const MAX_PANES: usize = 4;
+const DIVIDER_GRAB_RADIUS: f32 = 8.0;
+const SPLIT_MIN_RATIO: f32 = 0.2;
+const SPLIT_MAX_RATIO: f32 = 0.8;
+
+struct PaneRuntime {
+    session: TerminalSession,
+    pty: termite_core::PtyHandle,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DragDivider {
+    Vertical,
+    Horizontal,
+}
 
 pub struct TermiteApp {
     // Event loop proxy for waking from PTY thread
@@ -30,9 +45,13 @@ pub struct TermiteApp {
     compositor:  Option<Compositor>,
     atlas:       Option<GlyphAtlas>,
 
-    // Terminal
-    session:     Option<TerminalSession>,
-    pty:         Option<termite_core::PtyHandle>,
+    // Terminal panes
+    panes:       Vec<PaneRuntime>,
+    active_pane: usize,
+    split_x:     f32,
+    split_y:     f32,
+    dragging:    Option<DragDivider>,
+    cursor_pos:  (f32, f32),
 
     // Keyboard modifier state
     mods:        ModifiersState,
@@ -46,8 +65,12 @@ impl TermiteApp {
             gpu:        None,
             compositor: None,
             atlas:      None,
-            session:    None,
-            pty:        None,
+            panes:      Vec::new(),
+            active_pane: 0,
+            split_x:    0.5,
+            split_y:    0.5,
+            dragging:   None,
+            cursor_pos: (0.0, 0.0),
             mods:       ModifiersState::empty(),
         }
     }
@@ -67,6 +90,109 @@ impl TermiteApp {
         let cols = (gpu.surface_config.width  as f32 / cw).max(1.0) as usize;
         let rows = (gpu.surface_config.height as f32 / ch).max(1.0) as usize;
         (rows, cols)
+    }
+
+    fn spawn_pane(&self, rows: usize, cols: usize) -> PaneRuntime {
+        let (tx, rx) = unbounded::<Vec<u8>>();
+        let proxy = self.proxy.clone();
+        let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(move || {
+            let _ = proxy.send_event(UserEvent::PtyData);
+        });
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let pty = spawn_pty(
+            &shell,
+            rows as u16,
+            cols as u16,
+            tx,
+            wake_up,
+        ).expect("spawn_pty");
+        let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
+        PaneRuntime { session, pty }
+    }
+
+    fn pane_layout(&self) -> Vec<Rect> {
+        let gpu = match &self.gpu {
+            Some(gpu) => gpu,
+            None => return Vec::new(),
+        };
+        let width = gpu.surface_config.width as f32;
+        let height = gpu.surface_config.height as f32;
+
+        match self.panes.len() {
+            0 => Vec::new(),
+            1 => vec![Rect::new(0.0, 0.0, width, height)],
+            2 => {
+                let left_w = width * self.split_x;
+                vec![
+                    Rect::new(0.0, 0.0, left_w, height),
+                    Rect::new(left_w, 0.0, width - left_w, height),
+                ]
+            }
+            _ => {
+                let left_w = width * self.split_x;
+                let top_h = height * self.split_y;
+                vec![
+                    Rect::new(0.0, 0.0, left_w, top_h),
+                    Rect::new(left_w, 0.0, width - left_w, top_h),
+                    Rect::new(0.0, top_h, left_w, height - top_h),
+                    Rect::new(left_w, top_h, width - left_w, height - top_h),
+                ]
+            }
+        }
+    }
+
+    fn resize_panes_to_layout(&mut self) {
+        let Some(atlas) = &self.atlas else { return; };
+        let pane_rects = self.pane_layout();
+        let cell_w = atlas.cell_width().max(1.0);
+        let cell_h = atlas.cell_height().max(1.0);
+
+        for (pane, rect) in self.panes.iter_mut().zip(pane_rects.iter()) {
+            let cols = (rect.w / cell_w).max(1.0) as usize;
+            let rows = (rect.h / cell_h).max(1.0) as usize;
+            pane.session.parser.resize(rows, cols);
+            let _ = pane.pty.resize(rows as u16, cols as u16);
+        }
+    }
+
+    fn add_new_terminal(&mut self) {
+        if self.panes.len() >= MAX_PANES {
+            return;
+        }
+        self.panes.push(self.spawn_pane(24, 80));
+        self.active_pane = self.panes.len().saturating_sub(1);
+        self.resize_panes_to_layout();
+    }
+
+    fn pane_index_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.pane_layout()
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| {
+                x >= rect.x && y >= rect.y && x <= rect.x + rect.w && y <= rect.y + rect.h
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    fn divider_hit_test(&self, x: f32, y: f32) -> Option<DragDivider> {
+        let gpu = self.gpu.as_ref()?;
+        let width = gpu.surface_config.width as f32;
+        let height = gpu.surface_config.height as f32;
+
+        if self.panes.len() >= 2 {
+            let split_x_px = width * self.split_x;
+            if (x - split_x_px).abs() <= DIVIDER_GRAB_RADIUS {
+                return Some(DragDivider::Vertical);
+            }
+        }
+        if self.panes.len() >= 3 {
+            let split_y_px = height * self.split_y;
+            if (y - split_y_px).abs() <= DIVIDER_GRAB_RADIUS {
+                return Some(DragDivider::Horizontal);
+            }
+        }
+        None
     }
 }
 
@@ -93,8 +219,6 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         // ── Compositor ────────────────────────────────────────────────────────
         let compositor = Compositor::new(&gpu, &atlas).expect("Compositor::new");
 
-        // ── PTY ───────────────────────────────────────────────────────────────
-        let (tx, rx) = unbounded::<Vec<u8>>();
         let (rows, cols) = {
             let cw = atlas.cell_width().max(1.0);
             let ch = atlas.cell_height().max(1.0);
@@ -103,27 +227,11 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
             ((h / ch).max(1.0) as usize, (w / cw).max(1.0) as usize)
         };
 
-        let proxy = self.proxy.clone();
-        let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(move || {
-            let _ = proxy.send_event(UserEvent::PtyData);
-        });
-
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let pty = spawn_pty(
-            &shell,
-            rows as u16,
-            cols as u16,
-            tx,
-            wake_up,
-        ).expect("spawn_pty");
-
-        let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
-
         self.gpu        = Some(gpu);
         self.atlas      = Some(atlas);
         self.compositor = Some(compositor);
-        self.session    = Some(session);
-        self.pty        = Some(pty);
+        self.panes      = vec![self.spawn_pane(rows, cols)];
+        self.active_pane = 0;
 
         tracing::info!("TermITE started — {}×{} cells", cols, rows);
     }
@@ -142,18 +250,8 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
             WindowEvent::Resized(size) => {
                 if let (Some(gpu), Some(atlas)) = (&mut self.gpu, &mut self.atlas) {
                     gpu.resize(size.width, size.height);
-                    let (rows, cols) = {
-                        let cw = atlas.cell_width().max(1.0);
-                        let ch = atlas.cell_height().max(1.0);
-                        ((size.height as f32 / ch).max(1.0) as usize,
-                         (size.width  as f32 / cw).max(1.0) as usize)
-                    };
-                    if let Some(s) = &mut self.session {
-                        s.parser.resize(rows, cols);
-                    }
-                    if let Some(p) = &self.pty {
-                        let _ = p.resize(rows as u16, cols as u16);
-                    }
+                    let _ = atlas;
+                    self.resize_panes_to_layout();
                 }
             }
 
@@ -162,21 +260,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
                 if let Some(atlas) = &mut self.atlas {
                     atlas.set_raster_scale(scale);
                 }
-                // Re-do resize with new cell sizes
-                if let (Some(gpu), Some(atlas)) = (&self.gpu, &self.atlas) {
-                    let cw = atlas.cell_width().max(1.0);
-                    let ch = atlas.cell_height().max(1.0);
-                    let w  = gpu.surface_config.width  as f32;
-                    let h  = gpu.surface_config.height as f32;
-                    let rows = (h / ch).max(1.0) as usize;
-                    let cols = (w / cw).max(1.0) as usize;
-                    if let Some(s) = &mut self.session {
-                        s.parser.resize(rows, cols);
-                    }
-                    if let Some(p) = &self.pty {
-                        let _ = p.resize(rows as u16, cols as u16);
-                    }
-                }
+                self.resize_panes_to_layout();
             }
 
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -185,6 +269,47 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_keyboard(event);
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x as f32, position.y as f32);
+                if let Some(active_drag) = self.dragging {
+                    if let Some(gpu) = &self.gpu {
+                        let width = gpu.surface_config.width as f32;
+                        let height = gpu.surface_config.height as f32;
+                        match active_drag {
+                            DragDivider::Vertical => {
+                                self.split_x = (self.cursor_pos.0 / width)
+                                    .clamp(SPLIT_MIN_RATIO, SPLIT_MAX_RATIO);
+                            }
+                            DragDivider::Horizontal => {
+                                self.split_y = (self.cursor_pos.1 / height)
+                                    .clamp(SPLIT_MIN_RATIO, SPLIT_MAX_RATIO);
+                            }
+                        }
+                        self.resize_panes_to_layout();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    if let Some(divider) =
+                        self.divider_hit_test(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        self.dragging = Some(divider);
+                    } else if let Some(idx) =
+                        self.pane_index_at(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        self.active_pane = idx;
+                    }
+                }
+                if button == MouseButton::Left && state == ElementState::Released {
+                    self.dragging = None;
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -198,8 +323,8 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData => {
-                if let Some(session) = &mut self.session {
-                    session.drain_and_parse();
+                for pane in &mut self.panes {
+                    pane.session.drain_and_parse();
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -213,42 +338,60 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
 
 impl TermiteApp {
     fn handle_keyboard(&mut self, event: KeyEvent) {
+        if event.state == ElementState::Pressed {
+            let is_new_terminal_shortcut =
+                matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("n"))
+                    && self.mods.shift_key()
+                    && (self.mods.control_key() || self.mods.super_key());
+            if is_new_terminal_shortcut {
+                self.add_new_terminal();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+        }
+
         let app_cursor = self
-            .session
-            .as_ref()
-            .map(|s| s.parser.app_cursor_keys())
+            .panes
+            .get(self.active_pane)
+            .map(|p| p.session.parser.app_cursor_keys())
             .unwrap_or(false);
 
         if let Some(bytes) = key_to_bytes(&event, self.mods, app_cursor) {
             if !bytes.is_empty() {
-                if let Some(pty) = &self.pty {
-                    let _ = pty.write_all(&bytes);
+                if let Some(pane) = self.panes.get(self.active_pane) {
+                    let _ = pane.pty.write_all(&bytes);
                 }
             }
         }
     }
 
     fn redraw(&mut self) {
-        let (gpu, atlas, compositor, session, window) = match (
+        let pane_rects = self.pane_layout();
+        if pane_rects.is_empty() || self.panes.is_empty() {
+            return;
+        }
+
+        let (gpu, atlas, compositor, window) = match (
             &self.gpu,
             &mut self.atlas,
             &mut self.compositor,
-            &self.session,
             &self.window,
         ) {
-            (Some(g), Some(a), Some(c), Some(s), Some(w)) => (g, a, c, s, w),
+            (Some(g), Some(a), Some(c), Some(w)) => (g, a, c, w),
             _ => return,
         };
 
         let scale = window.scale_factor() as f32;
-        let rect  = Rect::new(
-            0.0, 0.0,
-            gpu.surface_config.width  as f32,
-            gpu.surface_config.height as f32,
-        );
+        let pane_grids: Vec<([f32; 4], &termite_vt::TerminalGrid)> = self
+            .panes
+            .iter()
+            .zip(pane_rects.iter())
+            .map(|(pane, rect)| (rect.as_array(), pane.session.parser.grid()))
+            .collect();
 
-        let grid = session.parser.grid();
-        if let Err(e) = compositor.render_terminal_frame(gpu, atlas, scale, rect.as_array(), grid) {
+        if let Err(e) = compositor.render_terminal_panes(gpu, atlas, scale, &pane_grids) {
             tracing::error!("render error: {e}");
         }
     }

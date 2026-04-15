@@ -240,6 +240,20 @@ impl Compositor {
         rect_px: [f32; 4],
         grid: &TerminalGrid,
     ) -> anyhow::Result<()> {
+        self.render_terminal_panes(gpu, atlas, scale, &[(rect_px, grid)])
+    }
+
+    /// Render multiple terminal panes in one frame.
+    pub fn render_terminal_panes(
+        &mut self,
+        gpu: &GpuContext,
+        atlas: &mut GlyphAtlas,
+        scale: f32,
+        panes: &[([f32; 4], &TerminalGrid)],
+    ) -> anyhow::Result<()> {
+        if panes.is_empty() {
+            return Ok(());
+        }
         // Update atlas scale
         atlas.set_raster_scale(scale);
 
@@ -253,59 +267,61 @@ impl Compositor {
         let cell_w = atlas.cell_width();
         let cell_h = atlas.cell_height();
 
-        let origin_x = rect_px[0];
-        let origin_y = rect_px[1];
-
         let raster_scale_key = (scale * 100.0) as u32;
 
         // ── Build instance lists ──────────────────────────────────────────────
-        let mut bg_insts:    Vec<BgQuadInstance> = Vec::with_capacity(grid.rows * grid.cols);
-        let mut glyph_insts: Vec<GlyphInstance>  = Vec::with_capacity(grid.rows * grid.cols);
+        let mut bg_insts:    Vec<BgQuadInstance> = Vec::new();
+        let mut glyph_insts: Vec<GlyphInstance>  = Vec::new();
 
-        for row in 0..grid.rows {
-            for col in 0..grid.cols {
-                let cell = grid.cell(row, col);
+        for (rect_px, grid) in panes.iter() {
+            let origin_x = rect_px[0];
+            let origin_y = rect_px[1];
 
-                // Skip trailing half of wide chars (renderer draws from leading half)
-                if cell.wide == WideKind::Trailing {
-                    continue;
-                }
+            for row in 0..grid.rows {
+                for col in 0..grid.cols {
+                    let cell = grid.cell(row, col);
 
-                let px = origin_x + col as f32 * cell_w;
-                let py = origin_y + row as f32 * cell_h;
-                let gw = if cell.wide == WideKind::Leading { cell_w * 2.0 } else { cell_w };
+                    // Skip trailing half of wide chars (renderer draws from leading half)
+                    if cell.wide == WideKind::Trailing {
+                        continue;
+                    }
 
-                // Background
-                let bg_color = color_to_linear(cell.bg, false);
-                // Only emit a bg quad if it differs from the surface clear color
-                // (optimisation: skip default-bg cells that match the clear)
-                bg_insts.push(BgQuadInstance {
-                    rect:  [px, py, gw, cell_h],
-                    color: bg_color,
-                });
+                    let px = origin_x + col as f32 * cell_w;
+                    let py = origin_y + row as f32 * cell_h;
+                    let gw = if cell.wide == WideKind::Leading { cell_w * 2.0 } else { cell_w };
 
-                // Glyph — skip space characters (no visible glyph)
-                if cell.ch != ' ' {
-                    let (eff_fg, eff_bg) = if cell.attrs.contains(termite_vt::CellAttrs::REVERSE) {
-                        (color_to_linear(cell.bg, false), color_to_linear(cell.fg, true))
-                    } else {
-                        (color_to_linear(cell.fg, true), color_to_linear(cell.bg, false))
-                    };
-                    let _ = eff_bg; // bg already emitted above
+                    // Background
+                    let bg_color = color_to_linear(cell.bg, false);
+                    // Only emit a bg quad if it differs from the surface clear color
+                    // (optimisation: skip default-bg cells that match the clear)
+                    bg_insts.push(BgQuadInstance {
+                        rect:  [px, py, gw, cell_h],
+                        color: bg_color,
+                    });
 
-                    let key = GlyphKey {
-                        ch:           cell.ch,
-                        bold:         cell.attrs.contains(termite_vt::CellAttrs::BOLD),
-                        italic:       cell.attrs.contains(termite_vt::CellAttrs::ITALIC),
-                        raster_scale: raster_scale_key,
-                    };
+                    // Glyph — skip space characters (no visible glyph)
+                    if cell.ch != ' ' {
+                        let (eff_fg, eff_bg) = if cell.attrs.contains(termite_vt::CellAttrs::REVERSE) {
+                            (color_to_linear(cell.bg, false), color_to_linear(cell.fg, true))
+                        } else {
+                            (color_to_linear(cell.fg, true), color_to_linear(cell.bg, false))
+                        };
+                        let _ = eff_bg; // bg already emitted above
 
-                    if let Some(uv) = atlas.get_or_rasterize(gpu, key) {
-                        glyph_insts.push(GlyphInstance {
-                            dest_rect: [px, py, uv.px_w as f32, uv.px_h as f32],
-                            src_rect:  [uv.u, uv.v, uv.uw, uv.vh],
-                            color:     eff_fg,
-                        });
+                        let key = GlyphKey {
+                            ch:           cell.ch,
+                            bold:         cell.attrs.contains(termite_vt::CellAttrs::BOLD),
+                            italic:       cell.attrs.contains(termite_vt::CellAttrs::ITALIC),
+                            raster_scale: raster_scale_key,
+                        };
+
+                        if let Some(uv) = atlas.get_or_rasterize(gpu, key) {
+                            glyph_insts.push(GlyphInstance {
+                                dest_rect: [px, py, uv.px_w as f32, uv.px_h as f32],
+                                src_rect:  [uv.u, uv.v, uv.uw, uv.vh],
+                                color:     eff_fg,
+                            });
+                        }
                     }
                 }
             }
