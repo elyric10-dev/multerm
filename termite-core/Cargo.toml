@@ -1,0 +1,15 @@
+[package]
+name    = "termite-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+termite-vt        = { workspace = true }
+portable-pty      = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot       = { workspace = true }
+uuid              = { workspace = true }
+anyhow            = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+bitflags          = { workspace = true }

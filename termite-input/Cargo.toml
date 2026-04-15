@@ -1,0 +1,9 @@
+[package]
+name    = "termite-input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+termite-core = { workspace = true }
+winit        = { workspace = true }
+anyhow       = { workspace = true }

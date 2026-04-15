@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "termite-app",
+    "termite-core",
+    "termite-vt",
+    "termite-render",
+    "termite-input",
+    "termite-ui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Windowing / GPU
+winit        = { version = "0.30", features = ["rwh_06"] }
+wgpu         = "23.0"
+pollster     = "0.3"
+
+# PTY
+portable-pty = "0.8"
+
+# Text rendering
+cosmic-text  = { version = "0.12", features = ["swash"] }
+
+# VT parsing
+vte          = "0.13"
+
+# Concurrency
+crossbeam-channel = "0.5"
+parking_lot  = "0.12"
+
+# GPU data types
+bytemuck     = { version = "1", features = ["derive"] }
+glam         = "0.29"
+
+# Utilities
+bitflags     = "2"
+uuid         = { version = "1", features = ["v4"] }
+anyhow       = "1"
+thiserror    = "2"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arboard      = "3"
+etagere      = "0.2"
+unicode-width = "0.2"
+
+# Internal crates
+termite-vt     = { path = "termite-vt" }
+termite-core   = { path = "termite-core" }
+termite-render = { path = "termite-render" }
+termite-input  = { path = "termite-input" }
+termite-ui     = { path = "termite-ui" }

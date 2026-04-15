@@ -1,0 +1,19 @@
+[package]
+name    = "termite-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+termite-vt    = { workspace = true }
+wgpu          = { workspace = true }
+winit         = { workspace = true }
+cosmic-text   = { workspace = true }
+bytemuck      = { workspace = true }
+glam          = { workspace = true }
+etagere       = { workspace = true }
+pollster      = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+
+[build-dependencies]

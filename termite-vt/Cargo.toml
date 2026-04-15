@@ -1,0 +1,9 @@
+[package]
+name    = "termite-vt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vte           = { workspace = true }
+bitflags      = { workspace = true }
+unicode-width = { workspace = true }
