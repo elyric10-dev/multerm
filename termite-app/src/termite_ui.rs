@@ -904,7 +904,7 @@ fn new_terminal_context_menu(
         let mut uniform_equal_terminals = app.workspaces[ws_idx].uniform_equal_terminals;
         let mut open_equal_picker = false;
 
-        ui.menu_button("Panel layout  ▾", |ui| {
+        ui.menu_button("Panel layout", |ui| {
             changed |= ui
                 .selectable_value(&mut panel_layout.mode, PanelLayoutMode::Auto, "Auto")
                 .clicked();
@@ -2124,12 +2124,6 @@ impl TermiteUi {
             self.active_workspace_runtime()
                 .and_then(|r| r.active_terminal)
         });
-        let (sync_terminals_to_columns, uniform_equal_terminals) = self
-            .active_workspace_tab()
-            .map(|t| (t.sync_terminals_to_columns, t.uniform_equal_terminals))
-            .unwrap_or((false, false));
-        let honor_cursor_spawn = !(sync_terminals_to_columns || uniform_equal_terminals);
-        let spawn_pos = if honor_cursor_spawn { spawn_pos } else { None };
         let content_bounds = self
             .active_workspace_runtime()
             .map(|r| {
