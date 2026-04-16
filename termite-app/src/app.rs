@@ -17,8 +17,8 @@ use winit::{
 use crate::user_event::UserEvent;
 
 const FONT_SIZE: f32 = 15.0;
-const WINDOW_W:  f64 = 900.0;
-const WINDOW_H:  f64 = 600.0;
+const WINDOW_W: f64 = 900.0;
+const WINDOW_H: f64 = 600.0;
 const MAX_PANES: usize = 4;
 const DIVIDER_GRAB_RADIUS: f32 = 8.0;
 const SPLIT_MIN_RATIO: f32 = 0.2;
@@ -37,41 +37,41 @@ enum DragDivider {
 
 pub struct TermiteApp {
     // Event loop proxy for waking from PTY thread
-    proxy:       EventLoopProxy<UserEvent>,
+    proxy: EventLoopProxy<UserEvent>,
 
     // winit / GPU
-    window:      Option<Arc<Window>>,
-    gpu:         Option<GpuContext>,
-    compositor:  Option<Compositor>,
-    atlas:       Option<GlyphAtlas>,
+    window: Option<Arc<Window>>,
+    gpu: Option<GpuContext>,
+    compositor: Option<Compositor>,
+    atlas: Option<GlyphAtlas>,
 
     // Terminal panes
-    panes:       Vec<PaneRuntime>,
+    panes: Vec<PaneRuntime>,
     active_pane: usize,
-    split_x:     f32,
-    split_y:     f32,
-    dragging:    Option<DragDivider>,
-    cursor_pos:  (f32, f32),
+    split_x: f32,
+    split_y: f32,
+    dragging: Option<DragDivider>,
+    cursor_pos: (f32, f32),
 
     // Keyboard modifier state
-    mods:        ModifiersState,
+    mods: ModifiersState,
 }
 
 impl TermiteApp {
     pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         Self {
             proxy,
-            window:     None,
-            gpu:        None,
+            window: None,
+            gpu: None,
             compositor: None,
-            atlas:      None,
-            panes:      Vec::new(),
+            atlas: None,
+            panes: Vec::new(),
             active_pane: 0,
-            split_x:    0.5,
-            split_y:    0.5,
-            dragging:   None,
+            split_x: 0.5,
+            split_y: 0.5,
+            dragging: None,
             cursor_pos: (0.0, 0.0),
-            mods:       ModifiersState::empty(),
+            mods: ModifiersState::empty(),
         }
     }
 
@@ -79,15 +79,15 @@ impl TermiteApp {
     fn compute_terminal_size(&self) -> (usize, usize) {
         let atlas = match &self.atlas {
             Some(a) => a,
-            None    => return (24, 80),
+            None => return (24, 80),
         };
         let gpu = match &self.gpu {
             Some(g) => g,
-            None    => return (24, 80),
+            None => return (24, 80),
         };
         let cw = atlas.cell_width().max(1.0);
         let ch = atlas.cell_height().max(1.0);
-        let cols = (gpu.surface_config.width  as f32 / cw).max(1.0) as usize;
+        let cols = (gpu.surface_config.width as f32 / cw).max(1.0) as usize;
         let rows = (gpu.surface_config.height as f32 / ch).max(1.0) as usize;
         (rows, cols)
     }
@@ -100,14 +100,8 @@ impl TermiteApp {
         });
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let pty = spawn_pty(
-            &shell,
-            rows as u16,
-            cols as u16,
-            tx,
-            wake_up,
-            None,
-        ).expect("spawn_pty");
+        let pty =
+            spawn_pty(&shell, rows as u16, cols as u16, tx, wake_up, None).expect("spawn_pty");
         let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
         PaneRuntime { session, pty }
     }
@@ -144,7 +138,9 @@ impl TermiteApp {
     }
 
     fn resize_panes_to_layout(&mut self) {
-        let Some(atlas) = &self.atlas else { return; };
+        let Some(atlas) = &self.atlas else {
+            return;
+        };
         let pane_rects = self.pane_layout();
         let cell_w = atlas.cell_width().max(1.0);
         let cell_h = atlas.cell_height().max(1.0);
@@ -204,9 +200,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
             .with_title("TermITE")
             .with_inner_size(LogicalSize::new(WINDOW_W, WINDOW_H));
 
-        let window = Arc::new(
-            event_loop.create_window(attrs).expect("create window")
-        );
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.window = Some(Arc::clone(&window));
 
         // ── GPU context ───────────────────────────────────────────────────────
@@ -223,15 +217,15 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         let (rows, cols) = {
             let cw = atlas.cell_width().max(1.0);
             let ch = atlas.cell_height().max(1.0);
-            let w = gpu.surface_config.width  as f32;
+            let w = gpu.surface_config.width as f32;
             let h = gpu.surface_config.height as f32;
             ((h / ch).max(1.0) as usize, (w / cw).max(1.0) as usize)
         };
 
-        self.gpu        = Some(gpu);
-        self.atlas      = Some(atlas);
+        self.gpu = Some(gpu);
+        self.atlas = Some(atlas);
         self.compositor = Some(compositor);
-        self.panes      = vec![self.spawn_pane(rows, cols)];
+        self.panes = vec![self.spawn_pane(rows, cols)];
         self.active_pane = 0;
 
         tracing::info!("TermITE started — {}×{} cells", cols, rows);
@@ -340,10 +334,9 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
 impl TermiteApp {
     fn handle_keyboard(&mut self, event: KeyEvent) {
         if event.state == ElementState::Pressed {
-            let is_new_terminal_shortcut =
-                matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("n"))
-                    && self.mods.shift_key()
-                    && (self.mods.control_key() || self.mods.super_key());
+            let is_new_terminal_shortcut = matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("n"))
+                && self.mods.shift_key()
+                && (self.mods.control_key() || self.mods.super_key());
             if is_new_terminal_shortcut {
                 self.add_new_terminal();
                 if let Some(window) = &self.window {

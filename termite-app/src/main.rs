@@ -12,8 +12,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let event_loop = EventLoop::<user_event::UserEvent>::with_user_event()
-        .build()?;
+    let event_loop = EventLoop::<user_event::UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let proxy = event_loop.create_proxy();
