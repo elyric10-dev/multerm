@@ -50,6 +50,7 @@ pub fn spawn_pty(
     cols: u16,
     data_tx: Sender<Vec<u8>>,
     wake_up: Box<dyn Fn() + Send + 'static>,
+    working_dir: Option<&str>,
 ) -> anyhow::Result<PtyHandle> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -59,6 +60,9 @@ pub fn spawn_pty(
     // Spawn the shell
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", "xterm-256color");
+    if let Some(dir) = working_dir {
+        cmd.cwd(dir);
+    }
     let _child = pair.slave.spawn_command(cmd).context("spawn_command")?;
 
     // Close slave side in this process after spawn

@@ -106,6 +106,7 @@ impl TermiteApp {
             cols as u16,
             tx,
             wake_up,
+            None,
         ).expect("spawn_pty");
         let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
         PaneRuntime { session, pty }
