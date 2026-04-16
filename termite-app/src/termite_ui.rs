@@ -7,13 +7,23 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::PathBuf,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
+};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+    get_current_pid,
 };
 use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
 use termite_render::color::ansi_indexed_to_rgb;
 use termite_vt::cell::{Cell, CellAttrs, Color, WideKind};
 use termite_vt::TerminalGrid;
+
+mod daemon;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -224,6 +234,8 @@ const STACK_GAP_Y: f32 = 6.0;
 const MAX_WORKSPACE_COLUMNS: usize = 12;
 const TERMINAL_MIN_WIDTH: f32 = 260.0;
 const TERMINAL_MIN_HEIGHT: f32 = 180.0;
+/// CPU and memory readings for the bottom status strip.
+const SYSTEM_STATUS_SAMPLE_INTERVAL: Duration = Duration::from_millis(900);
 const RESIZE_HANDLE_SIZE: f32 = 14.0;
 const RESIZE_EDGE_THICKNESS: f32 = 6.0;
 const RESIZE_CORNER_HOTSPOT: f32 = 20.0;
@@ -236,7 +248,7 @@ const CORNER_GRIP_OUTSET: f32 = 2.0;
 const BR_CURSOR_HOVER_RADIUS: f32 = 14.0;
 
 /// Local-space `(left, right, top, bottom)` of the spawn-preview dashed frame, matching
-/// [`TermiteUi::paint_spawn_flash`] when `area_w` / `area_h` match that call.
+/// [`TermiteUi::paint_spawn_flash`] when `area_w` / `area_h` match that call (`area_h` = full workspace content height).
 fn spawn_flash_stripe_local_edges(
     until: Option<Instant>,
     local_pos: Option<Pos2>,
@@ -410,6 +422,11 @@ fn merge_layout_guide_drag_snaps(
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--daemon") {
+        let _ = daemon::run_daemon();
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 860.0])
@@ -425,18 +442,85 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+// Session daemon protocol frame types (mirrors `termite-app/src/daemon.rs`).
+const FRAME_ATTACH: u8 = 1;
+const FRAME_ATTACH_ERROR: u8 = 2;
+const FRAME_OUTPUT: u8 = 3;
+const FRAME_INPUT: u8 = 4;
+const FRAME_RESIZE: u8 = 5;
+
+enum TerminalBackend {
+    LocalPty { pty: PtyHandle },
+    DaemonPty { writer: Arc<Mutex<TcpStream>> },
+}
+
+impl TerminalBackend {
+    fn write_all(&self, bytes: &[u8]) {
+        match self {
+            TerminalBackend::LocalPty { pty } => {
+                let _ = pty.write_all(bytes);
+            }
+            TerminalBackend::DaemonPty { writer } => {
+                let Ok(mut w) = writer.lock() else {
+                    return;
+                };
+
+                let len = bytes.len() as u32;
+                let mut header = [0u8; 5];
+                header[0] = FRAME_INPUT;
+                header[1..5].copy_from_slice(&len.to_le_bytes());
+
+                let _ = w.write_all(&header);
+                if !bytes.is_empty() {
+                    let _ = w.write_all(bytes);
+                }
+            }
+        }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        match self {
+            TerminalBackend::LocalPty { pty } => {
+                let _ = pty.resize(rows, cols);
+            }
+            TerminalBackend::DaemonPty { writer } => {
+                let Ok(mut w) = writer.lock() else {
+                    return;
+                };
+
+                let mut payload = [0u8; 4];
+                payload[0..2].copy_from_slice(&rows.to_le_bytes());
+                payload[2..4].copy_from_slice(&cols.to_le_bytes());
+
+                let len = payload.len() as u32;
+                let mut header = [0u8; 5];
+                header[0] = FRAME_RESIZE;
+                header[1..5].copy_from_slice(&len.to_le_bytes());
+
+                let _ = w.write_all(&header);
+                let _ = w.write_all(&payload);
+            }
+        }
+    }
+}
+
 struct TerminalPane {
     id: u64,
     title: String,
+    tmux_session: String,
     session: TerminalSession,
-    pty: PtyHandle,
+    backend: TerminalBackend,
     desired_size: Vec2,
     position: Option<Pos2>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TerminalPaneState {
+    #[serde(default)]
+    id: u64,
     title: String,
+    #[serde(default)]
+    tmux_session: Option<String>,
     width: f32,
     height: f32,
     x: Option<f32>,
@@ -446,9 +530,6 @@ struct TerminalPaneState {
 struct TermiteUi {
     ui_theme: UiTheme,
     ui_style: UiStyle,
-    panel_layout: PanelLayout,
-    /// When set, terminal widths track the column stripe width and x snaps to column bands.
-    sync_terminals_to_columns: bool,
     selected_workspace: usize,
     workspaces: Vec<WorkspaceTab>,
     next_workspace_index: usize,
@@ -473,12 +554,23 @@ struct TermiteUi {
     pending_context_terminal: Option<usize>,
     pending_spawn_flash_pos: Option<Pos2>,
     pending_spawn_flash_until: Option<Instant>,
+    /// Live CPU / RAM / load readings (`sysinfo`).
+    system: System,
+    system_last_sample: Instant,
+    /// `Some(true)` => termite panel pinned, `Some(false)` => system panel pinned.
+    usage_panel_pinned_scope: Option<bool>,
+    show_termite_only_status: bool,
+    equal_size_picker_open: bool,
+    equal_size_picker_selection: Option<u64>,
+    equal_size_template_blink_terminal_id: Option<u64>,
+    equal_size_template_blink_started_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct WorkspaceRuntime {
     terminals: Vec<TerminalPane>,
     active_terminal: Option<usize>,
+    equal_size_source_terminal_id: Option<u64>,
 }
 
 struct WorkspaceTab {
@@ -486,6 +578,11 @@ struct WorkspaceTab {
     badge: Option<u8>,
     color_rgba: Option<[u8; 4]>,
     working_dir: String,
+    panel_layout: PanelLayout,
+    /// When set, terminal widths track the column stripe width and x snaps to column bands.
+    sync_terminals_to_columns: bool,
+    /// When set, all terminals share one size in a grid that fills the workspace (overrides column sync).
+    uniform_equal_terminals: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -494,15 +591,21 @@ struct WorkspaceState {
     ui_theme: UiTheme,
     #[serde(default)]
     ui_style: UiStyle,
-    #[serde(default)]
-    panel_layout: PanelLayout,
-    #[serde(default)]
-    sync_terminals_to_columns: bool,
+    // Legacy, pre-workspace-scoped values. Kept for backward compatibility while old
+    // persisted state is being migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_terminals_to_columns: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uniform_equal_terminals: Option<bool>,
     selected_workspace: usize,
     workspaces: Vec<WorkspaceTabState>,
     next_workspace_index: usize,
     #[serde(default)]
     color_history: Vec<[u8; 4]>,
+    #[serde(default)]
+    usage_panel_pinned_scope: Option<bool>,
+    #[serde(default)]
+    show_termite_only_status: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -511,11 +614,20 @@ struct WorkspaceTabState {
     badge: Option<u8>,
     color_rgba: Option<[u8; 4]>,
     #[serde(default)]
+    panel_layout: PanelLayout,
+    // Workspace-scoped values. If missing (old state), fall back to legacy root fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_terminals_to_columns: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uniform_equal_terminals: Option<bool>,
+    #[serde(default)]
     working_dir: Option<String>,
     #[serde(default)]
     terminal_sessions: Vec<TerminalPaneState>,
     #[serde(default)]
     active_terminal: Option<usize>,
+    #[serde(default)]
+    equal_size_source_terminal_id: Option<u64>,
 }
 
 impl Default for TermiteUi {
@@ -523,8 +635,6 @@ impl Default for TermiteUi {
         if let Some(state) = load_workspace_state() {
             let ui_theme = state.ui_theme;
             let ui_style = state.ui_style;
-            let panel_layout = state.panel_layout.sanitized();
-            let sync_terminals_to_columns = state.sync_terminals_to_columns;
             let theme_palette = ui_theme.palette().with_style(ui_style);
             let tab_states = state.workspaces.clone();
             let workspaces: Vec<WorkspaceTab> = tab_states
@@ -534,6 +644,15 @@ impl Default for TermiteUi {
                     badge: tab.badge,
                     color_rgba: tab.color_rgba,
                     working_dir: tab.working_dir.clone().unwrap_or_else(default_working_dir),
+                    panel_layout: tab.panel_layout.sanitized(),
+                    sync_terminals_to_columns: tab
+                        .sync_terminals_to_columns
+                        .or(state.sync_terminals_to_columns)
+                        .unwrap_or(false),
+                    uniform_equal_terminals: tab
+                        .uniform_equal_terminals
+                        .or(state.uniform_equal_terminals)
+                        .unwrap_or(false),
                 })
                 .collect();
             let next_workspace_index = compute_next_workspace_index(&workspaces);
@@ -541,8 +660,6 @@ impl Default for TermiteUi {
             let mut app = Self {
                 ui_theme,
                 ui_style,
-                panel_layout,
-                sync_terminals_to_columns,
                 selected_workspace: state
                     .selected_workspace
                     .min(workspaces.len().saturating_sub(1)),
@@ -569,6 +686,14 @@ impl Default for TermiteUi {
                 pending_context_terminal: None,
                 pending_spawn_flash_pos: None,
                 pending_spawn_flash_until: None,
+                system: system_status_probe_new(),
+                system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
+                usage_panel_pinned_scope: state.usage_panel_pinned_scope,
+                show_termite_only_status: state.show_termite_only_status,
+                equal_size_picker_open: false,
+                equal_size_picker_selection: None,
+                equal_size_template_blink_terminal_id: None,
+                equal_size_template_blink_started_at: None,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -576,12 +701,18 @@ impl Default for TermiteUi {
                     let working_dir = app.workspaces[idx].working_dir.clone();
                     let mut restored: Vec<TerminalPane> = Vec::new();
                     for pane_state in &saved_tab.terminal_sessions {
+                        let terminal_id = pane_state.id.max(app.next_terminal_id);
+                        let tmux_session = pane_state
+                            .tmux_session
+                            .clone()
+                            .unwrap_or_else(|| tmux_session_name(idx, terminal_id));
                         let mut pane = spawn_terminal_pane(
                             pane_state.title.clone(),
-                            app.next_terminal_id,
+                            terminal_id,
                             &working_dir,
+                            &tmux_session,
                         );
-                        app.next_terminal_id += 1;
+                        app.next_terminal_id = terminal_id + 1;
                         pane.desired_size = Vec2::new(
                             pane_state.width.max(TERMINAL_MIN_WIDTH),
                             pane_state.height.max(TERMINAL_MIN_HEIGHT),
@@ -601,6 +732,7 @@ impl Default for TermiteUi {
                                 None
                             }
                         });
+                        runtime.equal_size_source_terminal_id = saved_tab.equal_size_source_terminal_id;
                     }
                 }
             }
@@ -610,8 +742,6 @@ impl Default for TermiteUi {
         Self {
             ui_theme: UiTheme::default(),
             ui_style: UiStyle::default(),
-            panel_layout: PanelLayout::default(),
-            sync_terminals_to_columns: false,
             selected_workspace: 2,
             workspaces: vec![
                 WorkspaceTab {
@@ -619,30 +749,45 @@ impl Default for TermiteUi {
                     badge: Some(2),
                     color_rgba: None,
                     working_dir: default_working_dir(),
+                    panel_layout: PanelLayout::default(),
+                    sync_terminals_to_columns: false,
+                    uniform_equal_terminals: false,
                 },
                 WorkspaceTab {
                     title: "Workspace 2".to_string(),
                     badge: None,
                     color_rgba: None,
                     working_dir: default_working_dir(),
+                    panel_layout: PanelLayout::default(),
+                    sync_terminals_to_columns: false,
+                    uniform_equal_terminals: false,
                 },
                 WorkspaceTab {
                     title: "Workspace 3".to_string(),
                     badge: Some(11),
                     color_rgba: None,
                     working_dir: default_working_dir(),
+                    panel_layout: PanelLayout::default(),
+                    sync_terminals_to_columns: false,
+                    uniform_equal_terminals: false,
                 },
                 WorkspaceTab {
                     title: "Workspace 4".to_string(),
                     badge: Some(5),
                     color_rgba: None,
                     working_dir: default_working_dir(),
+                    panel_layout: PanelLayout::default(),
+                    sync_terminals_to_columns: false,
+                    uniform_equal_terminals: false,
                 },
                 WorkspaceTab {
                     title: "Workspace 5".to_string(),
                     badge: None,
                     color_rgba: None,
                     working_dir: default_working_dir(),
+                    panel_layout: PanelLayout::default(),
+                    sync_terminals_to_columns: false,
+                    uniform_equal_terminals: false,
                 },
             ],
             next_workspace_index: 6,
@@ -668,8 +813,58 @@ impl Default for TermiteUi {
             pending_context_terminal: None,
             pending_spawn_flash_pos: None,
             pending_spawn_flash_until: None,
+            system: system_status_probe_new(),
+            system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
+            usage_panel_pinned_scope: None,
+            show_termite_only_status: false,
+            equal_size_picker_open: false,
+            equal_size_picker_selection: None,
+            equal_size_template_blink_terminal_id: None,
+            equal_size_template_blink_started_at: None,
         }
     }
+}
+
+fn system_status_probe_new() -> System {
+    System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything()),
+    )
+}
+
+fn format_gib(n: u64) -> String {
+    format!("{:.1} GiB", n as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn usage_meter_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    ratio: f32,
+    value_text: String,
+    fill: Color32,
+    p: UiPalette,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .size(10.0)
+                .family(FontFamily::Monospace)
+                .color(p.muted),
+        );
+        ui.add(
+            egui::ProgressBar::new(ratio)
+                .desired_width(126.0)
+                .fill(fill)
+                .show_percentage(),
+        );
+        ui.label(
+            RichText::new(value_text)
+                .size(10.0)
+                .family(FontFamily::Monospace)
+                .color(p.text),
+        );
+    });
 }
 
 fn new_terminal_context_menu(
@@ -677,6 +872,7 @@ fn new_terminal_context_menu(
     app: &mut TermiteUi,
     target_terminal: Option<usize>,
 ) {
+    let mut changed = false;
     if ui.button("New Terminal").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
@@ -700,6 +896,77 @@ fn new_terminal_context_menu(
         app.pending_context_terminal = None;
         ui.close();
     }
+    ui.separator();
+    if app.active_workspace_tab_mut().is_some() {
+        let mut panel_layout = app.active_panel_layout();
+        let ws_idx = app.selected_workspace.min(app.workspaces.len().saturating_sub(1));
+        let mut sync_terminals_to_columns = app.workspaces[ws_idx].sync_terminals_to_columns;
+        let mut uniform_equal_terminals = app.workspaces[ws_idx].uniform_equal_terminals;
+        let mut open_equal_picker = false;
+
+        ui.menu_button("Panel layout  ▾", |ui| {
+            changed |= ui
+                .selectable_value(&mut panel_layout.mode, PanelLayoutMode::Auto, "Auto")
+                .clicked();
+            ui.horizontal(|ui| {
+                let fixed_selected = panel_layout.mode == PanelLayoutMode::Fixed;
+                if ui.selectable_label(fixed_selected, "Fixed").clicked() {
+                    panel_layout.mode = PanelLayoutMode::Fixed;
+                    changed = true;
+                };
+                let mut c = panel_layout.cols as i32;
+                let resp = ui.add(
+                    egui::DragValue::new(&mut c)
+                        .range(1..=MAX_WORKSPACE_COLUMNS as i32)
+                        .speed(0.15)
+                        .fixed_decimals(0),
+                );
+                if resp.changed() {
+                    panel_layout.mode = PanelLayoutMode::Fixed;
+                    panel_layout.cols = c.clamp(1, MAX_WORKSPACE_COLUMNS as i32) as u8;
+                    changed = true;
+                }
+            });
+            ui.separator();
+            changed |= ui
+                .checkbox(
+                    &mut sync_terminals_to_columns,
+                    "Sync terminals to columns (auto-fit width)",
+                )
+                .on_hover_text(
+                    "Sets each terminal to the column stripe width, aligns to column starts, and stacks from the top of each column. Pauses while you drag or resize a terminal.",
+                )
+                .changed();
+            let equal_toggle_changed = ui
+                .checkbox(
+                    &mut uniform_equal_terminals,
+                    "Equal-size grid (fit all terminals)",
+                )
+                .on_hover_text(
+                    "Arranges every terminal in a grid with the same width and height, filling the workspace. Pauses while the mouse button is held. Overrides \"Sync terminals to columns\" when both are on.",
+                )
+                .changed();
+            changed |= equal_toggle_changed;
+            if equal_toggle_changed && uniform_equal_terminals {
+                open_equal_picker = true;
+            }
+        });
+
+        if let Some(tab) = app.active_workspace_tab_mut() {
+            tab.panel_layout = panel_layout.sanitized();
+            tab.sync_terminals_to_columns = sync_terminals_to_columns;
+            tab.uniform_equal_terminals = uniform_equal_terminals;
+        }
+        if open_equal_picker {
+            app.open_equal_size_picker_for_active_workspace();
+        } else if !uniform_equal_terminals {
+            app.equal_size_picker_open = false;
+            app.equal_size_picker_selection = None;
+        }
+    }
+    if changed {
+        save_workspace_state(app);
+    }
 }
 
 impl eframe::App for TermiteUi {
@@ -710,6 +977,7 @@ impl eframe::App for TermiteUi {
         self.drain_terminals();
         self.handle_keyboard_input(ctx);
         self.color_picker_rendered_this_frame = false;
+        self.refresh_system_status_if_due();
 
         let p = self.ui_theme.palette().with_style(self.ui_style);
         apply_egui_visuals(ctx, self.ui_theme, p);
@@ -728,6 +996,88 @@ impl eframe::App for TermiteUi {
                 directory_path_bar(ui, self, p);
             });
 
+        egui::TopBottomPanel::bottom("system_status")
+            .resizable(false)
+            .exact_height(30.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(p.path_bar_bg)
+                    .stroke(Stroke::new(1.0, p.path_bar_border))
+                    .inner_margin(Margin::symmetric(10, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let term_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new("Termite")
+                                    .size(11.0)
+                                    .color(p.text),
+                            )
+                            .sense(Sense::hover()),
+                        )
+                        .on_hover_cursor(CursorIcon::Default);
+                        let term_resp = if self.usage_panel_pinned_scope.is_none() {
+                            term_resp.on_hover_ui(|ui| {
+                                self.show_termite_only_status = true;
+                                self.draw_usage_hover_panel(ui, p, true);
+                            })
+                        } else {
+                            term_resp
+                        };
+
+                        let sep_resp = ui.label(RichText::new("|").size(11.0).color(p.muted));
+                        let mut selector_resp = term_resp.union(sep_resp);
+
+                        let sys_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new("System")
+                                    .size(11.0)
+                                    .color(p.text),
+                            )
+                            .sense(Sense::hover()),
+                        )
+                        .on_hover_cursor(CursorIcon::Default);
+                        let sys_resp = if self.usage_panel_pinned_scope.is_none() {
+                            sys_resp.on_hover_ui(|ui| {
+                                self.show_termite_only_status = false;
+                                self.draw_usage_hover_panel(ui, p, false);
+                            })
+                        } else {
+                            sys_resp
+                        };
+                        selector_resp = selector_resp.union(sys_resp);
+
+                        ui.add_space(6.0);
+                        let usage_resp = ui.label(
+                            RichText::new("Usage:")
+                                .size(11.0)
+                                .strong()
+                                .color(p.muted),
+                        );
+                        selector_resp = selector_resp.union(usage_resp);
+                        let _ = selector_resp;
+                    });
+                });
+            });
+
+        if let Some(pinned_scope) = self.usage_panel_pinned_scope {
+            let content = ctx.content_rect();
+            let panel_pos = Pos2::new(content.right() - 318.0, content.bottom() - 184.0);
+            egui::Area::new("usage_panel_pinned".into())
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(p.popover_fill)
+                        .stroke(Stroke::new(1.0, p.path_bar_border))
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            self.draw_usage_hover_panel(ui, p, pinned_scope);
+                        });
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::Frame::default()
                 .fill(p.bg)
@@ -744,6 +1094,10 @@ impl eframe::App for TermiteUi {
                             Sense::click(),
                         );
                         if response.secondary_clicked() {
+                            // Right-clicking clears the template selection highlight.
+                            self.equal_size_picker_selection = None;
+                            self.equal_size_template_blink_terminal_id = None;
+                            self.equal_size_template_blink_started_at = None;
                             if let Some(pointer_pos) = response.interact_pointer_pos() {
                                 let local_pos = pointer_pos - area_rect.min.to_vec2();
                                 self.pending_terminal_spawn_pos = Some(local_pos);
@@ -756,9 +1110,9 @@ impl eframe::App for TermiteUi {
                             }
                         }
                         let target_terminal = self.pending_context_terminal;
-                        response.context_menu(|ui| {
-                            new_terminal_context_menu(ui, self, target_terminal)
-                        });
+                        egui::Popup::context_menu(&response)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| new_terminal_context_menu(ui, self, target_terminal));
                         self.paint_spawn_flash(ui, area_rect.min, viewport, p);
                         let hint = ui.label(
                             RichText::new("Create a workspace tab to start terminals.")
@@ -766,6 +1120,10 @@ impl eframe::App for TermiteUi {
                                 .color(p.muted),
                         );
                         if hint.secondary_clicked() {
+                            // Right-click clears the template selection highlight.
+                            self.equal_size_picker_selection = None;
+                            self.equal_size_template_blink_terminal_id = None;
+                            self.equal_size_template_blink_started_at = None;
                             self.pending_context_terminal = None;
                             if let Some(pointer_pos) = hint.interact_pointer_pos() {
                                 let local_pos = pointer_pos - area_rect.min.to_vec2();
@@ -773,7 +1131,9 @@ impl eframe::App for TermiteUi {
                                 self.trigger_spawn_flash(local_pos);
                             }
                         }
-                        hint.context_menu(|ui| new_terminal_context_menu(ui, self, None));
+                        egui::Popup::context_menu(&hint)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| new_terminal_context_menu(ui, self, None));
                         self.terminal_area_size = viewport;
                         return;
                     };
@@ -796,6 +1156,10 @@ impl eframe::App for TermiteUi {
                                 Sense::click(),
                             );
                             if scroll_bg.secondary_clicked() {
+                                // Right-clicking clears the template selection highlight.
+                                self.equal_size_picker_selection = None;
+                                self.equal_size_template_blink_terminal_id = None;
+                                self.equal_size_template_blink_started_at = None;
                                 if let Some(pointer_pos) = scroll_bg.interact_pointer_pos() {
                                     let local_pos = Pos2::new(
                                         pointer_pos.x - content_origin.x,
@@ -810,25 +1174,35 @@ impl eframe::App for TermiteUi {
                                 }
                             }
                             let target_terminal = self.pending_context_terminal;
-                            scroll_bg.context_menu(|ui| {
-                                new_terminal_context_menu(ui, self, target_terminal)
-                            });
+                            egui::Popup::context_menu(&scroll_bg)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                .show(|ui| new_terminal_context_menu(ui, self, target_terminal));
                             self.paint_spawn_flash(
                                 ui,
                                 content_origin,
-                                Vec2::new(workspace_col_w, viewport.y),
+                                Vec2::new(workspace_col_w, content_h),
                                 p,
                             );
 
+                            let active_layout = self.active_panel_layout();
                             let spawn_flash_edges = spawn_flash_stripe_local_edges(
                                 self.pending_spawn_flash_until,
                                 self.pending_spawn_flash_pos,
                                 workspace_col_w,
-                                viewport.y,
-                                self.panel_layout,
+                                content_h,
+                                active_layout,
                             );
-                            let layout = self.panel_layout;
-                            let sync_terminals_to_columns = self.sync_terminals_to_columns;
+                            let layout = active_layout;
+                            let (sync_terminals_to_columns, uniform_equal_terminals) = self
+                                .active_workspace_tab()
+                                .map(|t| (t.sync_terminals_to_columns, t.uniform_equal_terminals))
+                                .unwrap_or((false, false));
+                            let equal_size_picker_open = self.equal_size_picker_open;
+                            let equal_size_template_blink_terminal_id =
+                                self.equal_size_template_blink_terminal_id;
+                            let equal_size_template_blink_started_at =
+                                self.equal_size_template_blink_started_at;
+                            let equal_size_template_blink_now = Instant::now();
 
                             let Some(runtime) = self.active_workspace_runtime_mut() else {
                                 return;
@@ -851,7 +1225,9 @@ impl eframe::App for TermiteUi {
                                         self.trigger_spawn_flash(local_pos);
                                     }
                                 }
-                                hint.context_menu(|ui| new_terminal_context_menu(ui, self, None));
+                                egui::Popup::context_menu(&hint)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .show(|ui| new_terminal_context_menu(ui, self, None));
                                 return;
                             }
 
@@ -859,17 +1235,41 @@ impl eframe::App for TermiteUi {
                             let mut clicked_on_pane = false;
                             let available_width = content_rect.width();
                             let content_height = content_h;
+                            // Equal grid must not use full `content_h`: `workspace_content_height` adds
+                            // `2 * GRID_SPACING` below the deepest pane, so dividing that height makes the
+                            // grid grow by that padding every frame (slow "animation"). Use body height only.
+                            let uniform_grid_body_h = (content_h - 2.0 * GRID_SPACING)
+                                .max(viewport.y)
+                                .max(TERMINAL_MIN_HEIGHT);
                             let (_, _, n_cols) = column_slot_geometry(available_width, layout);
                             let slot_w = column_stripe_width(available_width, layout);
 
-                            if sync_terminals_to_columns
-                                && !ui.input(|i| i.pointer.any_down())
-                            {
-                                reflow_panes_to_column_starts(
-                                    &mut runtime.terminals,
-                                    available_width,
-                                    layout,
-                                );
+                            let ptr_up = !ui.input(|i| i.pointer.any_down());
+                            if ptr_up {
+                                if uniform_equal_terminals && !equal_size_picker_open {
+                                    let template_size = runtime
+                                        .equal_size_source_terminal_id
+                                        .and_then(|source_id| {
+                                            runtime
+                                                .terminals
+                                                .iter()
+                                                .find(|pane| pane.id == source_id)
+                                                .map(|pane| pane.desired_size)
+                                        });
+                                    reflow_panes_uniform_equal(
+                                        &mut runtime.terminals,
+                                        available_width,
+                                        uniform_grid_body_h,
+                                        layout,
+                                        template_size,
+                                    );
+                                } else if sync_terminals_to_columns {
+                                    reflow_panes_to_column_starts(
+                                        &mut runtime.terminals,
+                                        available_width,
+                                        layout,
+                                    );
+                                }
                             }
 
                             // Next Y for stacking in each column (must use the pane *above*'s height, not row index).
@@ -914,7 +1314,12 @@ impl eframe::App for TermiteUi {
 
                                 let mut pos = pane.position.unwrap_or(Pos2::ZERO);
                                 let max_x = (available_width - pane.desired_size.x).max(0.0);
-                                let max_y = (content_height - pane.desired_size.y).max(0.0);
+                                // `content_height` is captured early in the frame. If a pane is
+                                // spawned lower in this same frame, clamping to that stale value
+                                // pulls it upward and can visually overlap neighbours.
+                                let max_y = (content_height - pane.desired_size.y)
+                                    .max(0.0)
+                                    .max(pos.y);
                                 pos.x = pos.x.clamp(0.0, max_x);
                                 pos.y = pos.y.clamp(0.0, max_y);
                                 pane.position = Some(pos);
@@ -1420,11 +1825,35 @@ impl eframe::App for TermiteUi {
                                 }
 
                                 let is_active = runtime.active_terminal == Some(idx);
-                                let border = if is_active {
-                                    p.terminal_border_active
-                                } else {
-                                    p.border
-                                };
+                                let mut border = if is_active { p.terminal_border_active } else { p.border };
+                                let mut stroke_w: f32 = 2.0;
+                                if let (Some(blink_id), Some(started_at)) = (equal_size_template_blink_terminal_id, equal_size_template_blink_started_at) {
+                                    if pane.id == blink_id && equal_size_picker_open {
+                                        let elapsed = equal_size_template_blink_now.duration_since(started_at);
+                                        // Keep blinking continuously while picker is open.
+                                        stroke_w = 5.0;
+                                        const BLINK_PERIOD_MS: u128 = 550;
+                                        let phase_ms =
+                                            (elapsed.as_millis() % BLINK_PERIOD_MS) as f32;
+                                        let phase = phase_ms / (BLINK_PERIOD_MS as f32);
+                                        // Smooth sine-based fade for a less "jittery" look.
+                                        let intensity = 0.5 + 0.5 * (std::f32::consts::TAU * phase).sin(); // 0..1
+
+                                        let base = p.border;
+                                        let peak = p.terminal_border_active;
+                                        let lerp_u8 = |a: u8, b: u8, t: f32| -> u8 {
+                                            (a as f32 + (b as f32 - a as f32) * t)
+                                                .round()
+                                                .clamp(0.0, 255.0) as u8
+                                        };
+                                        border = Color32::from_rgba_unmultiplied(
+                                            lerp_u8(base.r(), peak.r(), intensity),
+                                            lerp_u8(base.g(), peak.g(), intensity),
+                                            lerp_u8(base.b(), peak.b(), intensity),
+                                            lerp_u8(base.a(), peak.a(), intensity),
+                                        );
+                                    }
+                                }
 
                                 let pane_response = ui.allocate_rect(pane_rect, Sense::click());
                                 ui.scope_builder(
@@ -1432,7 +1861,7 @@ impl eframe::App for TermiteUi {
                                     |ui| {
                                         egui::Frame::default()
                                             .fill(p.term_bg)
-                                            .stroke(Stroke::new(1.0, border))
+                                            .stroke(Stroke::new(stroke_w, border))
                                             .inner_margin(Margin::same(6))
                                             .show(ui, |ui| {
                                                 ui.horizontal(|ui| {
@@ -1493,13 +1922,39 @@ impl eframe::App for TermiteUi {
                                 }
                             }
 
-                            if scroll_bg.clicked() && !clicked_on_pane {
-                                runtime.active_terminal = None;
+                            if scroll_bg.clicked() {
+                                // Clear active terminal only when the click was truly outside all
+                                // pane rectangles (border/title clicks can be ambiguous with the per-pane
+                                // `clicked_on_pane` flag).
+                                if let Some(pointer_pos) = scroll_bg.interact_pointer_pos() {
+                                    let local_pos = Pos2::new(
+                                        pointer_pos.x - content_origin.x,
+                                        pointer_pos.y - content_origin.y,
+                                    );
+                                    let clicked_on_terminal = runtime.terminals.iter().any(|pane| {
+                                        let pos = pane.position.unwrap_or(Pos2::ZERO);
+                                        let rect = egui::Rect::from_min_size(pos, pane.desired_size);
+                                        rect.contains(local_pos)
+                                    });
+                                    if !clicked_on_terminal {
+                                        runtime.active_terminal = None;
+                                    }
+                                } else if !clicked_on_pane {
+                                    runtime.active_terminal = None;
+                                }
                             }
 
                             if let Some(idx) = close_idx {
                                 let was_active = runtime.active_terminal == Some(idx);
+                                let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
                                 runtime.terminals.remove(idx);
+                                if runtime
+                                    .equal_size_source_terminal_id
+                                    .is_some_and(|id| Some(id) == removed_id)
+                                {
+                                    runtime.equal_size_source_terminal_id =
+                                        runtime.terminals.first().map(|pane| pane.id);
+                                }
                                 runtime.active_terminal = if runtime.terminals.is_empty() {
                                     None
                                 } else if was_active {
@@ -1518,6 +1973,7 @@ impl eframe::App for TermiteUi {
                 });
         });
 
+        self.draw_equal_size_picker(ctx, p);
         self.cleanup_stale_color_picker();
     }
 
@@ -1527,9 +1983,139 @@ impl eframe::App for TermiteUi {
 }
 
 impl TermiteUi {
+    fn trigger_equal_size_template_blink(&mut self, terminal_id: u64) {
+        self.equal_size_template_blink_terminal_id = Some(terminal_id);
+        self.equal_size_template_blink_started_at = Some(Instant::now());
+    }
+
+    fn refresh_system_status_if_due(&mut self) {
+        if self.system_last_sample.elapsed() < SYSTEM_STATUS_SAMPLE_INTERVAL {
+            return;
+        }
+        self.system_last_sample = Instant::now();
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory().with_cpu(),
+        );
+    }
+
+    fn draw_usage_hover_panel(&mut self, ui: &mut egui::Ui, p: UiPalette, termite_only: bool) {
+        ui.set_min_width(300.0);
+        ui.label(
+            RichText::new(if termite_only {
+                "Termite process usage"
+            } else {
+                "System usage"
+            })
+            .size(12.0)
+            .strong()
+            .color(p.text),
+        );
+        ui.add_space(4.0);
+
+        if termite_only {
+            let Some(pid) = get_current_pid().ok() else {
+                ui.label(RichText::new("Termite process unavailable").size(11.0).color(p.muted));
+                return;
+            };
+            let Some(proc_) = self.system.process(pid) else {
+                ui.label(RichText::new("Termite process unavailable").size(11.0).color(p.muted));
+                return;
+            };
+
+            let total_mem = self.system.total_memory().max(1);
+            let proc_cpu = proc_.cpu_usage().max(0.0);
+            let proc_ram_ratio = (proc_.memory() as f32 / total_mem as f32).clamp(0.0, 1.0);
+
+            usage_meter_row(
+                ui,
+                "CPU",
+                (proc_cpu / 100.0).clamp(0.0, 1.0),
+                format!("{proc_cpu:.1}%"),
+                Color32::from_rgb(87, 156, 255),
+                p,
+            );
+            usage_meter_row(
+                ui,
+                "RAM",
+                proc_ram_ratio,
+                format!("{} / {}", format_gib(proc_.memory()), format_gib(total_mem)),
+                Color32::from_rgb(91, 189, 122),
+                p,
+            );
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!("PID {}", proc_.pid().as_u32()))
+                    .size(10.0)
+                    .color(p.muted),
+            );
+            ui.separator();
+            let mut pinned_here = self.usage_panel_pinned_scope == Some(true);
+            let pin_resp = ui.checkbox(
+                &mut pinned_here,
+                RichText::new("Always show").size(11.0).color(p.muted),
+            );
+            if pin_resp.changed() {
+                self.usage_panel_pinned_scope = if pinned_here { Some(true) } else { None };
+            }
+            return;
+        }
+
+        let cpu = self.system.global_cpu_usage().max(0.0);
+        let total_mem = self.system.total_memory().max(1);
+        let used_mem = self.system.used_memory();
+        let mem_ratio = (used_mem as f32 / total_mem as f32).clamp(0.0, 1.0);
+        let total_swap = self.system.total_swap();
+        let used_swap = self.system.used_swap();
+        let swap_ratio = if total_swap > 0 {
+            (used_swap as f32 / total_swap as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        usage_meter_row(
+            ui,
+            "CPU",
+            (cpu / 100.0).clamp(0.0, 1.0),
+            format!("{cpu:.0}%"),
+            Color32::from_rgb(87, 156, 255),
+            p,
+        );
+        usage_meter_row(
+            ui,
+            "RAM",
+            mem_ratio,
+            format!("{} / {}", format_gib(used_mem), format_gib(total_mem)),
+            Color32::from_rgb(91, 189, 122),
+            p,
+        );
+        if total_swap > 0 {
+            usage_meter_row(
+                ui,
+                "Swap",
+                swap_ratio,
+                format!("{} / {}", format_gib(used_swap), format_gib(total_swap)),
+                Color32::from_rgb(234, 162, 86),
+                p,
+            );
+        }
+        ui.separator();
+        let mut pinned_here = self.usage_panel_pinned_scope == Some(false);
+        let pin_resp = ui.checkbox(
+            &mut pinned_here,
+            RichText::new("Always show").size(11.0).color(p.muted),
+        );
+        if pin_resp.changed() {
+            self.usage_panel_pinned_scope = if pinned_here { Some(false) } else { None };
+        }
+    }
+
     fn add_terminal(&mut self, spawn_pos: Option<Pos2>, anchor_terminal: Option<usize>) {
         self.ensure_workspace_runtime_slots();
-        let layout = self.panel_layout;
+        let layout = self.active_panel_layout();
         let selected_workspace = self.selected_workspace;
         let area_size = self.terminal_area_size;
         let viewport_h = self.terminal_workspace_viewport.y.max(TERMINAL_MIN_HEIGHT);
@@ -1538,6 +2124,12 @@ impl TermiteUi {
             self.active_workspace_runtime()
                 .and_then(|r| r.active_terminal)
         });
+        let (sync_terminals_to_columns, uniform_equal_terminals) = self
+            .active_workspace_tab()
+            .map(|t| (t.sync_terminals_to_columns, t.uniform_equal_terminals))
+            .unwrap_or((false, false));
+        let honor_cursor_spawn = !(sync_terminals_to_columns || uniform_equal_terminals);
+        let spawn_pos = if honor_cursor_spawn { spawn_pos } else { None };
         let content_bounds = self
             .active_workspace_runtime()
             .map(|r| {
@@ -1564,7 +2156,13 @@ impl TermiteUi {
                 "Workspace {} - Terminal {}",
                 workspace_number, next_title_index
             );
-            let mut pane = spawn_terminal_pane(terminal_title, next_terminal_id, &working_dir);
+            let tmux_session = tmux_session_name(selected_workspace, next_terminal_id);
+            let mut pane = spawn_terminal_pane(
+                terminal_title,
+                next_terminal_id,
+                &working_dir,
+                &tmux_session,
+            );
             let stripe_w = column_stripe_width(area_for_placement.x, layout);
             pane.desired_size.x = if spawn_pos.is_some() {
                 stripe_w
@@ -1579,11 +2177,17 @@ impl TermiteUi {
                 .min(viewport_h.max(TERMINAL_MIN_HEIGHT))
                 .max(TERMINAL_MIN_HEIGHT);
             if let Some(h) = layout.default_pane_height_hint(viewport_h) {
-                default_h = default_h.max(h);
+                // Keep a stable default spawn size; do not upsize to full viewport height.
+                default_h = default_h.min(h.max(TERMINAL_MIN_HEIGHT));
             }
             pane.desired_size.y = default_h;
             let position = if let Some(cursor_pos) = spawn_pos {
-                let col = pick_column_at_x(cursor_pos.x, area_for_placement.x, layout);
+                let col = pick_spawn_column_preferring_empty_slot(
+                    &runtime.terminals,
+                    area_for_placement.x,
+                    cursor_pos.x,
+                    layout,
+                );
                 let default_h = pane.desired_size.y;
                 let first_top = min_y_topmost_in_column(
                     &runtime.terminals,
@@ -1596,11 +2200,21 @@ impl TermiteUi {
                     Some(_) => content_bounds,
                     None => content_bounds,
                 };
+                // Allow context-menu spawns to search below current content so a "full" column can
+                // still append at the bottom instead of being forced back near the top.
+                let spawn_search_area = Vec2::new(
+                    area_for_placement.x,
+                    area_for_placement.y + default_h + STACK_GAP_Y,
+                );
+                let preferred_y = cursor_pos
+                    .y
+                    .clamp(0.0, (spawn_search_area.y - default_h).max(0.0));
                 let preferred_max_h = default_h.min(cap.max(1.0));
                 let (pos, spawn_size) = find_spawn_column_no_overlap(
                     &runtime.terminals,
-                    area_for_placement,
+                    spawn_search_area,
                     col,
+                    preferred_y,
                     preferred_max_h,
                     default_h,
                     layout,
@@ -1626,17 +2240,27 @@ impl TermiteUi {
                         layout,
                     )
                 } else {
-                    find_non_overlapping_position(
+                    let cols = layout.column_count(area_for_placement.x).max(1);
+                    let col = runtime.terminals.len() % cols;
+                    find_non_overlapping_position_in_column(
                         &runtime.terminals,
                         area_for_placement,
                         pane.desired_size,
+                        col,
+                        0.0,
+                        layout,
                     )
                 }
             } else {
-                find_non_overlapping_position(
+                let cols = layout.column_count(area_for_placement.x).max(1);
+                let col = runtime.terminals.len() % cols;
+                find_non_overlapping_position_in_column(
                     &runtime.terminals,
                     area_for_placement,
                     pane.desired_size,
+                    col,
+                    0.0,
+                    layout,
                 )
             };
             pane.position = Some(position);
@@ -1672,7 +2296,7 @@ impl TermiteUi {
             match event {
                 egui::Event::Text(text) => {
                     if !text.is_empty() {
-                        let _ = runtime.terminals[active_idx].pty.write_all(text.as_bytes());
+                        runtime.terminals[active_idx].backend.write_all(text.as_bytes());
                     }
                 }
                 egui::Event::Key {
@@ -1686,7 +2310,7 @@ impl TermiteUi {
                         continue;
                     }
                     if let Some(bytes) = key_to_ansi_bytes(key, modifiers.shift) {
-                        let _ = runtime.terminals[active_idx].pty.write_all(&bytes);
+                        runtime.terminals[active_idx].backend.write_all(&bytes);
                     }
                 }
                 _ => {}
@@ -1722,33 +2346,161 @@ impl TermiteUi {
             .min(runtime.terminals.len().saturating_sub(1));
         runtime.active_terminal = Some(idx);
         let _ = runtime.terminals[idx]
-            .pty
+            .backend
             .write_all(format!("{command}\n").as_bytes());
     }
 }
 
-fn spawn_terminal_pane(title: String, next_terminal_id: u64, working_dir: &str) -> TerminalPane {
+fn read_frame_tcp(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header)?;
+    let frame_type = header[0];
+    let len = u32::from_le_bytes(header[1..5].try_into().expect("len")) as usize;
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut payload)?;
+    }
+    Ok((frame_type, payload))
+}
+
+fn write_frame_tcp(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> std::io::Result<()> {
+    let len = payload.len() as u32;
+    let mut header = [0u8; 5];
+    header[0] = frame_type;
+    header[1..5].copy_from_slice(&len.to_le_bytes());
+    stream.write_all(&header)?;
+    if !payload.is_empty() {
+        stream.write_all(payload)?;
+    }
+    Ok(())
+}
+
+fn connect_daemon() -> Option<TcpStream> {
+    if std::env::var("TERMITE_DAEMON_DISABLED").ok().as_deref() == Some("1") {
+        return None;
+    }
+
+    for _attempt in 0..30 {
+        if let Ok(port_file) = daemon::daemon_port_file_path() {
+            if let Ok(port_s) = fs::read_to_string(&port_file) {
+                if let Ok(port) = port_s.trim().parse::<u16>() {
+                    if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                        return Some(stream);
+                    }
+                }
+            }
+        }
+
+        // Start daemon once if it isn't running yet.
+        if _attempt == 0 {
+            let exe = std::env::current_exe().ok()?;
+            let _ = Command::new(exe)
+                .arg("--daemon")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    None
+}
+
+fn spawn_terminal_pane(
+    title: String,
+    next_terminal_id: u64,
+    working_dir: &str,
+    tmux_session: &str,
+) -> TerminalPane {
     let (tx, rx) = unbounded::<Vec<u8>>();
+
+    // Prefer the built-in daemon so terminal state (e.g. a running Claude session)
+    // survives closing/reopening this UI.
+    if let Some(mut stream) = connect_daemon() {
+        if let Ok(mut reader) = stream.try_clone() {
+            // Attach request payload:
+            // [u16 key_len][key bytes][u16 rows][u16 cols]
+            let key_bytes = tmux_session.as_bytes();
+            if key_bytes.len() <= u16::MAX as usize {
+                let mut payload = Vec::with_capacity(2 + key_bytes.len() + 2 + 2);
+                payload.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+                payload.extend_from_slice(key_bytes);
+                payload.extend_from_slice(&(24u16).to_le_bytes());
+                payload.extend_from_slice(&(80u16).to_le_bytes());
+
+                if write_frame_tcp(&mut stream, FRAME_ATTACH, &payload).is_ok() {
+                    if let Ok((ft, first_payload)) = read_frame_tcp(&mut reader) {
+                        if ft == FRAME_OUTPUT {
+                            let _ = tx.send(first_payload);
+
+                            let writer = Arc::new(Mutex::new(stream));
+                            let tx_thread = tx;
+
+                            std::thread::spawn(move || {
+                                loop {
+                                    let Ok((ft, payload)) = read_frame_tcp(&mut reader) else {
+                                        break;
+                                    };
+                                    if ft == FRAME_OUTPUT {
+                                        let _ = tx_thread.send(payload);
+                                    } else if ft == FRAME_ATTACH_ERROR {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            return TerminalPane {
+                                id: next_terminal_id,
+                                title,
+                                tmux_session: tmux_session.to_string(),
+                                session: TerminalSession::new(PaneId::new(), 24, 80, rx),
+                                backend: TerminalBackend::DaemonPty { writer },
+                                desired_size: Vec2::new(520.0, 280.0),
+                                position: None,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: local PTY (no persistence across restarts).
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(|| {});
-    let pty =
-        spawn_pty(&shell, 24, 80, tx, wake_up, Some(working_dir)).expect("spawn terminal pty");
+    let pty = spawn_pty(
+        &shell,
+        24,
+        80,
+        tx,
+        wake_up,
+        Some(working_dir),
+        None,
+    )
+    .expect("spawn terminal pty");
 
     TerminalPane {
         id: next_terminal_id,
         title,
+        tmux_session: tmux_session.to_string(),
         session: TerminalSession::new(PaneId::new(), 24, 80, rx),
-        pty,
+        backend: TerminalBackend::LocalPty { pty },
         desired_size: Vec2::new(520.0, 280.0),
         position: None,
     }
+}
+
+fn tmux_session_name(workspace_idx: usize, terminal_id: u64) -> String {
+    format!("termite-w{}-t{}", workspace_idx + 1, terminal_id)
 }
 
 fn resize_terminal_for_size(pane: &mut TerminalPane, size: Vec2) {
     let cols = (size.x / CELL_W).max(1.0) as usize;
     let rows = (size.y / CELL_H).max(1.0) as usize;
     pane.session.parser.resize(rows, cols);
-    let _ = pane.pty.resize(rows as u16, cols as u16);
+    pane.backend.resize(rows as u16, cols as u16);
 }
 
 fn paint_br_resize_line(painter: &egui::Painter, grip_rect: egui::Rect, hot: bool, p: UiPalette) {
@@ -2117,12 +2869,28 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                     .get(app.selected_workspace)
                     .map(|w| w.working_dir.clone())
                     .unwrap_or_else(default_working_dir);
+                let inherit_layout = app
+                    .workspaces
+                    .get(app.selected_workspace)
+                    .map(|w| w.panel_layout)
+                    .unwrap_or_default();
                 app.next_workspace_index += 1;
                 app.workspaces.push(WorkspaceTab {
                     title,
                     badge: None,
                     color_rgba: None,
                     working_dir: inherit_dir,
+                    panel_layout: inherit_layout,
+                    sync_terminals_to_columns: app
+                        .workspaces
+                        .get(app.selected_workspace)
+                        .map(|w| w.sync_terminals_to_columns)
+                        .unwrap_or(false),
+                    uniform_equal_terminals: app
+                        .workspaces
+                        .get(app.selected_workspace)
+                        .map(|w| w.uniform_equal_terminals)
+                        .unwrap_or(false),
                 });
                 app.workspace_runtime.push(WorkspaceRuntime::default());
                 app.selected_workspace = app.workspaces.len() - 1;
@@ -2198,50 +2966,6 @@ fn settings_menu(ui: &mut egui::Ui, app: &mut TermiteUi, changed: &mut bool) {
     *changed |= ui
         .selectable_value(&mut app.ui_style, UiStyle::Glass, "Glass")
         .clicked();
-    ui.separator();
-    ui.label("Panel layout");
-    ui.label(
-        RichText::new("Auto fits column count to window width. Fixed uses the column count you set.")
-            .size(11.0)
-            .color(ui.visuals().weak_text_color()),
-    );
-    ui.horizontal(|ui| {
-        *changed |= ui
-            .selectable_value(&mut app.panel_layout.mode, PanelLayoutMode::Auto, "Auto")
-            .clicked();
-        *changed |= ui
-            .selectable_value(
-                &mut app.panel_layout.mode,
-                PanelLayoutMode::Fixed,
-                "Fixed",
-            )
-            .clicked();
-    });
-    if app.panel_layout.mode == PanelLayoutMode::Fixed {
-        ui.horizontal(|ui| {
-            ui.label("Columns");
-            let mut c = app.panel_layout.cols as i32;
-            let resp = ui.add(
-                egui::DragValue::new(&mut c)
-                    .range(1..=MAX_WORKSPACE_COLUMNS as i32)
-                    .speed(0.15)
-                    .fixed_decimals(0),
-            );
-            if resp.changed() {
-                app.panel_layout.cols = c.clamp(1, MAX_WORKSPACE_COLUMNS as i32) as u8;
-                *changed = true;
-            }
-        });
-    }
-    *changed |= ui
-        .checkbox(
-            &mut app.sync_terminals_to_columns,
-            "Sync terminals to columns (auto-fit width)",
-        )
-        .on_hover_text(
-            "Sets each terminal to the column stripe width, aligns to column starts, and stacks from the top of each column. Pauses while you drag or resize a terminal.",
-        )
-        .changed();
 }
 
 fn workspace_tab_context_menu(
@@ -2510,8 +3234,8 @@ fn save_workspace_state(app: &TermiteUi) {
     let state = WorkspaceState {
         ui_theme: app.ui_theme,
         ui_style: app.ui_style,
-        panel_layout: app.panel_layout.sanitized(),
-        sync_terminals_to_columns: app.sync_terminals_to_columns,
+        sync_terminals_to_columns: None,
+        uniform_equal_terminals: None,
         selected_workspace: app.selected_workspace,
         workspaces: app
             .workspaces
@@ -2521,6 +3245,9 @@ fn save_workspace_state(app: &TermiteUi) {
                 title: tab.title.clone(),
                 badge: tab.badge,
                 color_rgba: tab.color_rgba,
+                panel_layout: tab.panel_layout.sanitized(),
+                sync_terminals_to_columns: Some(tab.sync_terminals_to_columns),
+                uniform_equal_terminals: Some(tab.uniform_equal_terminals),
                 working_dir: Some(tab.working_dir.clone()),
                 terminal_sessions: app
                     .workspace_runtime
@@ -2530,7 +3257,9 @@ fn save_workspace_state(app: &TermiteUi) {
                             .terminals
                             .iter()
                             .map(|pane| TerminalPaneState {
+                                id: pane.id,
                                 title: pane.title.clone(),
+                                tmux_session: Some(pane.tmux_session.clone()),
                                 width: pane.desired_size.x,
                                 height: pane.desired_size.y,
                                 x: pane.position.map(|p| p.x),
@@ -2543,10 +3272,16 @@ fn save_workspace_state(app: &TermiteUi) {
                     .workspace_runtime
                     .get(idx)
                     .and_then(|runtime| runtime.active_terminal),
+                equal_size_source_terminal_id: app
+                    .workspace_runtime
+                    .get(idx)
+                    .and_then(|runtime| runtime.equal_size_source_terminal_id),
             })
             .collect(),
         next_workspace_index: app.next_workspace_index,
         color_history: app.color_history.clone(),
+        usage_panel_pinned_scope: app.usage_panel_pinned_scope,
+        show_termite_only_status: app.show_termite_only_status,
     };
 
     let path = workspace_state_path();
@@ -2688,6 +3423,39 @@ impl TermiteUi {
         self.workspace_runtime.get(idx)
     }
 
+    fn active_workspace_tab_mut(&mut self) -> Option<&mut WorkspaceTab> {
+        if self.workspaces.is_empty() {
+            return None;
+        }
+        let idx = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        self.workspaces.get_mut(idx)
+    }
+
+    fn active_panel_layout(&self) -> PanelLayout {
+        if self.workspaces.is_empty() {
+            return PanelLayout::default();
+        }
+        let idx = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        self.workspaces
+            .get(idx)
+            .map(|w| w.panel_layout.sanitized())
+            .unwrap_or_default()
+    }
+
+    fn active_workspace_tab(&self) -> Option<&WorkspaceTab> {
+        if self.workspaces.is_empty() {
+            return None;
+        }
+        let idx = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        self.workspaces.get(idx)
+    }
+
     fn terminal_index_at_local_pos(&self, local_pos: Pos2) -> Option<usize> {
         let runtime = self.active_workspace_runtime()?;
         for idx in (0..runtime.terminals.len()).rev() {
@@ -2704,6 +3472,105 @@ impl TermiteUi {
     fn trigger_spawn_flash(&mut self, local_pos: Pos2) {
         self.pending_spawn_flash_pos = Some(local_pos);
         self.pending_spawn_flash_until = Some(Instant::now() + Duration::from_millis(260));
+    }
+
+    fn open_equal_size_picker_for_active_workspace(&mut self) {
+        let Some(runtime) = self.active_workspace_runtime_mut() else {
+            self.equal_size_picker_open = false;
+            self.equal_size_picker_selection = None;
+            return;
+        };
+        let fallback = runtime
+            .active_terminal
+            .and_then(|idx| runtime.terminals.get(idx).map(|pane| pane.id))
+            .or_else(|| runtime.terminals.first().map(|pane| pane.id));
+        let current = runtime
+            .equal_size_source_terminal_id
+            .or(fallback);
+        self.equal_size_picker_selection = current;
+        self.equal_size_picker_open = current.is_some();
+        if let Some(id) = current {
+            self.trigger_equal_size_template_blink(id);
+        }
+    }
+
+    fn draw_equal_size_picker(&mut self, ctx: &egui::Context, p: UiPalette) {
+        let uniform_equal_terminals = self
+            .active_workspace_tab()
+            .map(|t| t.uniform_equal_terminals)
+            .unwrap_or(false);
+        if !uniform_equal_terminals || !self.equal_size_picker_open {
+            return;
+        }
+        let Some(runtime) = self.active_workspace_runtime() else {
+            return;
+        };
+        if runtime.terminals.is_empty() {
+            return;
+        }
+        let terminals: Vec<(u64, String, Vec2)> = runtime
+            .terminals
+            .iter()
+            .map(|pane| (pane.id, pane.title.clone(), pane.desired_size))
+            .collect();
+        let mut selection = self.equal_size_picker_selection;
+        let mut apply_selection = false;
+        let mut close_only = false;
+
+        egui::Window::new("Equal-size template terminal")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.popover_fill)
+                    .stroke(Stroke::new(1.0, p.border)),
+            )
+            .show(ctx, |ui| {
+                ui.label("Choose a terminal size to apply to all panes in equal-size grid:");
+                ui.add_space(6.0);
+                for (id, title, size) in &terminals {
+                    let selected = selection == Some(*id);
+                    let label = format!("{title} ({:.0} x {:.0})", size.x, size.y);
+                    if ui.selectable_label(selected, label).clicked() {
+                        selection = Some(*id);
+                        self.trigger_equal_size_template_blink(*id);
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply_selection = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_only = true;
+                    }
+                });
+            });
+
+        self.equal_size_picker_selection = selection;
+        if apply_selection {
+            if let Some(runtime_mut) = self.active_workspace_runtime_mut() {
+                runtime_mut.equal_size_source_terminal_id = selection;
+            }
+            self.equal_size_picker_open = false;
+            self.equal_size_template_blink_terminal_id = None;
+            self.equal_size_template_blink_started_at = None;
+            save_workspace_state(self);
+        } else if close_only {
+            // Canceling the picker should disable the equal-size grid toggle as well.
+            if let Some(tab) = self.active_workspace_tab_mut() {
+                tab.uniform_equal_terminals = false;
+            }
+            self.equal_size_picker_open = false;
+            self.equal_size_picker_selection = None;
+            if let Some(runtime_mut) = self.active_workspace_runtime_mut() {
+                runtime_mut.equal_size_source_terminal_id = None;
+            }
+            self.equal_size_template_blink_terminal_id = None;
+            self.equal_size_template_blink_started_at = None;
+            save_workspace_state(self);
+        }
     }
 
     fn paint_spawn_flash(
@@ -2731,9 +3598,10 @@ impl TermiteUi {
         let [r, g, b] = p.spawn_flash_rgb;
         let color = Color32::from_rgba_unmultiplied(r, g, b, alpha);
 
-        let col = pick_column_at_x(local_pos.x, area_size.x, self.panel_layout);
-        let w = column_stripe_width(area_size.x, self.panel_layout);
-        let x = column_band_left(area_size.x, col, self.panel_layout);
+        let layout = self.active_panel_layout();
+        let col = pick_column_at_x(local_pos.x, area_size.x, layout);
+        let w = column_stripe_width(area_size.x, layout);
+        let x = column_band_left(area_size.x, col, layout);
         let rect = egui::Rect::from_min_size(
             area_min + Vec2::new(x, 0.0),
             Vec2::new(w, area_size.y.max(1.0)),
@@ -2759,14 +3627,37 @@ fn min_y_topmost_in_column(
     column: usize,
     layout: PanelLayout,
 ) -> Option<f32> {
+    let (stripe_left, stripe_right) = column_slot_x_range(area_width, column, layout);
     terminals
         .iter()
         .filter_map(|pane| {
             let pos = pane.position.unwrap_or_default();
-            let cx = pos.x + pane.desired_size.x * 0.5;
-            (pick_column_at_x(cx, area_width, layout) == column).then_some(pos.y)
+            let pr = egui::Rect::from_min_size(pos, pane.desired_size);
+            let ix0 = pr.min.x.max(stripe_left);
+            let ix1 = pr.max.x.min(stripe_right);
+            (ix1 > ix0 + 1.0).then_some(pos.y)
         })
         .min_by(|a, b| a.total_cmp(b))
+}
+
+/// Maximum bottom `y` among panes whose center lies in the given column band.
+fn max_y_bottom_in_column(
+    terminals: &[TerminalPane],
+    area_width: f32,
+    column: usize,
+    layout: PanelLayout,
+) -> Option<f32> {
+    let (stripe_left, stripe_right) = column_slot_x_range(area_width, column, layout);
+    terminals
+        .iter()
+        .filter_map(|pane| {
+            let pos = pane.position.unwrap_or_default();
+            let pr = egui::Rect::from_min_size(pos, pane.desired_size);
+            let ix0 = pr.min.x.max(stripe_left);
+            let ix1 = pr.max.x.min(stripe_right);
+            (ix1 > ix0 + 1.0).then_some(pos.y + pane.desired_size.y)
+        })
+        .max_by(|a, b| a.total_cmp(b))
 }
 
 /// Left edge for a new pane that is **right-aligned** to `[stripe_left, stripe_right]`, after
@@ -2799,28 +3690,18 @@ fn intrusion_left_right_aligned(
 fn spawn_candidate_overlaps_pane(
     candidate: egui::Rect,
     pane: &TerminalPane,
-    area_width: f32,
-    layout: PanelLayout,
+    _area_width: f32,
+    _layout: PanelLayout,
 ) -> bool {
     let pos = pane.position.unwrap_or_default();
     let pr = egui::Rect::from_min_size(pos, pane.desired_size);
-    let cand_col = pick_column_at_x(candidate.center().x, area_width, layout);
-    let pane_col = pick_column_at_x(pr.center().x, area_width, layout);
-
-    if cand_col != pane_col {
-        const H_EPS: f32 = 3.0;
-        const V_EPS: f32 = 2.0;
-        let ix0 = candidate.min.x.max(pr.min.x);
-        let iy0 = candidate.min.y.max(pr.min.y);
-        let ix1 = candidate.max.x.min(pr.max.x);
-        let iy1 = candidate.max.y.min(pr.max.y);
-        return ix1 > ix0 + H_EPS && iy1 > iy0 + V_EPS;
-    }
-
-    let half_gap = STACK_GAP_Y * 0.5;
-    let c = candidate.expand2(Vec2::new(0.0, half_gap));
-    let p = pr.expand2(Vec2::new(0.0, half_gap));
-    c.intersects(p)
+    const H_EPS: f32 = 1.0;
+    const V_EPS: f32 = 1.0;
+    let ix0 = candidate.min.x.max(pr.min.x);
+    let iy0 = candidate.min.y.max(pr.min.y);
+    let ix1 = candidate.max.x.min(pr.max.x);
+    let iy1 = candidate.max.y.min(pr.max.y);
+    ix1 > ix0 + H_EPS && iy1 > iy0 + V_EPS
 }
 
 /// Prefer the top of the column band, never overlapping any existing pane (any column).
@@ -2830,6 +3711,7 @@ fn find_spawn_column_no_overlap(
     terminals: &[TerminalPane],
     area_size: Vec2,
     column: usize,
+    preferred_y: f32,
     preferred_max_h: f32,
     default_h: f32,
     layout: PanelLayout,
@@ -2851,26 +3733,36 @@ fn find_spawn_column_no_overlap(
 
     while h >= min_h {
         let max_y = (area_size.y - h).max(0.0);
-        let mut y = 0.0_f32;
-        while y <= max_y + 0.01 {
-            let left = intrusion_left_right_aligned(
-                terminals,
-                stripe_left,
-                stripe_right,
-                y,
-                h,
-                GRID_SPACING,
-            );
-            let w = stripe_right - left;
-            if w < min_spawn_w {
-                y += y_step;
-                continue;
+        let start_y = preferred_y.clamp(0.0, max_y);
+        let max_steps = ((max_y / y_step).ceil() as u32).saturating_add(2);
+        for k in 0..=max_steps {
+            let delta = k as f32 * y_step;
+            let y_candidates = if k == 0 {
+                [Some(start_y), None]
+            } else {
+                let down = (start_y + delta <= max_y + 0.01).then_some((start_y + delta).clamp(0.0, max_y));
+                let up = (start_y >= delta).then_some((start_y - delta).clamp(0.0, max_y));
+                [down, up]
+            };
+
+            for y in y_candidates.into_iter().flatten() {
+                let left = intrusion_left_right_aligned(
+                    terminals,
+                    stripe_left,
+                    stripe_right,
+                    y,
+                    h,
+                    GRID_SPACING,
+                );
+                let w = stripe_right - left;
+                if w < min_spawn_w {
+                    continue;
+                }
+                let cand = egui::Rect::from_min_size(Pos2::new(left, y), Vec2::new(w, h));
+                if !overlaps(cand) {
+                    return (cand.min, cand.size());
+                }
             }
-            let cand = egui::Rect::from_min_size(Pos2::new(left, y), Vec2::new(w, h));
-            if !overlaps(cand) {
-                return (cand.min, cand.size());
-            }
-            y += y_step;
         }
         h -= CELL_H;
     }
@@ -2885,7 +3777,7 @@ fn find_spawn_column_no_overlap(
         area_size,
         Vec2::new(slot_w, h),
         column,
-        0.0,
+        preferred_y,
         layout,
     );
     let left =
@@ -2895,40 +3787,14 @@ fn find_spawn_column_no_overlap(
     if !overlaps(cand) {
         return (cand.min, cand.size());
     }
-    (pos, Vec2::new(slot_w, h))
-}
 
-fn find_non_overlapping_position(
-    terminals: &[TerminalPane],
-    area_size: Vec2,
-    new_size: Vec2,
-) -> Pos2 {
-    let max_x = (area_size.x - new_size.x).max(0.0);
-    let max_y = (area_size.y - new_size.y).max(0.0);
-    let step = 24.0;
-    let padding = 4.0;
-
-    let mut y = 0.0;
-    while y <= max_y {
-        let mut x = 0.0;
-        while x <= max_x {
-            let candidate = egui::Rect::from_min_size(Pos2::new(x, y), new_size);
-            let overlaps = terminals.iter().any(|pane| {
-                let pos = pane.position.unwrap_or(Pos2::ZERO);
-                let rect = egui::Rect::from_min_size(pos, pane.desired_size).expand(padding);
-                candidate.intersects(rect)
-            });
-            if !overlaps {
-                return Pos2::new(x, y);
-            }
-            x += step;
-        }
-        y += step;
-    }
-
-    // Fallback: cascade near top-left if area is saturated.
-    let offset = (terminals.len() as f32 * 20.0).min(max_x.max(max_y));
-    Pos2::new(offset.min(max_x), offset.min(max_y))
+    // Hard fallback: never return an overlapping position. Append below the current stack in
+    // this column (growing workspace height as needed).
+    let bottom = max_y_bottom_in_column(terminals, area_size.x, column, layout).unwrap_or(0.0);
+    let y = (bottom + STACK_GAP_Y).max(0.0);
+    let left = intrusion_left_right_aligned(terminals, stripe_left, stripe_right, y, h, GRID_SPACING);
+    let w = (stripe_right - left).max(min_spawn_w).min(slot_w);
+    (Pos2::new(left, y), Vec2::new(w, h))
 }
 
 /// Snap every pane to the layout column width and restack from the top (`y = 0`) in each column.
@@ -2979,6 +3845,48 @@ fn reflow_panes_to_column_starts(
     }
 }
 
+/// Same width and height for every pane, row-major grid using the current column layout count.
+/// `body_height` is the vertical span to fill with panes (not including [`workspace_content_height`]'s bottom margin).
+fn reflow_panes_uniform_equal(
+    terminals: &mut [TerminalPane],
+    available_width: f32,
+    body_height: f32,
+    layout: PanelLayout,
+    template_size: Option<Vec2>,
+) {
+    let n = terminals.len();
+    if n == 0 || !(available_width > 0.0 && body_height > 0.0) {
+        return;
+    }
+    let (_, _, n_cols) = column_slot_geometry(available_width, layout);
+    let cols = n_cols.max(1);
+    let rows = (n + cols - 1) / cols;
+    let grid_cell_w = column_stripe_width(available_width, layout)
+        .max(TERMINAL_MIN_WIDTH)
+        .min(available_width.max(TERMINAL_MIN_WIDTH));
+    let gap_y = STACK_GAP_Y;
+    let gap_total = (rows.saturating_sub(1)) as f32 * gap_y;
+    let grid_cell_h = ((body_height - gap_total) / rows as f32).max(TERMINAL_MIN_HEIGHT);
+    let cell_w = template_size
+        .map(|s| s.x)
+        .unwrap_or(grid_cell_w)
+        .clamp(TERMINAL_MIN_WIDTH, grid_cell_w.max(TERMINAL_MIN_WIDTH));
+    let cell_h = template_size
+        .map(|s| s.y)
+        .unwrap_or(grid_cell_h)
+        .clamp(TERMINAL_MIN_HEIGHT, grid_cell_h.max(TERMINAL_MIN_HEIGHT));
+    let max_x = (available_width - cell_w).max(0.0);
+
+    for (i, pane) in terminals.iter_mut().enumerate() {
+        let col = i % cols;
+        let row = i / cols;
+        let x = column_band_left(available_width, col, layout).clamp(0.0, max_x);
+        let y = row as f32 * (cell_h + gap_y);
+        pane.desired_size = Vec2::new(cell_w, cell_h);
+        pane.position = Some(Pos2::new(x, y));
+    }
+}
+
 /// How many vertical columns fit at `area_width` with at least [`TERMINAL_MIN_WIDTH`] per slot.
 fn workspace_column_count_auto(area_width: f32) -> usize {
     if area_width <= 0.0 {
@@ -3008,6 +3916,79 @@ fn column_band_left(area_width: f32, column: usize, layout: PanelLayout) -> f32 
     let (w, g, n) = column_slot_geometry(area_width, layout);
     let col = column.min(n.saturating_sub(1));
     col as f32 * (w + g)
+}
+
+/// Horizontal span of the layout slot for `column` (one grid column, excluding neighbour gutters).
+fn column_slot_x_range(area_width: f32, column: usize, layout: PanelLayout) -> (f32, f32) {
+    let left = column_band_left(area_width, column, layout);
+    let w = column_stripe_width(area_width, layout);
+    (left, left + w)
+}
+
+/// True when some pane's bbox overlaps this column's slot on the x-axis (any row). Used so a
+/// right-click "New terminal" can target a visually empty column instead of the stripe under the
+/// cursor that is already covered by a wide pane.
+fn column_slot_has_pane_overlap(
+    terminals: &[TerminalPane],
+    area_width: f32,
+    column: usize,
+    layout: PanelLayout,
+) -> bool {
+    let (stripe_left, stripe_right) = column_slot_x_range(area_width, column, layout);
+    terminals.iter().any(|pane| {
+        let pos = pane.position.unwrap_or_default();
+        let pr = egui::Rect::from_min_size(pos, pane.desired_size);
+        let ix0 = pr.min.x.max(stripe_left);
+        let ix1 = pr.max.x.min(stripe_right);
+        ix1 > ix0 + 1.0
+    })
+}
+
+/// True when a pane belongs to this column by center point (normal column ownership).
+fn column_has_native_pane(
+    terminals: &[TerminalPane],
+    area_width: f32,
+    column: usize,
+    layout: PanelLayout,
+) -> bool {
+    terminals.iter().any(|pane| {
+        let pos = pane.position.unwrap_or_default();
+        let pr = egui::Rect::from_min_size(pos, pane.desired_size);
+        pick_column_at_x(pr.center().x, area_width, layout) == column
+    })
+}
+
+/// Column under the cursor if that slot is unused; otherwise the unused slot closest by index.
+fn pick_spawn_column_preferring_empty_slot(
+    terminals: &[TerminalPane],
+    area_width: f32,
+    cursor_x: f32,
+    layout: PanelLayout,
+) -> usize {
+    let preferred = pick_column_at_x(cursor_x, area_width, layout);
+    let preferred_overlapped =
+        column_slot_has_pane_overlap(terminals, area_width, preferred, layout);
+    let preferred_has_native =
+        column_has_native_pane(terminals, area_width, preferred, layout);
+    if !preferred_overlapped || preferred_has_native {
+        return preferred;
+    }
+    let (_, _, n) = column_slot_geometry(area_width, layout);
+    let n = n.max(1);
+    let mut best: Option<(u32, usize)> = None;
+    for col in 0..n {
+        if column_slot_has_pane_overlap(terminals, area_width, col, layout) {
+            continue;
+        }
+        let dist = (col as i32 - preferred as i32).unsigned_abs();
+        if best
+            .as_ref()
+            .map_or(true, |(d, c)| dist < *d || (dist == *d && col < *c))
+        {
+            best = Some((dist, col));
+        }
+    }
+    best.map(|(_, c)| c).unwrap_or(preferred)
 }
 
 fn pick_column_at_x(cursor_x: f32, area_width: f32, layout: PanelLayout) -> usize {

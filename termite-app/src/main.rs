@@ -1,10 +1,16 @@
 mod app;
+mod daemon;
 mod user_event;
 
 use app::TermiteApp;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--daemon") {
+        // Runs the background PTY daemon and exits into an accept loop.
+        return daemon::run_daemon();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()

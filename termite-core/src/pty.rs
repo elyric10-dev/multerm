@@ -51,6 +51,7 @@ pub fn spawn_pty(
     data_tx: Sender<Vec<u8>>,
     wake_up: Box<dyn Fn() + Send + 'static>,
     working_dir: Option<&str>,
+    startup_command: Option<&str>,
 ) -> anyhow::Result<PtyHandle> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -59,6 +60,10 @@ pub fn spawn_pty(
 
     // Spawn the shell
     let mut cmd = CommandBuilder::new(shell);
+    if let Some(command) = startup_command {
+        cmd.arg("-lc");
+        cmd.arg(command);
+    }
     cmd.env("TERM", "xterm-256color");
     if let Some(dir) = working_dir {
         cmd.cwd(dir);

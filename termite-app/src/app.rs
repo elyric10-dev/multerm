@@ -1,4 +1,11 @@
-use std::sync::Arc;
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpStream,
+    process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use crossbeam_channel::unbounded;
 use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId};
@@ -24,9 +31,46 @@ const DIVIDER_GRAB_RADIUS: f32 = 8.0;
 const SPLIT_MIN_RATIO: f32 = 0.2;
 const SPLIT_MAX_RATIO: f32 = 0.8;
 
+// Protocol frames for the session daemon (mirrors `daemon.rs`).
+const FRAME_ATTACH: u8 = 1;
+const FRAME_ATTACH_ERROR: u8 = 2;
+const FRAME_OUTPUT: u8 = 3;
+const FRAME_INPUT: u8 = 4;
+const FRAME_RESIZE: u8 = 5;
+
 struct PaneRuntime {
     session: TerminalSession,
-    pty: termite_core::PtyHandle,
+    backend: PaneBackend,
+}
+
+enum PaneBackend {
+    LocalPty { pty: termite_core::PtyHandle },
+    DaemonPty { writer: TcpStream },
+}
+
+impl PaneBackend {
+    fn write_input(&mut self, data: &[u8]) {
+        match self {
+            PaneBackend::LocalPty { pty } => {
+                let _ = pty.write_all(data);
+            }
+            PaneBackend::DaemonPty { writer } => {
+                let _ = TermiteApp::write_frame_tcp(writer, FRAME_INPUT, data);
+            }
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        match self {
+            PaneBackend::LocalPty { pty } => {
+                let _ = pty.resize(rows, cols);
+            }
+            PaneBackend::DaemonPty { writer } => {
+                let payload = [rows.to_le_bytes(), cols.to_le_bytes()].concat();
+                let _ = TermiteApp::write_frame_tcp(writer, FRAME_RESIZE, &payload);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +120,59 @@ impl TermiteApp {
     }
 
     #[allow(dead_code)]
+    fn tmux_startup_command_for_pane(pane_index: usize) -> Option<String> {
+        // Opt out if desired.
+        if std::env::var("TERMITE_TMUX_DISABLED").ok().as_deref() == Some("1") {
+            return None;
+        }
+
+        // Session naming needs to be stable across app restarts so you can reattach.
+        // Users can override the prefix if they run multiple termite instances.
+        let prefix =
+            std::env::var("TERMITE_TMUX_SESSION_PREFIX").unwrap_or_else(|_| "termite".into());
+
+        // Sanitize to avoid weird tmux targeting behavior.
+        let sanitize = |s: &str| {
+            s.chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+                    _ => '_',
+                })
+                .collect::<String>()
+        };
+
+        let session_name = format!("{}-pane-{}", sanitize(&prefix), pane_index);
+        let session_name_q = session_name.replace('\'', "_"); // should be impossible after sanitize
+
+        // `spawn_pty` runs the shell as `SHELL -lc <startup_command>`, so we must `exec`
+        // the interactive thing we want to keep running.
+        Some(format!(
+            r#"
+if command -v tmux >/dev/null 2>&1; then
+  tmux has-session -t '{session}' 2>/dev/null || tmux new-session -s '{session}' -d
+  exec tmux attach -t '{session}'
+fi
+
+# tmux isn't installed. Optionally try a best-effort install (macOS: Homebrew).
+# This is opt-in to avoid surprising users / doing network installs silently.
+if [ "${{TERMITE_TMUX_AUTO_INSTALL:-0}}" = "1" ] && command -v brew >/dev/null 2>&1; then
+  echo "[termite] tmux not found; installing via brew..."
+  brew install tmux >/dev/null 2>&1 || brew install tmux || true
+fi
+
+if command -v tmux >/dev/null 2>&1; then
+  tmux has-session -t '{session}' 2>/dev/null || tmux new-session -s '{session}' -d
+  exec tmux attach -t '{session}'
+fi
+
+echo "[termite] tmux is not installed; falling back to a normal shell."
+exec "${{SHELL:-/bin/zsh}}" -i
+"#,
+            session = session_name_q
+        ))
+    }
+
+    #[allow(dead_code)]
     fn compute_terminal_size(&self) -> (usize, usize) {
         let atlas = match &self.atlas {
             Some(a) => a,
@@ -92,18 +189,155 @@ impl TermiteApp {
         (rows, cols)
     }
 
-    fn spawn_pane(&self, rows: usize, cols: usize) -> PaneRuntime {
+    fn daemon_session_key_for_pane(pane_index: usize) -> String {
+        let prefix = std::env::var("TERMITE_DAEMON_SESSION_PREFIX")
+            .unwrap_or_else(|_| "termite".into());
+
+        // Sanitize to tmux-like charset so it is safe for the daemon.
+        let sanitize = |s: &str| {
+            s.chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+                    _ => '_',
+                })
+                .collect::<String>()
+        };
+
+        format!("{}-pane-{}", sanitize(&prefix), pane_index)
+    }
+
+    fn read_frame_tcp(stream: &mut TcpStream) -> anyhow::Result<(u8, Vec<u8>)> {
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header)?;
+        let frame_type = header[0];
+        let len = u32::from_le_bytes(header[1..5].try_into().expect("len")) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            stream.read_exact(&mut payload)?;
+        }
+        Ok((frame_type, payload))
+    }
+
+    fn write_frame_tcp(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> anyhow::Result<()> {
+        let len = payload.len() as u32;
+        let mut header = [0u8; 5];
+        header[0] = frame_type;
+        header[1..5].copy_from_slice(&len.to_le_bytes());
+        stream.write_all(&header)?;
+        if !payload.is_empty() {
+            stream.write_all(payload)?;
+        }
+        Ok(())
+    }
+
+    fn connect_daemon(&self) -> anyhow::Result<TcpStream> {
+        if std::env::var("TERMITE_DAEMON_DISABLED").ok().as_deref() == Some("1") {
+            anyhow::bail!("termite daemon disabled");
+        }
+
+        // First, try the port file if it exists.
+        let mut spawned = false;
+        for _attempt in 0..30 {
+            if let Ok(port_file) = crate::daemon::daemon_port_file_path() {
+                if let Ok(port_s) = fs::read_to_string(&port_file) {
+                    if let Ok(port) = port_s.trim().parse::<u16>() {
+                        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                            return Ok(stream);
+                        }
+                    }
+                }
+            }
+
+            if !spawned {
+                spawned = true;
+                let exe = std::env::current_exe()?;
+                let _ = Command::new(exe)
+                    .arg("--daemon")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        anyhow::bail!("could not connect to termite session daemon");
+    }
+
+    fn spawn_pane(&self, rows: usize, cols: usize, pane_index: usize) -> PaneRuntime {
         let (tx, rx) = unbounded::<Vec<u8>>();
+        let session_key = Self::daemon_session_key_for_pane(pane_index);
+
+        // Try the daemon first so the process can survive restarts.
+        if let Ok(stream) = self.connect_daemon() {
+            let mut reader = stream.try_clone().expect("clone daemon stream");
+            let mut writer = stream;
+
+            let payload = {
+                let key_bytes = session_key.as_bytes();
+                if key_bytes.len() > u16::MAX as usize {
+                    None
+                } else {
+                    let mut p = Vec::with_capacity(2 + key_bytes.len() + 2 + 2);
+                    p.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+                    p.extend_from_slice(key_bytes);
+                    p.extend_from_slice(&(rows as u16).to_le_bytes());
+                    p.extend_from_slice(&(cols as u16).to_le_bytes());
+                    Some(p)
+                }
+            };
+
+            if let Some(payload) = payload {
+                if Self::write_frame_tcp(&mut writer, FRAME_ATTACH, &payload).is_ok() {
+                    if let Ok((frame_type, first_payload)) = Self::read_frame_tcp(&mut reader) {
+                        if frame_type == FRAME_OUTPUT {
+                            let _ = tx.send(first_payload);
+                            let _ = self.proxy.send_event(UserEvent::PtyData);
+
+                            let proxy = self.proxy.clone();
+                            let out_tx = tx.clone();
+                            let wake_proxy = proxy.clone();
+                            std::thread::spawn(move || {
+                                loop {
+                                    let Ok((ft, payload)) = Self::read_frame_tcp(&mut reader) else {
+                                        break;
+                                    };
+                                    if ft == FRAME_OUTPUT {
+                                        let _ = out_tx.send(payload);
+                                        let _ = wake_proxy.send_event(UserEvent::PtyData);
+                                    } else if ft == FRAME_ATTACH_ERROR {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
+                            return PaneRuntime {
+                                session,
+                                backend: PaneBackend::DaemonPty { writer },
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: local PTY (no persistence across restarts).
         let proxy = self.proxy.clone();
         let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(move || {
             let _ = proxy.send_event(UserEvent::PtyData);
         });
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let pty =
-            spawn_pty(&shell, rows as u16, cols as u16, tx, wake_up, None).expect("spawn_pty");
+        let pty = spawn_pty(&shell, rows as u16, cols as u16, tx, wake_up, None, None)
+            .expect("spawn_pty");
+
         let session = TerminalSession::new(PaneId::new(), rows, cols, rx);
-        PaneRuntime { session, pty }
+        PaneRuntime {
+            session,
+            backend: PaneBackend::LocalPty { pty },
+        }
     }
 
     fn pane_layout(&self) -> Vec<Rect> {
@@ -149,7 +383,7 @@ impl TermiteApp {
             let cols = (rect.w / cell_w).max(1.0) as usize;
             let rows = (rect.h / cell_h).max(1.0) as usize;
             pane.session.parser.resize(rows, cols);
-            let _ = pane.pty.resize(rows as u16, cols as u16);
+            pane.backend.resize(rows as u16, cols as u16);
         }
     }
 
@@ -157,7 +391,8 @@ impl TermiteApp {
         if self.panes.len() >= MAX_PANES {
             return;
         }
-        self.panes.push(self.spawn_pane(24, 80));
+        let pane_index = self.panes.len();
+        self.panes.push(self.spawn_pane(24, 80, pane_index));
         self.active_pane = self.panes.len().saturating_sub(1);
         self.resize_panes_to_layout();
     }
@@ -225,7 +460,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         self.gpu = Some(gpu);
         self.atlas = Some(atlas);
         self.compositor = Some(compositor);
-        self.panes = vec![self.spawn_pane(rows, cols)];
+        self.panes = vec![self.spawn_pane(rows, cols, 0)];
         self.active_pane = 0;
 
         tracing::info!("TermITE started — {}×{} cells", cols, rows);
@@ -354,8 +589,8 @@ impl TermiteApp {
 
         if let Some(bytes) = key_to_bytes(&event, self.mods, app_cursor) {
             if !bytes.is_empty() {
-                if let Some(pane) = self.panes.get(self.active_pane) {
-                    let _ = pane.pty.write_all(&bytes);
+                if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                    pane.backend.write_input(&bytes);
                 }
             }
         }
