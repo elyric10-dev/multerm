@@ -431,12 +431,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 860.0])
             .with_min_inner_size([1100.0, 700.0])
-            .with_title("Termite UI"),
+            .with_title("TermITE"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Termite UI",
+        "TermITE",
         options,
         Box::new(|_cc| Ok(Box::<TermiteUi>::default())),
     )
