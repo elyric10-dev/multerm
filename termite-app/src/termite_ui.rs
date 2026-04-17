@@ -1314,7 +1314,8 @@ impl eframe::App for TermiteUi {
                                 }
                             }
 
-                            for idx in 0..runtime.terminals.len() {
+                            let total_panes = runtime.terminals.len();
+                            for idx in 0..total_panes {
                                 let (left_group, right_group) = runtime.terminals.split_at_mut(idx);
                                 let Some((pane, right_group)) = right_group.split_first_mut()
                                 else {
@@ -1358,15 +1359,15 @@ impl eframe::App for TermiteUi {
                                     pane_rect.min,
                                     Vec2::new(pane_rect.width(), 24.0),
                                 );
-                                let drag_response = ui.interact(
-                                    header_rect,
-                                    ui.id().with(("pane_drag", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
+                                let drag_response = ui
+                                    .interact(
+                                        header_rect,
+                                        ui.id().with(("pane_drag", pane.id)),
+                                        Sense::click_and_drag(),
+                                    )
+                                    .on_hover_cursor(CursorIcon::Grab);
                                 if drag_response.dragged() {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
-                                } else if drag_response.hovered() {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+                                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                                 }
                                 if drag_response.dragged() {
                                     let delta = ui.input(|i| i.pointer.delta());
@@ -1613,13 +1614,13 @@ impl eframe::App for TermiteUi {
 
                                 // Cursor priority: corners first, then edges.
                                 if tl_active || br_active || near_br_corner {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeNwSe);
+                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
                                 } else if tr_active || bl_active {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeNeSw);
+                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw);
                                 } else if left_active || right_active {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal);
+                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
                                 } else if top_active || bottom_active {
-                                    ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeVertical);
+                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
                                 }
 
                                 let any_resize_dragged = resize_left.dragged()
@@ -1850,9 +1851,8 @@ impl eframe::App for TermiteUi {
                                     }
                                 }
 
-                                let pane_count = left_group.len() + right_group.len();
                                 let is_active = runtime.active_terminal == Some(idx)
-                                    || (runtime.active_terminal.is_none() && pane_count == 1);
+                                    || (runtime.active_terminal.is_none() && total_panes == 1);
                                 let mut border = if is_active { p.terminal_border_active } else { p.border };
                                 let mut stroke_w: f32 = 2.0;
                                 if let (Some(blink_id), Some(started_at)) = (equal_size_template_blink_terminal_id, equal_size_template_blink_started_at) {
@@ -1883,16 +1883,7 @@ impl eframe::App for TermiteUi {
                                     }
                                 }
 
-                                let pane_response = ui
-                                    .allocate_rect(pane_rect, Sense::click())
-                                    .on_hover_cursor(CursorIcon::Text);
-                                let pointer_in_pane = ui
-                                    .ctx()
-                                    .pointer_hover_pos()
-                                    .is_some_and(|pos| pane_rect.contains(pos));
-                                if pane_response.hovered() || pointer_in_pane {
-                                    ui.ctx().set_cursor_icon(CursorIcon::Text);
-                                }
+                                let pane_response = ui.allocate_rect(pane_rect, Sense::click());
                                 let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
                                 ui.scope_builder(
                                     egui::UiBuilder::new().max_rect(pane_rect),
@@ -1932,9 +1923,8 @@ impl eframe::App for TermiteUi {
                                                 resize_terminal_for_size(pane, terminal_size);
                                                 let selection = runtime
                                                     .selections
-                                                    .get(idx)
-                                                    .copied()
-                                                    .unwrap_or(None);
+                                                    .get_mut(idx)
+                                                    .expect("selection slot should exist");
                                                 let grid = pane.session.parser.grid();
                                                 let show_caret = pane.session.parser.cursor_visible()
                                                     || pane.session.parser.app_cursor_keys()
@@ -1951,6 +1941,8 @@ impl eframe::App for TermiteUi {
 
                                                 if let Some((clicked_row, clicked_col)) = clicked_cell_from_grid
                                                 {
+                                                    runtime.active_terminal = Some(idx);
+                                                    clicked_on_pane = true;
                                                     let grid = pane.session.parser.grid();
                                                     if grid.cols > 0 {
                                                         let target_row = clicked_row
@@ -2042,7 +2034,7 @@ impl eframe::App for TermiteUi {
                                 let was_active = runtime.active_terminal == Some(idx);
                                 let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
                                 runtime.terminals.remove(idx);
-                            runtime.selections.remove(idx);
+                                runtime.selections.remove(idx);
                                 if runtime
                                     .equal_size_source_terminal_id
                                     .is_some_and(|id| Some(id) == removed_id)
@@ -2449,6 +2441,20 @@ impl TermiteUi {
                         continue;
                     }
 
+                    if matches!(key, egui::Key::Backspace | egui::Key::Delete) {
+                        if let Some(range) =
+                            runtime.selections.get(active_idx).copied().unwrap_or(None)
+                        {
+                            let grid = runtime.terminals[active_idx].session.parser.grid();
+                            let bytes = selection_delete_bytes(grid, range, key);
+                            if !bytes.is_empty() {
+                                runtime.terminals[active_idx].backend.write_all(&bytes);
+                            }
+                            runtime.selections[active_idx] = None;
+                            continue;
+                        }
+                    }
+
                     if let Some(bytes) =
                         key_to_ansi_bytes(key, shift, modifiers.ctrl)
                     {
@@ -2833,9 +2839,9 @@ fn render_terminal_grid(
     pane_id: u64,
     grid: &TerminalGrid,
     p: UiPalette,
-    selection: Option<SelectionRange>,
+    selection: &mut Option<SelectionRange>,
     is_focused_terminal: bool,
-    show_caret: bool,
+    _show_caret: bool,
 ) -> Option<(usize, usize)> {
     let font_id = FontId::monospace(12.0);
     let newline_fmt = TextFormat {
@@ -2847,8 +2853,12 @@ fn render_terminal_grid(
 
     // Bake the block cursor directly into the LayoutJob so it is pixel-perfectly
     // aligned with the glyph grid (avoids painter-overlay Y drift).
-    // Keep caret always visible to avoid blink/repaint desync in TUIs.
-    let show_block_cursor = is_focused_terminal && show_caret;
+    let blink_visible = ui
+        .ctx()
+        .input(|i| ((i.time / 0.5).floor() as i64).rem_euclid(2) == 0);
+    // Some apps (including Claude Code) can report cursor visibility in ways
+    // that don't map cleanly to VT cursor state, so keep blink tied to focus.
+    let show_block_cursor = is_focused_terminal && blink_visible;
     let cursor_row = grid.cursor.row.min(grid.rows.saturating_sub(1));
     let cursor_col = grid.cursor.col.min(grid.cols.saturating_sub(1));
 
@@ -2881,6 +2891,24 @@ fn render_terminal_grid(
                 };
                 fmt.color = normal_bg;
                 fmt.background = normal_fg;
+            }
+            // Some TUIs render the cursor by toggling reverse-video on the
+            // cursor cell itself. When blink is in the "off" phase, undo that
+            // cursor-cell reverse so the caret actually disappears.
+            if is_focused_terminal
+                && !show_block_cursor
+                && row == cursor_row
+                && col == cursor_col
+                && cell.attrs.contains(CellAttrs::REVERSE)
+            {
+                let effective_bg = if fmt.background == Color32::TRANSPARENT {
+                    p.term_bg
+                } else {
+                    fmt.background
+                };
+                let effective_fg = fmt.color;
+                fmt.color = effective_bg;
+                fmt.background = effective_fg;
             }
             // Block cursor: invert this cell's colors so the cursor is a
             // filled rectangle aligned with the rest of the glyph grid.
@@ -2939,29 +2967,62 @@ fn render_terminal_grid(
         .show(ui, |ui| {
             let row_h = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
             let glyph_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'W')).max(1.0);
-            let response = ui.add(
-                egui::Label::new(job)
-                    .selectable(true)
-                    .sense(Sense::click_and_drag())
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            )
-            .on_hover_cursor(CursorIcon::Text);
+            let response = ui
+                .add(
+                    egui::Label::new(job)
+                        .selectable(true)
+                        .sense(Sense::click_and_drag())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                )
+                .on_hover_cursor(CursorIcon::Text);
             if response.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::Text);
             }
 
+            let pointer_to_cell = |pointer: Pos2| -> (usize, usize) {
+                let local = pointer - response.rect.min;
+                let row = (local.y / row_h)
+                    .floor()
+                    .max(0.0)
+                    .min(grid.rows.saturating_sub(1) as f32) as usize;
+                let col = (local.x / glyph_w)
+                    .floor()
+                    .max(0.0)
+                    .min(grid.cols.saturating_sub(1) as f32) as usize;
+                (row, col)
+            };
+
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let local = pointer - response.rect.min;
-                    let row = (local.y / row_h).floor().max(0.0) as usize;
-                    let col = (local.x / glyph_w).floor().max(0.0) as usize;
+                    let (row, col) = pointer_to_cell(pointer);
                     clicked_cell = Some((row, col));
+                }
+            }
+
+            if response.drag_started() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let (row, col) = pointer_to_cell(pointer);
+                    *selection = Some(SelectionRange {
+                        start_row: row,
+                        start_col: col,
+                        end_row: row,
+                        end_col: col,
+                        active: true,
+                    });
+                }
+            } else if response.dragged() {
+                if let (Some(pointer), Some(range)) = (response.interact_pointer_pos(), selection.as_mut())
+                {
+                    let (row, col) = pointer_to_cell(pointer);
+                    range.end_row = row;
+                    range.end_col = col;
+                    range.active = true;
                 }
             }
 
             // Fallback cursor overlay: guarantees a visible caret even when the
             // current cell is a trailing space run that the text layout may trim.
-            if show_caret && grid.rows > 0 && grid.cols > 0 {
+            if show_block_cursor && grid.rows > 0 && grid.cols > 0 {
                 let caret_row = cursor_row.min(grid.rows.saturating_sub(1));
                 let caret_col = cursor_col.min(grid.cols.saturating_sub(1));
                 let caret_x = response.rect.min.x + caret_col as f32 * glyph_w;
@@ -3103,6 +3164,71 @@ fn key_to_ansi_bytes(key: egui::Key, shift: bool, ctrl: bool) -> Option<Vec<u8>>
         _ => None,
     }
 }
+
+fn selection_delete_bytes(grid: &TerminalGrid, mut range: SelectionRange, key: egui::Key) -> Vec<u8> {
+    if !range.active || grid.rows == 0 || grid.cols == 0 {
+        return key_to_ansi_bytes(key, false, false).unwrap_or_default();
+    }
+
+    range.clamp_to_grid(grid.rows, grid.cols);
+    let ((start_row, start_col), (end_row, end_col)) = range.normalized_start_end();
+    let selected_len = if start_row == end_row {
+        let mut count = 0usize;
+        for col in start_col..=end_col {
+            let cell = grid.cell(start_row, col);
+            if cell.wide != WideKind::Trailing {
+                count += 1;
+            }
+        }
+        count
+    } else {
+        0
+    };
+
+    // Reliable deletion for line-editor prompts: normalize cursor to the selected span
+    // and emit delete/backspace the right number of times.
+    if selected_len > 0 && start_row == grid.cursor.row {
+        let mut bytes = Vec::new();
+        match key {
+            egui::Key::Backspace => {
+                let target_col_after_selection = end_col.saturating_add(1);
+                if grid.cursor.col > target_col_after_selection {
+                    for _ in 0..(grid.cursor.col - target_col_after_selection) {
+                        bytes.extend_from_slice(b"\x1b[D");
+                    }
+                } else if grid.cursor.col < target_col_after_selection {
+                    for _ in 0..(target_col_after_selection - grid.cursor.col) {
+                        bytes.extend_from_slice(b"\x1b[C");
+                    }
+                }
+                for _ in 0..selected_len {
+                    bytes.push(0x7f);
+                }
+            }
+            egui::Key::Delete => {
+                if grid.cursor.col > start_col {
+                    for _ in 0..(grid.cursor.col - start_col) {
+                        bytes.extend_from_slice(b"\x1b[D");
+                    }
+                } else if grid.cursor.col < start_col {
+                    for _ in 0..(start_col - grid.cursor.col) {
+                        bytes.extend_from_slice(b"\x1b[C");
+                    }
+                }
+                for _ in 0..selected_len {
+                    bytes.extend_from_slice(b"\x1b[3~");
+                }
+            }
+            _ => {}
+        }
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
+
+    key_to_ansi_bytes(key, false, false).unwrap_or_default()
+}
+
 
 fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
     let mut changed = false;
