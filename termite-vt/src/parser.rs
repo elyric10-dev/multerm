@@ -1,3 +1,4 @@
+use std::io::Write as IoWrite;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
@@ -8,6 +9,9 @@ use crate::grid::TerminalGrid;
 
 struct VtePerformer {
     pub grid: TerminalGrid,
+
+    // Unique instance id for log correlation
+    id: u32,
 
     // Current SGR state
     fg:    Color,
@@ -34,12 +38,16 @@ struct VtePerformer {
 
 impl VtePerformer {
     fn new(rows: usize, cols: usize) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut tab_stops = vec![false; cols.max(1)];
         for i in (0..cols).step_by(8) {
             tab_stops[i] = true;
         }
         Self {
             grid:            TerminalGrid::new(rows, cols),
+            id,
             fg:              Color::Default,
             bg:              Color::Default,
             attrs:           CellAttrs::empty(),
@@ -62,20 +70,42 @@ impl VtePerformer {
         }
     }
 
+    // ── Debug helper (writes to /tmp/termite_vt.log) ─────────────────────────
+
+    fn vt_log(&self, msg: &str) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/termite_vt.log")
+        {
+            let _ = writeln!(f, "p{} t={} rows={} cursor=({},{}) scroll=({},{}) | {}",
+                self.id,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                self.grid.rows,
+                self.grid.cursor.row, self.grid.cursor.col,
+                self.grid.scroll_top, self.grid.scroll_bot,
+                msg);
+        }
+    }
+
     // ── Cursor movement helpers ───────────────────────────────────────────────
 
     fn cursor_up(&mut self, n: usize) {
         self.pending_wrap = false;
         let n = n.max(1);
-        self.grid.cursor.row = self.grid.cursor.row.saturating_sub(n)
-            .max(self.grid.scroll_top);
+        self.vt_log(&format!("cursor_up({})", n));
+        // CUU should move within the full screen, not be clamped to DECSTBM.
+        // Clamping to scroll_top traps some TUIs' cursors near the bottom.
+        self.grid.cursor.row = self.grid.cursor.row.saturating_sub(n);
     }
 
     fn cursor_down(&mut self, n: usize) {
         self.pending_wrap = false;
         let n = n.max(1);
-        let bot = self.grid.scroll_bot;
-        self.grid.cursor.row = (self.grid.cursor.row + n).min(bot);
+        // CUD should move within the full screen, not be clamped to DECSTBM.
+        self.grid.cursor.row = (self.grid.cursor.row + n).min(self.grid.rows - 1);
     }
 
     fn cursor_forward(&mut self, n: usize) {
@@ -93,6 +123,7 @@ impl VtePerformer {
     fn advance_line(&mut self) {
         let bot = self.grid.scroll_bot;
         let top = self.grid.scroll_top;
+        self.vt_log("LF");
         if self.grid.cursor.row >= bot {
             self.grid.scroll_up(top, bot, 1);
         } else {
@@ -334,6 +365,7 @@ impl Perform for VtePerformer {
                 let mut params_iter = params.iter();
                 let row = params_iter.next().map(|s| s[0]).unwrap_or(1).max(1) as usize;
                 let col = params_iter.next().map(|s| s[0]).unwrap_or(1).max(1) as usize;
+                self.vt_log(&format!("CUP ({},{}) → grid rows={}", row, col, self.grid.rows));
                 self.grid.cursor.row = (row - 1).min(self.grid.rows - 1);
                 self.grid.cursor.col = (col - 1).min(self.grid.cols - 1);
             }
@@ -417,6 +449,26 @@ impl Perform for VtePerformer {
             (false, 'n') if p0 == 6 => {
                 // We can't send a response here without write access; ignore for now.
             }
+            // ANSI cursor save (same semantics as ESC 7 / DECSC)
+            (false, 's') => {
+                self.vt_log("CSI s  (ANSI save)");
+                self.saved_row   = self.grid.cursor.row;
+                self.saved_col   = self.grid.cursor.col;
+                self.saved_fg    = self.fg;
+                self.saved_bg    = self.bg;
+                self.saved_attrs = self.attrs;
+            }
+            // ANSI cursor restore (same semantics as ESC 8 / DECRC)
+            (false, 'u') => {
+                self.vt_log(&format!("CSI u  (ANSI restore) → saved=({},{})",
+                    self.saved_row, self.saved_col));
+                self.grid.cursor.row = self.saved_row.min(self.grid.rows - 1);
+                self.grid.cursor.col = self.saved_col.min(self.grid.cols - 1);
+                self.fg              = self.saved_fg;
+                self.bg              = self.saved_bg;
+                self.attrs           = self.saved_attrs;
+                self.pending_wrap    = false;
+            }
             // Set Scrolling Region (DECSTBM)
             (false, 'r') => {
                 let mut pi = params.iter();
@@ -424,6 +476,7 @@ impl Perform for VtePerformer {
                 let bot = pi.next().map(|s| s[0]).unwrap_or(self.grid.rows as u16) as usize;
                 let top = (top - 1).min(self.grid.rows - 1);
                 let bot = bot.min(self.grid.rows).saturating_sub(1);
+                self.vt_log(&format!("DECSTBM top={} bot={}", top, bot));
                 if top < bot {
                     self.grid.scroll_top = top;
                     self.grid.scroll_bot = bot;
@@ -440,6 +493,7 @@ impl Perform for VtePerformer {
         match (intermediates.first(), byte) {
             // Save cursor (DECSC)
             (None, b'7') => {
+                self.vt_log("ESC 7  (DEC save)");
                 self.saved_row   = self.grid.cursor.row;
                 self.saved_col   = self.grid.cursor.col;
                 self.saved_fg    = self.fg;
@@ -448,6 +502,8 @@ impl Perform for VtePerformer {
             }
             // Restore cursor (DECRC)
             (None, b'8') => {
+                self.vt_log(&format!("ESC 8  (DEC restore) → saved=({},{})",
+                    self.saved_row, self.saved_col));
                 self.grid.cursor.row = self.saved_row.min(self.grid.rows - 1);
                 self.grid.cursor.col = self.saved_col.min(self.grid.cols - 1);
                 self.fg              = self.saved_fg;
@@ -499,6 +555,7 @@ impl TerminalParser {
             self.parser.advance(&mut self.performer, byte);
         }
     }
+
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.performer.grid.resize(rows, cols);

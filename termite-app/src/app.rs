@@ -10,18 +10,18 @@ use std::{
 use crossbeam_channel::unbounded;
 use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId};
 use termite_input::key_to_bytes;
-use termite_render::{Compositor, GlyphAtlas, GpuContext};
+use termite_render::{Compositor, CursorState, GlyphAtlas, GpuContext, SelectionRange};
 use termite_ui::pane_layout::Rect;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
-    keyboard::{Key, ModifiersState},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
 
-use crate::user_event::UserEvent;
+use crate::{clipboard, user_event::UserEvent};
 
 const FONT_SIZE: f32 = 15.0;
 const WINDOW_W: f64 = 900.0;
@@ -79,6 +79,12 @@ enum DragDivider {
     Horizontal,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SelectionDrag {
+    pane_idx: usize,
+    start: (usize, usize),
+}
+
 pub struct TermiteApp {
     // Event loop proxy for waking from PTY thread
     proxy: EventLoopProxy<UserEvent>,
@@ -95,6 +101,8 @@ pub struct TermiteApp {
     split_x: f32,
     split_y: f32,
     dragging: Option<DragDivider>,
+    selections: Vec<Option<SelectionRange>>,
+    selection_drag: Option<SelectionDrag>,
     cursor_pos: (f32, f32),
 
     // Keyboard modifier state
@@ -114,6 +122,8 @@ impl TermiteApp {
             split_x: 0.5,
             split_y: 0.5,
             dragging: None,
+            selections: Vec::new(),
+            selection_drag: None,
             cursor_pos: (0.0, 0.0),
             mods: ModifiersState::empty(),
         }
@@ -379,11 +389,20 @@ exec "${{SHELL:-/bin/zsh}}" -i
         let cell_w = atlas.cell_width().max(1.0);
         let cell_h = atlas.cell_height().max(1.0);
 
-        for (pane, rect) in self.panes.iter_mut().zip(pane_rects.iter()) {
+        for (pane_idx, (pane, rect)) in self
+            .panes
+            .iter_mut()
+            .zip(pane_rects.iter())
+            .enumerate()
+        {
             let cols = (rect.w / cell_w).max(1.0) as usize;
             let rows = (rect.h / cell_h).max(1.0) as usize;
             pane.session.parser.resize(rows, cols);
             pane.backend.resize(rows as u16, cols as u16);
+
+            if let Some(sel) = self.selections.get_mut(pane_idx).and_then(|s| s.as_mut()) {
+                sel.clamp_to_grid(rows, cols);
+            }
         }
     }
 
@@ -393,6 +412,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
         }
         let pane_index = self.panes.len();
         self.panes.push(self.spawn_pane(24, 80, pane_index));
+        self.selections.push(None);
         self.active_pane = self.panes.len().saturating_sub(1);
         self.resize_panes_to_layout();
     }
@@ -405,6 +425,34 @@ exec "${{SHELL:-/bin/zsh}}" -i
                 x >= rect.x && y >= rect.y && x <= rect.x + rect.w && y <= rect.y + rect.h
             })
             .map(|(idx, _)| idx)
+    }
+
+    fn cell_pos_at_cursor_in_pane(&self, pane_idx: usize) -> Option<(usize, usize)> {
+        let _ = self.gpu.as_ref()?;
+        let atlas = self.atlas.as_ref()?;
+
+        let pane_rects = self.pane_layout();
+        let rect = pane_rects.get(pane_idx)?;
+        let grid = self.panes.get(pane_idx)?.session.parser.grid();
+
+        let cell_w = atlas.cell_width().max(1.0);
+        let cell_h = atlas.cell_height().max(1.0);
+
+        let local_x = (self.cursor_pos.0 - rect.x).max(0.0);
+        let local_y = (self.cursor_pos.1 - rect.y).max(0.0);
+
+        let mut col = (local_x / cell_w) as usize;
+        let mut row = (local_y / cell_h) as usize;
+
+        row = row.min(grid.rows.saturating_sub(1));
+        col = col.min(grid.cols.saturating_sub(1));
+
+        // Normalize wide glyph clicks: map the trailing half back to the leading cell.
+        if grid.cell(row, col).wide == termite_vt::WideKind::Trailing && col > 0 {
+            col -= 1;
+        }
+
+        Some((row, col))
     }
 
     fn divider_hit_test(&self, x: f32, y: f32) -> Option<DragDivider> {
@@ -461,6 +509,8 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         self.atlas = Some(atlas);
         self.compositor = Some(compositor);
         self.panes = vec![self.spawn_pane(rows, cols, 0)];
+        self.selections = vec![None];
+        self.selection_drag = None;
         self.active_pane = 0;
 
         tracing::info!("TermITE started — {}×{} cells", cols, rows);
@@ -503,7 +553,26 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
-                if let Some(active_drag) = self.dragging {
+                if let Some(drag) = self.selection_drag {
+                    if let Some((row, col)) =
+                        self.cell_pos_at_cursor_in_pane(drag.pane_idx)
+                    {
+                        self.selection_drag = Some(SelectionDrag {
+                            pane_idx: drag.pane_idx,
+                            start: drag.start,
+                        });
+                        self.selections[drag.pane_idx] = Some(SelectionRange {
+                            start_row: drag.start.0,
+                            start_col: drag.start.1,
+                            end_row: row,
+                            end_col: col,
+                            active: true,
+                        });
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                } else if let Some(active_drag) = self.dragging {
                     if let Some(gpu) = &self.gpu {
                         let width = gpu.surface_config.width as f32;
                         let height = gpu.surface_config.height as f32;
@@ -531,14 +600,32 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
                         self.divider_hit_test(self.cursor_pos.0, self.cursor_pos.1)
                     {
                         self.dragging = Some(divider);
+                        self.selection_drag = None;
                     } else if let Some(idx) =
                         self.pane_index_at(self.cursor_pos.0, self.cursor_pos.1)
                     {
                         self.active_pane = idx;
+                        if let Some((row, col)) = self.cell_pos_at_cursor_in_pane(idx) {
+                            self.selection_drag = Some(SelectionDrag {
+                                pane_idx: idx,
+                                start: (row, col),
+                            });
+                            self.selections[idx] = Some(SelectionRange {
+                                start_row: row,
+                                start_col: col,
+                                end_row: row,
+                                end_col: col,
+                                active: true,
+                            });
+                        }
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                 }
                 if button == MouseButton::Left && state == ElementState::Released {
                     self.dragging = None;
+                    self.selection_drag = None;
                 }
             }
 
@@ -567,8 +654,86 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
 }
 
 impl TermiteApp {
+    fn active_selection(&self) -> Option<SelectionRange> {
+        self.selections
+            .get(self.active_pane)
+            .and_then(|s| *s)
+            .filter(|r| r.active)
+    }
+
+    fn select_all_in_active_pane(&mut self) {
+        let Some(pane) = self.panes.get(self.active_pane) else {
+            return;
+        };
+        let grid = pane.session.parser.grid();
+        if grid.rows == 0 || grid.cols == 0 {
+            return;
+        }
+
+        self.selections[self.active_pane] = Some(SelectionRange {
+            start_row: 0,
+            start_col: 0,
+            end_row: grid.rows - 1,
+            end_col: grid.cols - 1,
+            active: true,
+        });
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn copy_active_selection_to_clipboard(&mut self) {
+        let Some(range) = self.active_selection() else {
+            return;
+        };
+        let Some(pane) = self.panes.get(self.active_pane) else {
+            return;
+        };
+        let grid = pane.session.parser.grid();
+
+        let text = clipboard::selection_to_ansi_sgr_text(grid, range);
+        if let Err(e) = clipboard::set_clipboard_text(&text) {
+            tracing::warn!("failed to set clipboard text: {e}");
+        }
+    }
+
+    fn paste_clipboard_into_active_pane(&mut self) {
+        let text = match clipboard::get_clipboard_text() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("failed to read clipboard text: {e}");
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+
+        let bytes = clipboard::clipboard_text_to_pty_bytes(&text);
+        if let Some(pane) = self.panes.get_mut(self.active_pane) {
+            pane.backend.write_input(&bytes);
+        }
+
+        self.selections[self.active_pane] = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn handle_keyboard(&mut self, event: KeyEvent) {
         if event.state == ElementState::Pressed {
+            let ctrl = self.mods.control_key();
+            let shift = self.mods.shift_key();
+            let cmd = self.mods.super_key();
+
+            let key_char = match &event.logical_key {
+                Key::Character(s) => s.chars().next(),
+                _ => None,
+            };
+
+            let has_sel = self.active_selection().is_some();
+
             let is_new_terminal_shortcut = matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("n"))
                 && self.mods.shift_key()
                 && (self.mods.control_key() || self.mods.super_key());
@@ -577,6 +742,42 @@ impl TermiteApp {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+                return;
+            }
+
+            // Select-all
+            let is_select_all =
+                (cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')))
+                    || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')));
+            if is_select_all {
+                self.select_all_in_active_pane();
+                return;
+            }
+
+            // Copy (only when we have an active selection).
+            let is_copy = has_sel
+                && ((cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c')))
+                    || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))));
+            if is_copy {
+                self.copy_active_selection_to_clipboard();
+                return;
+            }
+
+            // Prevent Cmd+C from inserting "c" into the terminal when no selection exists.
+            if (cmd || ctrl)
+                && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))
+                && !has_sel
+            {
+                return;
+            }
+
+            // Paste
+            let is_paste_cmd_v = cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
+            let is_paste_ctrl_v = ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
+            let is_paste_shift_insert = shift && matches!(event.logical_key, Key::Named(NamedKey::Insert));
+
+            if is_paste_cmd_v || is_paste_ctrl_v || is_paste_shift_insert {
+                self.paste_clipboard_into_active_pane();
                 return;
             }
         }
@@ -620,7 +821,37 @@ impl TermiteApp {
             .map(|(pane, rect)| (rect.as_array(), pane.session.parser.grid()))
             .collect();
 
-        if let Err(e) = compositor.render_terminal_panes(gpu, atlas, scale, &pane_grids) {
+        let pane_selections: Vec<Option<SelectionRange>> = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| self.selections.get(i).copied().unwrap_or(None))
+            .collect();
+        let pane_cursors: Vec<Option<CursorState>> = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(i, pane)| {
+                if i != self.active_pane || !pane.session.parser.cursor_visible() {
+                    return None;
+                }
+                let cursor = pane.session.parser.grid().cursor;
+                Some(CursorState {
+                    row: cursor.row,
+                    col: cursor.col,
+                    visible: true,
+                })
+            })
+            .collect();
+
+        if let Err(e) = compositor.render_terminal_panes(
+            gpu,
+            atlas,
+            scale,
+            &pane_grids,
+            &pane_selections,
+            &pane_cursors,
+        ) {
             tracing::error!("render error: {e}");
         }
     }

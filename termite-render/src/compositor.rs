@@ -10,7 +10,9 @@ use termite_vt::{
 use crate::{
     atlas::{GlyphAtlas, GlyphKey},
     color::color_to_linear,
+    cursor::CursorState,
     gpu_types::{BgQuadInstance, GlyphInstance},
+    selection::SelectionRange,
     surface::GpuContext,
 };
 
@@ -239,8 +241,10 @@ impl Compositor {
         scale: f32,
         rect_px: [f32; 4],
         grid: &TerminalGrid,
+        selection: Option<SelectionRange>,
+        cursor: Option<CursorState>,
     ) -> anyhow::Result<()> {
-        self.render_terminal_panes(gpu, atlas, scale, &[(rect_px, grid)])
+        self.render_terminal_panes(gpu, atlas, scale, &[(rect_px, grid)], &[selection], &[cursor])
     }
 
     /// Render multiple terminal panes in one frame.
@@ -250,10 +254,20 @@ impl Compositor {
         atlas: &mut GlyphAtlas,
         scale: f32,
         panes: &[([f32; 4], &TerminalGrid)],
+        selections: &[Option<SelectionRange>],
+        cursors: &[Option<CursorState>],
     ) -> anyhow::Result<()> {
         if panes.is_empty() {
             return Ok(());
         }
+        debug_assert!(
+            selections.len() == panes.len(),
+            "selections slice must match panes length"
+        );
+        debug_assert!(
+            cursors.len() == panes.len(),
+            "cursors slice must match panes length"
+        );
         // Update atlas scale
         atlas.set_raster_scale(scale);
 
@@ -273,9 +287,15 @@ impl Compositor {
         let mut bg_insts:    Vec<BgQuadInstance> = Vec::new();
         let mut glyph_insts: Vec<GlyphInstance>  = Vec::new();
 
-        for (rect_px, grid) in panes.iter() {
+        for (pane_idx, (rect_px, grid)) in panes.iter().enumerate() {
             let origin_x = rect_px[0];
             let origin_y = rect_px[1];
+            let selection = selections.get(pane_idx).copied().unwrap_or(None);
+            let cursor = cursors
+                .get(pane_idx)
+                .copied()
+                .flatten()
+                .filter(|c| c.visible && c.row < grid.rows && c.col < grid.cols);
 
             for row in 0..grid.rows {
                 for col in 0..grid.cols {
@@ -286,14 +306,37 @@ impl Compositor {
                         continue;
                     }
 
+                    let is_selected = selection
+                        .map_or(false, |sel| sel.contains(row, col, grid.rows, grid.cols));
+                    let is_cursor_cell = cursor
+                        .is_some_and(|cursor_state| cursor_state.row == row && cursor_state.col == col);
+
                     let px = origin_x + col as f32 * cell_w;
                     let py = origin_y + row as f32 * cell_h;
                     let gw = if cell.wide == WideKind::Leading { cell_w * 2.0 } else { cell_w };
 
+                    let reverse = cell.attrs.contains(termite_vt::CellAttrs::REVERSE);
+                    let normal_fg = if reverse {
+                        // Reverse: glyph foreground comes from the cell background.
+                        color_to_linear(cell.bg, false)
+                    } else {
+                        color_to_linear(cell.fg, true)
+                    };
+                    let normal_bg = if reverse {
+                        color_to_linear(cell.fg, true)
+                    } else {
+                        color_to_linear(cell.bg, false)
+                    };
+
+                    // Selection/cursor highlight: invert the effective fg/bg.
+                    let (render_fg, render_bg) = if is_selected || is_cursor_cell {
+                        (normal_bg, normal_fg)
+                    } else {
+                        (normal_fg, normal_bg)
+                    };
+
                     // Background
-                    let bg_color = color_to_linear(cell.bg, false);
-                    // Only emit a bg quad if it differs from the surface clear color
-                    // (optimisation: skip default-bg cells that match the clear)
+                    let bg_color = render_bg;
                     bg_insts.push(BgQuadInstance {
                         rect:  [px, py, gw, cell_h],
                         color: bg_color,
@@ -301,13 +344,6 @@ impl Compositor {
 
                     // Glyph — skip space characters (no visible glyph)
                     if cell.ch != ' ' {
-                        let (eff_fg, eff_bg) = if cell.attrs.contains(termite_vt::CellAttrs::REVERSE) {
-                            (color_to_linear(cell.bg, false), color_to_linear(cell.fg, true))
-                        } else {
-                            (color_to_linear(cell.fg, true), color_to_linear(cell.bg, false))
-                        };
-                        let _ = eff_bg; // bg already emitted above
-
                         let key = GlyphKey {
                             ch:           cell.ch,
                             bold:         cell.attrs.contains(termite_vt::CellAttrs::BOLD),
@@ -319,7 +355,7 @@ impl Compositor {
                             glyph_insts.push(GlyphInstance {
                                 dest_rect: [px, py, uv.px_w as f32, uv.px_h as f32],
                                 src_rect:  [uv.u, uv.v, uv.uw, uv.vh],
-                                color:     eff_fg,
+                                color:     render_fg,
                             });
                         }
                     }

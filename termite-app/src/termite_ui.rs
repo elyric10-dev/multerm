@@ -1,5 +1,5 @@
 use crossbeam_channel::unbounded;
-use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
+use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke, Vec2,
 };
@@ -20,10 +20,12 @@ use sysinfo::{
 };
 use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
 use termite_render::color::ansi_indexed_to_rgb;
+use termite_render::SelectionRange;
 use termite_vt::cell::{Cell, CellAttrs, Color, WideKind};
 use termite_vt::TerminalGrid;
 
 mod daemon;
+mod clipboard;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -557,8 +559,9 @@ struct TermiteUi {
     /// Live CPU / RAM / load readings (`sysinfo`).
     system: System,
     system_last_sample: Instant,
-    /// `Some(true)` => termite panel pinned, `Some(false)` => system panel pinned.
-    usage_panel_pinned_scope: Option<bool>,
+    /// Open usage panels, ordered from oldest click to newest click.
+    /// `true` => termite panel, `false` => system panel.
+    usage_panel_open_order: Vec<bool>,
     show_termite_only_status: bool,
     equal_size_picker_open: bool,
     equal_size_picker_selection: Option<u64>,
@@ -571,6 +574,7 @@ struct WorkspaceRuntime {
     terminals: Vec<TerminalPane>,
     active_terminal: Option<usize>,
     equal_size_source_terminal_id: Option<u64>,
+    selections: Vec<Option<SelectionRange>>,
 }
 
 struct WorkspaceTab {
@@ -604,6 +608,8 @@ struct WorkspaceState {
     color_history: Vec<[u8; 4]>,
     #[serde(default)]
     usage_panel_pinned_scope: Option<bool>,
+    #[serde(default)]
+    usage_panel_open_order: Vec<bool>,
     #[serde(default)]
     show_termite_only_status: bool,
 }
@@ -688,7 +694,11 @@ impl Default for TermiteUi {
                 pending_spawn_flash_until: None,
                 system: system_status_probe_new(),
                 system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
-                usage_panel_pinned_scope: state.usage_panel_pinned_scope,
+                usage_panel_open_order: if state.usage_panel_open_order.is_empty() {
+                    state.usage_panel_pinned_scope.into_iter().collect()
+                } else {
+                    state.usage_panel_open_order
+                },
                 show_termite_only_status: state.show_termite_only_status,
                 equal_size_picker_open: false,
                 equal_size_picker_selection: None,
@@ -815,7 +825,7 @@ impl Default for TermiteUi {
             pending_spawn_flash_until: None,
             system: system_status_probe_new(),
             system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
-            usage_panel_pinned_scope: None,
+            usage_panel_open_order: Vec::new(),
             show_termite_only_status: false,
             equal_size_picker_open: false,
             equal_size_picker_selection: None,
@@ -893,6 +903,22 @@ fn new_terminal_context_menu(
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
         app.add_terminal(spawn_pos, anchor_terminal);
         app.launch_cli_tool(None, "codex");
+        app.pending_context_terminal = None;
+        ui.close();
+    }
+    if is_cli_command_available("gemini") && ui.button("New Gemini").clicked() {
+        let spawn_pos = app.pending_terminal_spawn_pos.take();
+        let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
+        app.add_terminal(spawn_pos, anchor_terminal);
+        app.launch_cli_tool(None, "gemini");
+        app.pending_context_terminal = None;
+        ui.close();
+    }
+    if is_cli_command_available("agent") && ui.button("New Cursor").clicked() {
+        let spawn_pos = app.pending_terminal_spawn_pos.take();
+        let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
+        app.add_terminal(spawn_pos, anchor_terminal);
+        app.launch_cli_tool(None, "agent");
         app.pending_context_terminal = None;
         ui.close();
     }
@@ -1014,17 +1040,12 @@ impl eframe::App for TermiteUi {
                                     .size(11.0)
                                     .color(p.text),
                             )
-                            .sense(Sense::hover()),
+                            .sense(Sense::click()),
                         )
-                        .on_hover_cursor(CursorIcon::Default);
-                        let term_resp = if self.usage_panel_pinned_scope.is_none() {
-                            term_resp.on_hover_ui(|ui| {
-                                self.show_termite_only_status = true;
-                                self.draw_usage_hover_panel(ui, p, true);
-                            })
-                        } else {
-                            term_resp
-                        };
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                        if term_resp.clicked() {
+                            self.toggle_usage_panel(true);
+                        }
 
                         let sep_resp = ui.label(RichText::new("|").size(11.0).color(p.muted));
                         let mut selector_resp = term_resp.union(sep_resp);
@@ -1035,17 +1056,12 @@ impl eframe::App for TermiteUi {
                                     .size(11.0)
                                     .color(p.text),
                             )
-                            .sense(Sense::hover()),
+                            .sense(Sense::click()),
                         )
-                        .on_hover_cursor(CursorIcon::Default);
-                        let sys_resp = if self.usage_panel_pinned_scope.is_none() {
-                            sys_resp.on_hover_ui(|ui| {
-                                self.show_termite_only_status = false;
-                                self.draw_usage_hover_panel(ui, p, false);
-                            })
-                        } else {
-                            sys_resp
-                        };
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                        if sys_resp.clicked() {
+                            self.toggle_usage_panel(false);
+                        }
                         selector_resp = selector_resp.union(sys_resp);
 
                         ui.add_space(6.0);
@@ -1061,21 +1077,31 @@ impl eframe::App for TermiteUi {
                 });
             });
 
-        if let Some(pinned_scope) = self.usage_panel_pinned_scope {
-            let content = ctx.content_rect();
-            let panel_pos = Pos2::new(content.right() - 318.0, content.bottom() - 184.0);
-            egui::Area::new("usage_panel_pinned".into())
-                .order(egui::Order::Foreground)
-                .fixed_pos(panel_pos)
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(p.popover_fill)
-                        .stroke(Stroke::new(1.0, p.path_bar_border))
-                        .inner_margin(Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            self.draw_usage_hover_panel(ui, p, pinned_scope);
-                        });
-                });
+        if !self.usage_panel_open_order.is_empty() {
+            const USAGE_PANEL_STEP: f32 = 118.0;
+            const USAGE_PANEL_RIGHT_MARGIN: f32 = 8.0;
+            const USAGE_PANEL_BOTTOM_MARGIN: f32 = 42.0;
+            let open_scopes = self.usage_panel_open_order.clone();
+            for (idx, scope) in open_scopes.into_iter().enumerate() {
+                egui::Area::new(egui::Id::new(("usage_panel_pinned", scope)))
+                    .order(egui::Order::Foreground)
+                    .anchor(
+                        egui::Align2::RIGHT_BOTTOM,
+                        Vec2::new(
+                            -USAGE_PANEL_RIGHT_MARGIN,
+                            -(USAGE_PANEL_BOTTOM_MARGIN + USAGE_PANEL_STEP * idx as f32),
+                        ),
+                    )
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(p.popover_fill)
+                            .stroke(Stroke::new(1.0, p.path_bar_border))
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                self.draw_usage_hover_panel(ui, p, scope);
+                            });
+                    });
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1824,7 +1850,9 @@ impl eframe::App for TermiteUi {
                                     }
                                 }
 
-                                let is_active = runtime.active_terminal == Some(idx);
+                                let pane_count = left_group.len() + right_group.len();
+                                let is_active = runtime.active_terminal == Some(idx)
+                                    || (runtime.active_terminal.is_none() && pane_count == 1);
                                 let mut border = if is_active { p.terminal_border_active } else { p.border };
                                 let mut stroke_w: f32 = 2.0;
                                 if let (Some(blink_id), Some(started_at)) = (equal_size_template_blink_terminal_id, equal_size_template_blink_started_at) {
@@ -1855,7 +1883,17 @@ impl eframe::App for TermiteUi {
                                     }
                                 }
 
-                                let pane_response = ui.allocate_rect(pane_rect, Sense::click());
+                                let pane_response = ui
+                                    .allocate_rect(pane_rect, Sense::click())
+                                    .on_hover_cursor(CursorIcon::Text);
+                                let pointer_in_pane = ui
+                                    .ctx()
+                                    .pointer_hover_pos()
+                                    .is_some_and(|pos| pane_rect.contains(pos));
+                                if pane_response.hovered() || pointer_in_pane {
+                                    ui.ctx().set_cursor_icon(CursorIcon::Text);
+                                }
+                                let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
                                 ui.scope_builder(
                                     egui::UiBuilder::new().max_rect(pane_rect),
                                     |ui| {
@@ -1892,12 +1930,62 @@ impl eframe::App for TermiteUi {
                                                 let terminal_size =
                                                     Vec2::new(pane.desired_size.x, terminal_height);
                                                 resize_terminal_for_size(pane, terminal_size);
-                                                render_terminal_grid(
+                                                let selection = runtime
+                                                    .selections
+                                                    .get(idx)
+                                                    .copied()
+                                                    .unwrap_or(None);
+                                                let grid = pane.session.parser.grid();
+                                                let show_caret = pane.session.parser.cursor_visible()
+                                                    || pane.session.parser.app_cursor_keys()
+                                                    || grid.in_alt;
+                                                clicked_cell_from_grid = render_terminal_grid(
                                                     ui,
                                                     pane.id,
-                                                    pane.session.parser.grid(),
+                                                    grid,
                                                     p,
+                                                    selection,
+                                                    is_active,
+                                                    show_caret,
                                                 );
+
+                                                if let Some((clicked_row, clicked_col)) = clicked_cell_from_grid
+                                                {
+                                                    let grid = pane.session.parser.grid();
+                                                    if grid.cols > 0 {
+                                                        let target_row = clicked_row
+                                                            .min(grid.rows.saturating_sub(1));
+                                                        let row_end = row_render_end(grid, target_row)
+                                                            .min(grid.cols.saturating_sub(1));
+                                                        let target_col = clicked_col
+                                                            .min(row_end.saturating_add(1))
+                                                            .min(grid.cols.saturating_sub(1));
+
+                                                        let mut bytes = Vec::new();
+                                                        // Horizontal targeting only (do not send Up/Down,
+                                                        // which can trigger shell/TUI history navigation).
+                                                        if clicked_col >= row_end {
+                                                            // For readline-like prompts, this reliably lands at line end.
+                                                            bytes.push(0x05); // Ctrl+E
+                                                        } else if target_col > grid.cursor.col {
+                                                            let steps = target_col - grid.cursor.col;
+                                                            bytes.reserve(bytes.len() + steps * 3);
+                                                            for _ in 0..steps {
+                                                                bytes.extend_from_slice(b"\x1b[C");
+                                                            }
+                                                        } else if target_col < grid.cursor.col {
+                                                            let steps = grid.cursor.col - target_col;
+                                                            bytes.reserve(bytes.len() + steps * 3);
+                                                            for _ in 0..steps {
+                                                                bytes.extend_from_slice(b"\x1b[D");
+                                                            }
+                                                        }
+
+                                                        if !bytes.is_empty() {
+                                                            pane.backend.write_all(&bytes);
+                                                        }
+                                                    }
+                                                }
                                             });
                                     },
                                 );
@@ -1905,12 +1993,18 @@ impl eframe::App for TermiteUi {
                                 if pane_response.clicked() {
                                     runtime.active_terminal = Some(idx);
                                     clicked_on_pane = true;
-                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                                    // If user clicked inside pane but not on rendered text content,
+                                    // treat it as "move caret to end of current input line".
+                                    if clicked_cell_from_grid.is_none() {
+                                        pane.backend.write_all(&[0x05]); // Ctrl+E
+                                    }
+                                    // Allow egui to forward `Event::Text` into the PTY.
+                                    // Without this, we only see some Key events (e.g. delete/backspace).
                                 }
                                 if pane_response.secondary_clicked() {
                                     runtime.active_terminal = Some(idx);
                                     clicked_on_pane = true;
-                                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                                    // Allow egui to forward `Event::Text` into the PTY.
                                 }
                                 if near_br_corner || resize_br.hovered() || resize_br.dragged() {
                                     paint_br_resize_line(
@@ -1948,6 +2042,7 @@ impl eframe::App for TermiteUi {
                                 let was_active = runtime.active_terminal == Some(idx);
                                 let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
                                 runtime.terminals.remove(idx);
+                            runtime.selections.remove(idx);
                                 if runtime
                                     .equal_size_source_terminal_id
                                     .is_some_and(|id| Some(id) == removed_id)
@@ -2002,6 +2097,19 @@ impl TermiteUi {
         );
     }
 
+    fn toggle_usage_panel(&mut self, termite_only: bool) {
+        if let Some(existing_idx) = self
+            .usage_panel_open_order
+            .iter()
+            .position(|scope| *scope == termite_only)
+        {
+            self.usage_panel_open_order.remove(existing_idx);
+            return;
+        }
+        self.show_termite_only_status = termite_only;
+        self.usage_panel_open_order.push(termite_only);
+    }
+
     fn draw_usage_hover_panel(&mut self, ui: &mut egui::Ui, p: UiPalette, termite_only: bool) {
         ui.set_min_width(300.0);
         ui.label(
@@ -2052,15 +2160,6 @@ impl TermiteUi {
                     .size(10.0)
                     .color(p.muted),
             );
-            ui.separator();
-            let mut pinned_here = self.usage_panel_pinned_scope == Some(true);
-            let pin_resp = ui.checkbox(
-                &mut pinned_here,
-                RichText::new("Always show").size(11.0).color(p.muted),
-            );
-            if pin_resp.changed() {
-                self.usage_panel_pinned_scope = if pinned_here { Some(true) } else { None };
-            }
             return;
         }
 
@@ -2101,15 +2200,6 @@ impl TermiteUi {
                 Color32::from_rgb(234, 162, 86),
                 p,
             );
-        }
-        ui.separator();
-        let mut pinned_here = self.usage_panel_pinned_scope == Some(false);
-        let pin_resp = ui.checkbox(
-            &mut pinned_here,
-            RichText::new("Always show").size(11.0).color(p.muted),
-        );
-        if pin_resp.changed() {
-            self.usage_panel_pinned_scope = if pinned_here { Some(false) } else { None };
         }
     }
 
@@ -2259,6 +2349,7 @@ impl TermiteUi {
             };
             pane.position = Some(position);
             runtime.terminals.push(pane);
+            runtime.selections.push(None);
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
         self.next_terminal_id = next_terminal_id + 1;
@@ -2277,6 +2368,11 @@ impl TermiteUi {
         let Some(runtime) = self.active_workspace_runtime_mut() else {
             return;
         };
+        if runtime.selections.len() < runtime.terminals.len() {
+            runtime.selections.resize(runtime.terminals.len(), None);
+        } else if runtime.selections.len() > runtime.terminals.len() {
+            runtime.selections.truncate(runtime.terminals.len());
+        }
         let Some(active_idx) = runtime.active_terminal else {
             return;
         };
@@ -2293,6 +2389,13 @@ impl TermiteUi {
                         runtime.terminals[active_idx].backend.write_all(text.as_bytes());
                     }
                 }
+                egui::Event::Paste(text) => {
+                    if !text.is_empty() {
+                        let bytes = clipboard::clipboard_text_to_pty_bytes(&text);
+                        runtime.terminals[active_idx].backend.write_all(&bytes);
+                    }
+                    runtime.selections[active_idx] = None;
+                }
                 egui::Event::Key {
                     key,
                     pressed,
@@ -2303,7 +2406,52 @@ impl TermiteUi {
                         shortcut_new_terminal = true;
                         continue;
                     }
-                    if let Some(bytes) = key_to_ansi_bytes(key, modifiers.shift) {
+
+                    // macOS-like shortcuts:
+                    // - Cmd/Ctrl+Shift+A = Select all
+                    // - Cmd/Ctrl+Shift+C = Copy (rich text via ANSI SGR)
+                    // - Cmd/Ctrl+Shift+V = Paste
+                    // - Shift+Insert     = Paste
+                    let cmd = modifiers.command;
+                    let ctrl = modifiers.ctrl;
+                    let shift = modifiers.shift;
+
+                    let is_select_all = (cmd && key == egui::Key::A)
+                        || (cmd && shift && key == egui::Key::A)
+                        || (ctrl && shift && key == egui::Key::A);
+                    if is_select_all {
+                        let grid = runtime.terminals[active_idx].session.parser.grid();
+                        if grid.rows > 0 && grid.cols > 0 {
+                            runtime.selections[active_idx] = Some(SelectionRange {
+                                start_row: 0,
+                                start_col: 0,
+                                end_row: grid.rows - 1,
+                                end_col: grid.cols - 1,
+                                active: true,
+                            });
+                        }
+                        continue;
+                    }
+
+                    let is_copy =
+                        (cmd && key == egui::Key::C) || (ctrl && shift && key == egui::Key::C);
+                    if is_copy {
+                        if let Some(range) =
+                            runtime.selections.get(active_idx).copied().unwrap_or(None)
+                        {
+                            let grid =
+                                runtime.terminals[active_idx].session.parser.grid();
+                            let text = clipboard::selection_to_ansi_sgr_text(grid, range);
+                            if let Err(_e) = clipboard::set_clipboard_text(&text) {}
+                        }
+                        // Even without an internal rich selection, don't forward the
+                        // keystroke into the PTY (Cmd/C is typically used for copy).
+                        continue;
+                    }
+
+                    if let Some(bytes) =
+                        key_to_ansi_bytes(key, shift, modifiers.ctrl)
+                    {
                         runtime.terminals[active_idx].backend.write_all(&bytes);
                     }
                 }
@@ -2343,6 +2491,22 @@ impl TermiteUi {
             .backend
             .write_all(format!("{command}\n").as_bytes());
     }
+
+}
+
+fn is_cli_command_available(command: &str) -> bool {
+    if !command
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn read_frame_tcp(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
@@ -2575,9 +2739,21 @@ fn cell_text_format(
         (cell.fg, cell.bg)
     };
 
-    let mut fg = color32_from_vt_color(fg_src, true, vt_default_fg);
-    let bg_opaque = color32_from_vt_color(bg_src, false, vt_default_fg);
-    let background = if matches!(bg_src, Color::Default) {
+    // Under reverse, a Default source has to resolve concretely: the displayed fg
+    // becomes the terminal bg, and the displayed bg becomes the default fg color.
+    // Otherwise reverse-on-default renders as transparent and is invisible (e.g.
+    // Claude Code's `\e[7m \e[27m` cursor block).
+    let mut fg = match (reverse, fg_src) {
+        (true, Color::Default) => term_bg,
+        _ => color32_from_vt_color(fg_src, true, vt_default_fg),
+    };
+    let bg_opaque = match (reverse, bg_src) {
+        (true, Color::Default) => vt_default_fg,
+        _ => color32_from_vt_color(bg_src, false, vt_default_fg),
+    };
+    let background = if reverse {
+        bg_opaque
+    } else if matches!(bg_src, Color::Default) {
         Color32::TRANSPARENT
     } else {
         bg_opaque
@@ -2625,6 +2801,12 @@ fn formats_match(a: &TextFormat, b: &TextFormat) -> bool {
 
 /// Last column index + 1 to render on `row`, trimming only trailing unstyled spaces.
 fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
+    // Styling that makes an otherwise-blank space visually non-trivial
+    // (reverse swaps fg/bg, underline/strikethrough draw strokes). Trimming such
+    // cells hides TUI cursors that render as `\e[7m \e[27m` on a default bg.
+    let visible_space_attrs =
+        CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
+
     let mut end = grid.cols;
     while end > 0 {
         let cell = grid.cell(row, end - 1);
@@ -2635,7 +2817,10 @@ fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
         if cell.ch != ' ' {
             break;
         }
-        if cell.fg != Color::Default || cell.bg != Color::Default || !cell.attrs.is_empty() {
+        if cell.bg != Color::Default {
+            break;
+        }
+        if cell.attrs.intersects(visible_space_attrs) {
             break;
         }
         end -= 1;
@@ -2643,7 +2828,15 @@ fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
     end
 }
 
-fn render_terminal_grid(ui: &mut egui::Ui, pane_id: u64, grid: &TerminalGrid, p: UiPalette) {
+fn render_terminal_grid(
+    ui: &mut egui::Ui,
+    pane_id: u64,
+    grid: &TerminalGrid,
+    p: UiPalette,
+    selection: Option<SelectionRange>,
+    is_focused_terminal: bool,
+    show_caret: bool,
+) -> Option<(usize, usize)> {
     let font_id = FontId::monospace(12.0);
     let newline_fmt = TextFormat {
         font_id: font_id.clone(),
@@ -2652,9 +2845,21 @@ fn render_terminal_grid(ui: &mut egui::Ui, pane_id: u64, grid: &TerminalGrid, p:
         ..Default::default()
     };
 
+    // Bake the block cursor directly into the LayoutJob so it is pixel-perfectly
+    // aligned with the glyph grid (avoids painter-overlay Y drift).
+    // Keep caret always visible to avoid blink/repaint desync in TUIs.
+    let show_block_cursor = is_focused_terminal && show_caret;
+    let cursor_row = grid.cursor.row.min(grid.rows.saturating_sub(1));
+    let cursor_col = grid.cursor.col.min(grid.cols.saturating_sub(1));
+
     let mut job = LayoutJob::default();
     for row in 0..grid.rows {
-        let trim_end = row_render_end(grid, row);
+        let mut trim_end = row_render_end(grid, row);
+        // Extend the rendered region to cover the cursor cell so the block
+        // cursor is visible even when it sits on a trailing space.
+        if show_block_cursor && row == cursor_row && cursor_col < grid.cols {
+            trim_end = trim_end.max(cursor_col + 1);
+        }
         let mut col = 0;
         while col < trim_end {
             let cell = grid.cell(row, col);
@@ -2663,7 +2868,31 @@ fn render_terminal_grid(ui: &mut egui::Ui, pane_id: u64, grid: &TerminalGrid, p:
                 continue;
             }
 
-            let fmt = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
+            let mut fmt = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
+            let is_selected = selection
+                .map_or(false, |sel| sel.contains(row, col, grid.rows, grid.cols));
+            if is_selected {
+                // Invert the displayed fg/bg to highlight selection.
+                let normal_fg = fmt.color;
+                let normal_bg = if fmt.background == Color32::TRANSPARENT {
+                    p.term_bg
+                } else {
+                    fmt.background
+                };
+                fmt.color = normal_bg;
+                fmt.background = normal_fg;
+            }
+            // Block cursor: invert this cell's colors so the cursor is a
+            // filled rectangle aligned with the rest of the glyph grid.
+            if show_block_cursor && row == cursor_row && col == cursor_col {
+                let effective_bg = if fmt.background == Color32::TRANSPARENT {
+                    p.term_bg
+                } else {
+                    fmt.background
+                };
+                fmt.background = fmt.color;
+                fmt.color = effective_bg;
+            }
             let mut chunk = String::new();
             chunk.push(cell.ch);
 
@@ -2673,6 +2902,11 @@ fn render_terminal_grid(ui: &mut egui::Ui, pane_id: u64, grid: &TerminalGrid, p:
             }
 
             while next < trim_end {
+                // Never merge the cursor cell into a preceding run so the
+                // block-cursor format is applied to exactly one segment.
+                if show_block_cursor && row == cursor_row && next == cursor_col {
+                    break;
+                }
                 let c2 = grid.cell(row, next);
                 if c2.wide == WideKind::Trailing {
                     next += 1;
@@ -2698,21 +2932,59 @@ fn render_terminal_grid(ui: &mut egui::Ui, pane_id: u64, grid: &TerminalGrid, p:
         }
     }
 
-    egui::ScrollArea::vertical()
+    let mut clicked_cell: Option<(usize, usize)> = None;
+    egui::ScrollArea::both()
         .id_salt(("term-scroll", pane_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            job.wrap = TextWrapping::wrap_at_width(ui.available_width());
-            ui.add(
+            let row_h = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
+            let glyph_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'W')).max(1.0);
+            let response = ui.add(
                 egui::Label::new(job)
-                    .selectable(false)
-                    .sense(Sense::hover())
-                    .wrap_mode(egui::TextWrapMode::Wrap),
-            );
+                    .selectable(true)
+                    .sense(Sense::click_and_drag())
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            )
+            .on_hover_cursor(CursorIcon::Text);
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::Text);
+            }
+
+            if response.clicked() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let local = pointer - response.rect.min;
+                    let row = (local.y / row_h).floor().max(0.0) as usize;
+                    let col = (local.x / glyph_w).floor().max(0.0) as usize;
+                    clicked_cell = Some((row, col));
+                }
+            }
+
+            // Fallback cursor overlay: guarantees a visible caret even when the
+            // current cell is a trailing space run that the text layout may trim.
+            if show_caret && grid.rows > 0 && grid.cols > 0 {
+                let caret_row = cursor_row.min(grid.rows.saturating_sub(1));
+                let caret_col = cursor_col.min(grid.cols.saturating_sub(1));
+                let caret_x = response.rect.min.x + caret_col as f32 * glyph_w;
+                let caret_y = response.rect.min.y + caret_row as f32 * row_h;
+                let caret_rect = egui::Rect::from_min_size(
+                    Pos2::new(caret_x, caret_y),
+                    Vec2::new(glyph_w.clamp(6.0, 12.0), row_h.max(10.0)),
+                );
+                ui.painter().rect_filled(caret_rect, 0.0, Color32::WHITE);
+                ui.painter().rect_stroke(
+                    caret_rect,
+                    0.0,
+                    Stroke::new(1.0, Color32::BLACK),
+                    egui::StrokeKind::Outside,
+                );
+                // Keep the caret in view for TUIs that place the prompt near the bottom.
+                ui.scroll_to_rect(caret_rect, Some(egui::Align::Center));
+            }
         });
+    clicked_cell
 }
 
-fn key_to_ansi_bytes(key: egui::Key, shift: bool) -> Option<Vec<u8>> {
+fn key_to_ansi_bytes(key: egui::Key, shift: bool, ctrl: bool) -> Option<Vec<u8>> {
     match key {
         egui::Key::Enter => Some(vec![b'\r']),
         egui::Key::Tab => Some(if shift {
@@ -2722,6 +2994,99 @@ fn key_to_ansi_bytes(key: egui::Key, shift: bool) -> Option<Vec<u8>> {
         }),
         egui::Key::Backspace => Some(vec![0x7f]),
         egui::Key::Escape => Some(vec![0x1b]),
+        egui::Key::Insert => Some(b"\x1b[2~".to_vec()),
+        // Printable characters (including space) are delivered via `egui::Event::Text`.
+        // Avoid emitting them from `Event::Key` to prevent double-insertion.
+        egui::Key::Space => None,
+
+        // Ctrl+letter -> control codes.
+        // (Used when egui doesn't deliver `Event::Text`.)
+        k @ egui::Key::A
+        | k @ egui::Key::B
+        | k @ egui::Key::C
+        | k @ egui::Key::D
+        | k @ egui::Key::E
+        | k @ egui::Key::F
+        | k @ egui::Key::G
+        | k @ egui::Key::H
+        | k @ egui::Key::I
+        | k @ egui::Key::J
+        | k @ egui::Key::K
+        | k @ egui::Key::L
+        | k @ egui::Key::M
+        | k @ egui::Key::N
+        | k @ egui::Key::O
+        | k @ egui::Key::P
+        | k @ egui::Key::Q
+        | k @ egui::Key::R
+        | k @ egui::Key::S
+        | k @ egui::Key::T
+        | k @ egui::Key::U
+        | k @ egui::Key::V
+        | k @ egui::Key::W
+        | k @ egui::Key::X
+        | k @ egui::Key::Y
+        | k @ egui::Key::Z => {
+            // Avoid double-insertion: letters are delivered via `egui::Event::Text`.
+            // Here we only handle Ctrl+letter as control codes.
+            if !ctrl {
+                return None;
+            }
+
+            // ctrl pressed: encode control code.
+            let upper = match k {
+                egui::Key::A => b'A',
+                egui::Key::B => b'B',
+                egui::Key::C => b'C',
+                egui::Key::D => b'D',
+                egui::Key::E => b'E',
+                egui::Key::F => b'F',
+                egui::Key::G => b'G',
+                egui::Key::H => b'H',
+                egui::Key::I => b'I',
+                egui::Key::J => b'J',
+                egui::Key::K => b'K',
+                egui::Key::L => b'L',
+                egui::Key::M => b'M',
+                egui::Key::N => b'N',
+                egui::Key::O => b'O',
+                egui::Key::P => b'P',
+                egui::Key::Q => b'Q',
+                egui::Key::R => b'R',
+                egui::Key::S => b'S',
+                egui::Key::T => b'T',
+                egui::Key::U => b'U',
+                egui::Key::V => b'V',
+                egui::Key::W => b'W',
+                egui::Key::X => b'X',
+                egui::Key::Y => b'Y',
+                egui::Key::Z => b'Z',
+                _ => 0,
+            };
+            if upper == 0 {
+                return None;
+            }
+            // A -> 0x01 ... Z -> 0x1A
+            let code = (upper - b'A' + 1) & 0x1F;
+            Some(vec![code])
+        }
+
+        // Digits (and shifted symbols).
+        d @ egui::Key::Num0
+        | d @ egui::Key::Num1
+        | d @ egui::Key::Num2
+        | d @ egui::Key::Num3
+        | d @ egui::Key::Num4
+        | d @ egui::Key::Num5
+        | d @ egui::Key::Num6
+        | d @ egui::Key::Num7
+        | d @ egui::Key::Num8
+        | d @ egui::Key::Num9 => {
+            // Digits are delivered via `egui::Event::Text`; avoid duplicating.
+            let _ = (d, shift, ctrl);
+            None
+        }
+
         egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
         egui::Key::ArrowDown => Some(b"\x1b[B".to_vec()),
         egui::Key::ArrowRight => Some(b"\x1b[C".to_vec()),
@@ -2731,6 +3096,10 @@ fn key_to_ansi_bytes(key: egui::Key, shift: bool) -> Option<Vec<u8>> {
         egui::Key::Delete => Some(b"\x1b[3~".to_vec()),
         egui::Key::PageUp => Some(b"\x1b[5~".to_vec()),
         egui::Key::PageDown => Some(b"\x1b[6~".to_vec()),
+
+        // Printable punctuation is delivered via `egui::Event::Text`.
+        // Keep `Event::Key` focused on control/navigation keys to avoid double insertion.
+
         _ => None,
     }
 }
@@ -3274,7 +3643,8 @@ fn save_workspace_state(app: &TermiteUi) {
             .collect(),
         next_workspace_index: app.next_workspace_index,
         color_history: app.color_history.clone(),
-        usage_panel_pinned_scope: app.usage_panel_pinned_scope,
+        usage_panel_pinned_scope: app.usage_panel_open_order.last().copied(),
+        usage_panel_open_order: app.usage_panel_open_order.clone(),
         show_termite_only_status: app.show_termite_only_status,
     };
 

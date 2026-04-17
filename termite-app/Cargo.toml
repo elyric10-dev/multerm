@@ -28,4 +28,5 @@ pollster       = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 sysinfo        = { workspace = true }
+arboard        = { workspace = true }
 rfd = "0.17.2"
