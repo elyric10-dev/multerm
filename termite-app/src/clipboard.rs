@@ -193,6 +193,7 @@ pub fn set_clipboard_text(text: &str) -> Result<(), anyhow::Error> {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_clipboard_text() -> Result<String, anyhow::Error> {
     // Primary: arboard (cross-platform).
     if let Ok(mut clipboard) = Clipboard::new() {

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     io::{Read, Write},
     net::TcpStream,
@@ -30,6 +31,66 @@ const MAX_PANES: usize = 4;
 const DIVIDER_GRAB_RADIUS: f32 = 8.0;
 const SPLIT_MIN_RATIO: f32 = 0.2;
 const SPLIT_MAX_RATIO: f32 = 0.8;
+const SNAPSHOT_CAPACITY: usize = 50;
+
+struct PaneHistory {
+    snapshots: VecDeque<termite_vt::TerminalGrid>,
+    /// How many steps back we are from live. 0 = live view.
+    steps_back: usize,
+}
+
+impl PaneHistory {
+    fn new() -> Self {
+        Self { snapshots: VecDeque::new(), steps_back: 0 }
+    }
+
+    /// Push a snapshot of the current grid (called before each PTY data batch).
+    /// Ignored while the user is browsing history so indices stay stable.
+    fn push(&mut self, grid: termite_vt::TerminalGrid) {
+        if self.steps_back > 0 {
+            return;
+        }
+        self.snapshots.push_front(grid);
+        if self.snapshots.len() > SNAPSHOT_CAPACITY {
+            self.snapshots.pop_back();
+        }
+    }
+
+    /// Step one snapshot further back. Returns false if already at the oldest.
+    fn undo(&mut self) -> bool {
+        let next = self.steps_back + 1;
+        if next > self.snapshots.len() {
+            return false;
+        }
+        self.steps_back = next;
+        true
+    }
+
+    /// Step one snapshot toward live. Returns false if already live.
+    fn redo(&mut self) -> bool {
+        if self.steps_back == 0 {
+            return false;
+        }
+        self.steps_back -= 1;
+        true
+    }
+
+    fn resume_live(&mut self) {
+        self.steps_back = 0;
+    }
+
+    fn is_live(&self) -> bool {
+        self.steps_back == 0
+    }
+
+    /// Returns the snapshot grid to display, or `None` when live.
+    fn current_snapshot(&self) -> Option<&termite_vt::TerminalGrid> {
+        if self.steps_back == 0 {
+            return None;
+        }
+        self.snapshots.get(self.steps_back - 1)
+    }
+}
 
 // Protocol frames for the session daemon (mirrors `daemon.rs`).
 const FRAME_ATTACH: u8 = 1;
@@ -104,6 +165,7 @@ pub struct TermiteApp {
     selections: Vec<Option<SelectionRange>>,
     selection_drag: Option<SelectionDrag>,
     cursor_pos: (f32, f32),
+    histories: Vec<PaneHistory>,
 
     // Keyboard modifier state
     mods: ModifiersState,
@@ -125,6 +187,7 @@ impl TermiteApp {
             selections: Vec::new(),
             selection_drag: None,
             cursor_pos: (0.0, 0.0),
+            histories: Vec::new(),
             mods: ModifiersState::empty(),
         }
     }
@@ -413,6 +476,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
         let pane_index = self.panes.len();
         self.panes.push(self.spawn_pane(24, 80, pane_index));
         self.selections.push(None);
+        self.histories.push(PaneHistory::new());
         self.active_pane = self.panes.len().saturating_sub(1);
         self.resize_panes_to_layout();
     }
@@ -510,6 +574,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         self.compositor = Some(compositor);
         self.panes = vec![self.spawn_pane(rows, cols, 0)];
         self.selections = vec![None];
+        self.histories = vec![PaneHistory::new()];
         self.selection_drag = None;
         self.active_pane = 0;
 
@@ -640,7 +705,10 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData => {
-                for pane in &mut self.panes {
+                for (pane, history) in self.panes.iter_mut().zip(self.histories.iter_mut()) {
+                    if history.is_live() {
+                        history.push(pane.session.parser.grid().clone());
+                    }
                     pane.session.drain_and_parse();
                 }
                 if let Some(window) = &self.window {
@@ -734,6 +802,35 @@ impl TermiteApp {
 
             let has_sel = self.active_selection().is_some();
 
+            // ── Snapshot undo / redo ──────────────────────────────────────────
+            let is_undo = cmd && !shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'z'));
+            let is_redo = cmd && shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'z'));
+
+            if is_undo {
+                if let Some(h) = self.histories.get_mut(self.active_pane) {
+                    h.undo();
+                }
+                if let Some(window) = &self.window { window.request_redraw(); }
+                return;
+            }
+            if is_redo {
+                if let Some(h) = self.histories.get_mut(self.active_pane) {
+                    h.redo();
+                }
+                if let Some(window) = &self.window { window.request_redraw(); }
+                return;
+            }
+
+            // Any other key press while viewing a snapshot resumes live first.
+            let in_snapshot = self.histories.get(self.active_pane).map(|h| !h.is_live()).unwrap_or(false);
+            if in_snapshot {
+                if let Some(h) = self.histories.get_mut(self.active_pane) {
+                    h.resume_live();
+                }
+                if let Some(window) = &self.window { window.request_redraw(); }
+                // Fall through so the key is also sent normally.
+            }
+
             let is_new_terminal_shortcut = matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("n"))
                 && self.mods.shift_key()
                 && (self.mods.control_key() || self.mods.super_key());
@@ -814,12 +911,16 @@ impl TermiteApp {
         };
 
         let scale = window.scale_factor() as f32;
-        let pane_grids: Vec<([f32; 4], &termite_vt::TerminalGrid)> = self
-            .panes
-            .iter()
-            .zip(pane_rects.iter())
-            .map(|(pane, rect)| (rect.as_array(), pane.session.parser.grid()))
-            .collect();
+        let pane_grids: Vec<([f32; 4], &termite_vt::TerminalGrid)> = {
+            let mut grids = Vec::with_capacity(self.panes.len());
+            for (i, (pane, rect)) in self.panes.iter().zip(pane_rects.iter()).enumerate() {
+                let grid = self.histories.get(i)
+                    .and_then(|h| h.current_snapshot())
+                    .unwrap_or_else(|| pane.session.parser.grid());
+                grids.push((rect.as_array(), grid));
+            }
+            grids
+        };
 
         let pane_selections: Vec<Option<SelectionRange>> = self
             .panes

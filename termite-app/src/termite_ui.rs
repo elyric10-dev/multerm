@@ -46,6 +46,132 @@ enum UiStyle {
 /// Upper bound on the row count in a fixed grid (default height hint for new panes).
 const MAX_PANEL_GRID_ROWS: u8 = 8;
 
+const LINE_EDITOR_MAX_HISTORY: usize = 100;
+
+/// A single snapshot of the line buffer: text content + cursor position.
+#[derive(Clone)]
+struct LineState {
+    text: String,
+    /// Char index from the start of `text` (0 = before first char).
+    cursor: usize,
+}
+
+impl LineState {
+    fn new() -> Self {
+        Self { text: String::new(), cursor: 0 }
+    }
+}
+
+/// Per-pane shadow line editor with undo/redo.
+///
+/// Tracks the full text and an absolute cursor index (chars from start),
+/// so any input source — keyboard, mouse click, arrow keys — can update
+/// `cursor` without converting between "from-end" and "from-start".
+///
+/// Undo/redo stacks store `LineState` snapshots (text + cursor) so that
+/// restoring a snapshot also repositions the terminal cursor correctly.
+struct LineEditor {
+    current: LineState,
+    undo_stack: Vec<LineState>,
+    redo_stack: Vec<LineState>,
+}
+
+impl LineEditor {
+    fn new() -> Self {
+        Self { current: LineState::new(), undo_stack: Vec::new(), redo_stack: Vec::new() }
+    }
+
+    fn cursor_byte_pos(&self) -> usize {
+        self.current.text
+            .char_indices()
+            .nth(self.current.cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.current.text.len())
+    }
+
+    fn char_before_cursor(&self) -> Option<char> {
+        if self.current.cursor == 0 { return None; }
+        self.current.text.char_indices().nth(self.current.cursor - 1).map(|(_, c)| c)
+    }
+
+    fn push_snapshot(&mut self) {
+        self.undo_stack.push(self.current.clone());
+        if self.undo_stack.len() > LINE_EDITOR_MAX_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn push_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            let is_word = ch.is_alphanumeric() || ch == '_';
+            let last_is_word = self.char_before_cursor()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+            if self.current.text.is_empty() || is_word != last_is_word {
+                self.push_snapshot();
+            }
+            let byte_pos = self.cursor_byte_pos();
+            self.current.text.insert(byte_pos, ch);
+            self.current.cursor += 1;
+        }
+    }
+
+    fn push_backspace(&mut self) {
+        if self.current.cursor == 0 { return; }
+        self.push_snapshot();
+        let (byte_start, _) = self.current.text
+            .char_indices()
+            .nth(self.current.cursor - 1)
+            .expect("cursor > 0 guarantees char exists");
+        self.current.text.remove(byte_start);
+        self.current.cursor -= 1;
+    }
+
+    fn move_left(&mut self) {
+        self.current.cursor = self.current.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        let max = self.current.text.chars().count();
+        if self.current.cursor < max { self.current.cursor += 1; }
+    }
+
+    fn move_to_start(&mut self) { self.current.cursor = 0; }
+
+    fn move_to_end(&mut self) {
+        self.current.cursor = self.current.text.chars().count();
+    }
+
+    /// Apply a signed column delta from a mouse click (right = positive).
+    fn move_cursor_delta(&mut self, delta: isize) {
+        let max = self.current.text.chars().count() as isize;
+        self.current.cursor = (self.current.cursor as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Returns the snapshot to restore, or `None` if nothing to undo.
+    fn undo(&mut self) -> Option<LineState> {
+        let prev = self.undo_stack.pop()?;
+        self.redo_stack.push(self.current.clone());
+        self.current = prev.clone();
+        Some(prev)
+    }
+
+    /// Returns the snapshot to restore, or `None` if nothing to redo.
+    fn redo(&mut self) -> Option<LineState> {
+        let next = self.redo_stack.pop()?;
+        self.undo_stack.push(self.current.clone());
+        self.current = next.clone();
+        Some(next)
+    }
+
+    fn reset(&mut self) {
+        self.current = LineState::new();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum PanelLayoutMode {
@@ -250,7 +376,8 @@ const CORNER_GRIP_OUTSET: f32 = 2.0;
 const BR_CURSOR_HOVER_RADIUS: f32 = 14.0;
 
 /// Local-space `(left, right, top, bottom)` of the spawn-preview dashed frame, matching
-/// [`TermiteUi::paint_spawn_flash`] when `area_w` / `area_h` match that call (`area_h` = full workspace content height).
+/// [`TermiteUi::paint_spawn_flash`]. `area_w` is the visible workspace width used for column
+/// stripes (not the horizontal scroll canvas). `area_h` is full workspace content height.
 fn spawn_flash_stripe_local_edges(
     until: Option<Instant>,
     local_pos: Option<Pos2>,
@@ -354,7 +481,6 @@ fn merge_layout_guide_drag_snaps(
     pos: Pos2,
     w: f32,
     h: f32,
-    max_x: f32,
     max_y: f32,
     best_x: &mut Option<(f32, f32, f32)>,
     best_y: &mut Option<(f32, f32, f32)>,
@@ -363,14 +489,14 @@ fn merge_layout_guide_drag_snaps(
     for snap_x in column_grid_vertical_snap_xs(column_area_w, layout) {
         let d_left = (pos.x - snap_x).abs();
         if d_left <= RESIZE_SNAP_DISTANCE {
-            let nx = snap_x.clamp(0.0, max_x);
+            let nx = snap_x.max(0.0);
             if best_x.is_none_or(|(bd, _, _)| d_left < bd) {
                 *best_x = Some((d_left, nx, snap_x));
             }
         }
         let d_right = ((pos.x + w) - snap_x).abs();
         if d_right <= RESIZE_SNAP_DISTANCE {
-            let nx = (snap_x - w).clamp(0.0, max_x);
+            let nx = (snap_x - w).max(0.0);
             if best_x.is_none_or(|(bd, _, _)| d_right < bd) {
                 *best_x = Some((d_right, nx, snap_x));
             }
@@ -387,14 +513,14 @@ fn merge_layout_guide_drag_snaps(
             for snap_x in [fl, fr] {
                 let d_left = (pos.x - snap_x).abs();
                 if d_left <= RESIZE_SNAP_DISTANCE {
-                    let nx = snap_x.clamp(0.0, max_x);
+                    let nx = snap_x.max(0.0);
                     if best_x.is_none_or(|(bd, _, _)| d_left < bd) {
                         *best_x = Some((d_left, nx, snap_x));
                     }
                 }
                 let d_right = ((pos.x + w) - snap_x).abs();
                 if d_right <= RESIZE_SNAP_DISTANCE {
-                    let nx = (snap_x - w).clamp(0.0, max_x);
+                    let nx = (snap_x - w).max(0.0);
                     if best_x.is_none_or(|(bd, _, _)| d_right < bd) {
                         *best_x = Some((d_right, nx, snap_x));
                     }
@@ -537,9 +663,10 @@ struct TermiteUi {
     next_workspace_index: usize,
     workspace_runtime: Vec<WorkspaceRuntime>,
     next_terminal_id: u64,
-    /// Workspace width and scrollable content height (used for placement / clamping).
+    /// Horizontal scroll canvas width and scrollable content height (spawn search, persistence).
     terminal_area_size: Vec2,
-    /// Visible workspace height inside the central panel (caps default new pane height).
+    /// Visible workspace inside the central panel. Width drives column stripes and auto-fit;
+    /// height caps default new pane height.
     terminal_workspace_viewport: Vec2,
     editing_workspace_idx: Option<usize>,
     editing_workspace_input: String,
@@ -575,6 +702,7 @@ struct WorkspaceRuntime {
     active_terminal: Option<usize>,
     equal_size_source_terminal_id: Option<u64>,
     selections: Vec<Option<SelectionRange>>,
+    line_editors: Vec<LineEditor>,
 }
 
 struct WorkspaceTab {
@@ -583,9 +711,9 @@ struct WorkspaceTab {
     color_rgba: Option<[u8; 4]>,
     working_dir: String,
     panel_layout: PanelLayout,
-    /// When set, terminal widths track the column stripe width and x snaps to column bands.
+    /// When set, terminal widths match column stripes and panes snap to column starts, restacked from the top (UI: "Auto-fit width").
     sync_terminals_to_columns: bool,
-    /// When set, all terminals share one size in a grid that fills the workspace (overrides column sync).
+    /// When set, all terminals share one size in a grid that fills the workspace (overrides auto-fit width).
     uniform_equal_terminals: bool,
 }
 
@@ -957,10 +1085,10 @@ fn new_terminal_context_menu(
             changed |= ui
                 .checkbox(
                     &mut sync_terminals_to_columns,
-                    "Sync terminals to columns (auto-fit width)",
+                    "Auto-fit width",
                 )
                 .on_hover_text(
-                    "Sets each terminal to the column stripe width, aligns to column starts, and stacks from the top of each column. Pauses while you drag or resize a terminal.",
+                    "Auto-fits width to each column stripe and auto-positions panes at column starts, restacked from the top in each column. Pauses while you drag or resize a terminal.",
                 )
                 .changed();
             let equal_toggle_changed = ui
@@ -969,7 +1097,7 @@ fn new_terminal_context_menu(
                     "Equal-size grid (fit all terminals)",
                 )
                 .on_hover_text(
-                    "Arranges every terminal in a grid with the same width and height, filling the workspace. Pauses while the mouse button is held. Overrides \"Sync terminals to columns\" when both are on.",
+                    "Arranges every terminal in a grid with the same width and height, filling the workspace. Pauses while the mouse button is held. When both are on, this overrides auto-fit width.",
                 )
                 .changed();
             changed |= equal_toggle_changed;
@@ -998,7 +1126,7 @@ fn new_terminal_context_menu(
 impl eframe::App for TermiteUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep refreshing so PTY output appears live without explicit wakeups.
-        self.ensure_workspace_runtime_slots();
+        self.sync_all_workspace_runtime_buffers();
         ctx.request_repaint_after(Duration::from_millis(16));
         self.drain_terminals();
         self.handle_keyboard_input(ctx);
@@ -1165,17 +1293,22 @@ impl eframe::App for TermiteUi {
                     };
 
                     let content_h = workspace_content_height(&runtime_ref.terminals, viewport.y);
+                    let content_w = workspace_content_width(&runtime_ref.terminals, viewport.x);
 
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .id_salt(("termite_ws_scroll", self.selected_workspace))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_size(Vec2::new(viewport.x, content_h));
-                            self.terminal_area_size = Vec2::new(viewport.x, content_h);
+                            ui.set_min_size(Vec2::new(content_w, content_h));
+                            self.terminal_area_size = Vec2::new(content_w, content_h);
 
                             let content_origin = ui.min_rect().min;
                             let content_rect = ui.max_rect();
-                            let workspace_col_w = content_rect.width();
+                            // Column layout uses the *visible* workspace width. Using the scroll
+                            // canvas width here grows stripes when a pane is wider than the screen
+                            // (horizontal scroll), which breaks auto-fit / equal-size.
+                            let canvas_width = content_rect.width();
+                            let layout_width = viewport.x.max(1.0);
                             let scroll_bg = ui.interact(
                                 content_rect,
                                 ui.id().with(("ws_scroll_bg", self.selected_workspace)),
@@ -1206,7 +1339,7 @@ impl eframe::App for TermiteUi {
                             self.paint_spawn_flash(
                                 ui,
                                 content_origin,
-                                Vec2::new(workspace_col_w, content_h),
+                                Vec2::new(layout_width, content_h),
                                 p,
                             );
 
@@ -1214,7 +1347,7 @@ impl eframe::App for TermiteUi {
                             let spawn_flash_edges = spawn_flash_stripe_local_edges(
                                 self.pending_spawn_flash_until,
                                 self.pending_spawn_flash_pos,
-                                workspace_col_w,
+                                layout_width,
                                 content_h,
                                 active_layout,
                             );
@@ -1259,7 +1392,6 @@ impl eframe::App for TermiteUi {
 
                             let mut close_idx: Option<usize> = None;
                             let mut clicked_on_pane = false;
-                            let available_width = content_rect.width();
                             let content_height = content_h;
                             // Equal grid must not use full `content_h`: `workspace_content_height` adds
                             // `2 * GRID_SPACING` below the deepest pane, so dividing that height makes the
@@ -1267,8 +1399,8 @@ impl eframe::App for TermiteUi {
                             let uniform_grid_body_h = (content_h - 2.0 * GRID_SPACING)
                                 .max(viewport.y)
                                 .max(TERMINAL_MIN_HEIGHT);
-                            let (_, _, n_cols) = column_slot_geometry(available_width, layout);
-                            let slot_w = column_stripe_width(available_width, layout);
+                            let (_, _, n_cols) = column_slot_geometry(layout_width, layout);
+                            let slot_w = column_stripe_width(layout_width, layout);
 
                             let ptr_up = !ui.input(|i| i.pointer.any_down());
                             if ptr_up {
@@ -1284,7 +1416,7 @@ impl eframe::App for TermiteUi {
                                         });
                                     reflow_panes_uniform_equal(
                                         &mut runtime.terminals,
-                                        available_width,
+                                        layout_width,
                                         uniform_grid_body_h,
                                         layout,
                                         template_size,
@@ -1292,7 +1424,7 @@ impl eframe::App for TermiteUi {
                                 } else if sync_terminals_to_columns {
                                     reflow_panes_to_column_starts(
                                         &mut runtime.terminals,
-                                        available_width,
+                                        layout_width,
                                         layout,
                                     );
                                 }
@@ -1304,7 +1436,7 @@ impl eframe::App for TermiteUi {
                                 if let Some(pos) = pane.position {
                                     let col = pick_column_at_x(
                                         pos.x + pane.desired_size.x * 0.5,
-                                        available_width,
+                                        layout_width,
                                         layout,
                                     );
                                     if col < n_cols {
@@ -1323,9 +1455,9 @@ impl eframe::App for TermiteUi {
                                 };
 
                                 if pane.position.is_none() {
-                                    pane.desired_size.x = slot_w
-                                        .max(TERMINAL_MIN_WIDTH)
-                                        .min(available_width.max(1.0));
+                                    // `slot_w` splits `layout_width` across `n` columns with gutters.
+                                    pane.desired_size.x =
+                                        slot_w.clamp(1.0, layout_width.max(1.0));
                                     let mut h =
                                         pane.desired_size.y.max(content_height.max(260.0));
                                     if let Some(rh) = layout.default_pane_height_hint(viewport.y) {
@@ -1333,21 +1465,24 @@ impl eframe::App for TermiteUi {
                                     }
                                     pane.desired_size.y = h;
                                     let col = idx % n_cols.max(1);
-                                    let x = column_band_left(available_width, col, layout);
+                                    let x = column_band_left(layout_width, col, layout);
                                     let y = column_floor_y[col];
                                     pane.position = Some(Pos2::new(x, y));
                                     column_floor_y[col] = y + pane.desired_size.y + STACK_GAP_Y;
                                 }
 
                                 let mut pos = pane.position.unwrap_or(Pos2::ZERO);
-                                let max_x = (available_width - pane.desired_size.x).max(0.0);
+                                // With horizontal scrolling the scroll area grows to fit all
+                                // terminals, so we only clamp x to be non-negative. Previously
+                                // clamping to the scroll canvas width caused right-side terminals to
+                                // be pushed left and overlap neighbours when the window shrank.
                                 // `content_height` is captured early in the frame. If a pane is
                                 // spawned lower in this same frame, clamping to that stale value
                                 // pulls it upward and can visually overlap neighbours.
                                 let max_y = (content_height - pane.desired_size.y)
                                     .max(0.0)
                                     .max(pos.y);
-                                pos.x = pos.x.clamp(0.0, max_x);
+                                pos.x = pos.x.max(0.0);
                                 pos.y = pos.y.clamp(0.0, max_y);
                                 pane.position = Some(pos);
 
@@ -1371,7 +1506,7 @@ impl eframe::App for TermiteUi {
                                 }
                                 if drag_response.dragged() {
                                     let delta = ui.input(|i| i.pointer.delta());
-                                    pos.x = (pos.x + delta.x).clamp(0.0, max_x);
+                                    pos.x = (pos.x + delta.x).max(0.0);
                                     pos.y = (pos.y + delta.y).clamp(0.0, max_y);
 
                                     // Snap dragged pane edges to other terminals (same thresholds as resize).
@@ -1403,7 +1538,7 @@ impl eframe::App for TermiteUi {
                                             for snap_x in [other_left, other_right] {
                                                 let d_left = (pos.x - snap_x).abs();
                                                 if d_left <= RESIZE_SNAP_DISTANCE {
-                                                    let nx = snap_x.clamp(0.0, max_x);
+                                                    let nx = snap_x.max(0.0);
                                                     if best_x_snap
                                                         .is_none_or(|(best, _, _)| d_left < best)
                                                     {
@@ -1412,7 +1547,7 @@ impl eframe::App for TermiteUi {
                                                 }
                                                 let d_right = ((pos.x + w) - snap_x).abs();
                                                 if d_right <= RESIZE_SNAP_DISTANCE {
-                                                    let nx = (snap_x - w).clamp(0.0, max_x);
+                                                    let nx = (snap_x - w).max(0.0);
                                                     if best_x_snap
                                                         .is_none_or(|(best, _, _)| d_right < best)
                                                     {
@@ -1453,12 +1588,11 @@ impl eframe::App for TermiteUi {
                                     }
 
                                     merge_layout_guide_drag_snaps(
-                                        workspace_col_w,
+                                        layout_width,
                                         spawn_flash_edges,
                                         pos,
                                         w,
                                         h,
-                                        max_x,
                                         max_y,
                                         &mut best_x_snap,
                                         &mut best_y_snap,
@@ -1492,7 +1626,7 @@ impl eframe::App for TermiteUi {
                                         ui.painter().line_segment(
                                             [
                                                 Pos2::new(content_origin.x, y),
-                                                Pos2::new(content_origin.x + available_width, y),
+                                                Pos2::new(content_origin.x + canvas_width, y),
                                             ],
                                             Stroke::new(1.3, p.resize_grip_hot),
                                         );
@@ -1661,9 +1795,7 @@ impl eframe::App for TermiteUi {
                                         new_w = right - proposed_left;
                                     }
                                     if right_dragged {
-                                        let max_w =
-                                            (available_width - new_x).max(TERMINAL_MIN_WIDTH);
-                                        new_w = (new_w + delta.x).clamp(TERMINAL_MIN_WIDTH, max_w);
+                                        new_w = (new_w + delta.x).max(TERMINAL_MIN_WIDTH);
                                     }
                                     if top_dragged {
                                         let bottom = pos.y + pane.desired_size.y;
@@ -1770,7 +1902,7 @@ impl eframe::App for TermiteUi {
                                     }
 
                                     merge_layout_guide_resize_snaps(
-                                        workspace_col_w,
+                                        layout_width,
                                         spawn_flash_edges,
                                         right_dragged,
                                         left_dragged,
@@ -1789,10 +1921,7 @@ impl eframe::App for TermiteUi {
                                         best_x_snap
                                     {
                                         if snapped_right_edge && right_dragged {
-                                            new_w = (snap_x - new_x).clamp(
-                                                TERMINAL_MIN_WIDTH,
-                                                (available_width - new_x).max(TERMINAL_MIN_WIDTH),
-                                            );
+                                            new_w = (snap_x - new_x).max(TERMINAL_MIN_WIDTH);
                                             snap_guide_x = Some(snap_x);
                                         } else if !snapped_right_edge && left_dragged {
                                             let right = new_x + new_w;
@@ -1844,7 +1973,7 @@ impl eframe::App for TermiteUi {
                                         ui.painter().line_segment(
                                             [
                                                 Pos2::new(content_origin.x, y),
-                                                Pos2::new(content_origin.x + available_width, y),
+                                                Pos2::new(content_origin.x + canvas_width, y),
                                             ],
                                             Stroke::new(1.3, p.resize_grip_hot),
                                         );
@@ -1959,17 +2088,26 @@ impl eframe::App for TermiteUi {
                                                         if clicked_col >= row_end {
                                                             // For readline-like prompts, this reliably lands at line end.
                                                             bytes.push(0x05); // Ctrl+E
+                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
+                                                                ed.move_to_end();
+                                                            }
                                                         } else if target_col > grid.cursor.col {
                                                             let steps = target_col - grid.cursor.col;
-                                                            bytes.reserve(bytes.len() + steps * 3);
+                                                            bytes.reserve(steps * 3);
                                                             for _ in 0..steps {
                                                                 bytes.extend_from_slice(b"\x1b[C");
                                                             }
+                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
+                                                                ed.move_cursor_delta(steps as isize);
+                                                            }
                                                         } else if target_col < grid.cursor.col {
                                                             let steps = grid.cursor.col - target_col;
-                                                            bytes.reserve(bytes.len() + steps * 3);
+                                                            bytes.reserve(steps * 3);
                                                             for _ in 0..steps {
                                                                 bytes.extend_from_slice(b"\x1b[D");
+                                                            }
+                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
+                                                                ed.move_cursor_delta(-(steps as isize));
                                                             }
                                                         }
 
@@ -2200,6 +2338,7 @@ impl TermiteUi {
         let layout = self.active_panel_layout();
         let selected_workspace = self.selected_workspace;
         let area_size = self.terminal_area_size;
+        let viewport_w = self.terminal_workspace_viewport.x.max(1.0);
         let viewport_h = self.terminal_workspace_viewport.y.max(TERMINAL_MIN_HEIGHT);
         let next_terminal_id = self.next_terminal_id;
         let fallback_anchor = anchor_terminal.or_else(|| {
@@ -2239,14 +2378,8 @@ impl TermiteUi {
                 &working_dir,
                 &tmux_session,
             );
-            let stripe_w = column_stripe_width(area_for_placement.x, layout);
-            pane.desired_size.x = if spawn_pos.is_some() {
-                stripe_w
-            } else {
-                stripe_w
-                    .max(TERMINAL_MIN_WIDTH)
-                    .min(area_for_placement.x.max(TERMINAL_MIN_WIDTH))
-            };
+            let stripe_w = column_stripe_width(viewport_w, layout);
+            pane.desired_size.x = stripe_w.clamp(1.0, viewport_w.max(1.0));
             let mut default_h = pane
                 .desired_size
                 .y
@@ -2260,14 +2393,14 @@ impl TermiteUi {
             let position = if let Some(cursor_pos) = spawn_pos {
                 let col = pick_spawn_column_preferring_empty_slot(
                     &runtime.terminals,
-                    area_for_placement.x,
+                    viewport_w,
                     cursor_pos.x,
                     layout,
                 );
                 let default_h = pane.desired_size.y;
                 let first_top = min_y_topmost_in_column(
                     &runtime.terminals,
-                    area_for_placement.x,
+                    viewport_w,
                     col,
                     layout,
                 );
@@ -2289,6 +2422,7 @@ impl TermiteUi {
                 let (pos, spawn_size) = find_spawn_column_no_overlap(
                     &runtime.terminals,
                     spawn_search_area,
+                    viewport_w,
                     col,
                     preferred_y,
                     preferred_max_h,
@@ -2302,25 +2436,25 @@ impl TermiteUi {
                     let pos = anchor.position.unwrap_or(Pos2::ZERO);
                     let col = pick_column_at_x(
                         pos.x + anchor.desired_size.x * 0.5,
-                        area_for_placement.x,
+                        viewport_w,
                         layout,
                     );
                     let preferred_y =
                         (pos.y + 24.0).min((area_for_placement.y - pane.desired_size.y).max(0.0));
                     find_non_overlapping_position_in_column(
                         &runtime.terminals,
-                        area_for_placement,
+                        Vec2::new(viewport_w, area_for_placement.y),
                         pane.desired_size,
                         col,
                         preferred_y,
                         layout,
                     )
                 } else {
-                    let cols = layout.column_count(area_for_placement.x).max(1);
+                    let cols = layout.column_count(viewport_w).max(1);
                     let col = runtime.terminals.len() % cols;
                     find_non_overlapping_position_in_column(
                         &runtime.terminals,
-                        area_for_placement,
+                        Vec2::new(viewport_w, area_for_placement.y),
                         pane.desired_size,
                         col,
                         0.0,
@@ -2328,11 +2462,11 @@ impl TermiteUi {
                     )
                 }
             } else {
-                let cols = layout.column_count(area_for_placement.x).max(1);
+                let cols = layout.column_count(viewport_w).max(1);
                 let col = runtime.terminals.len() % cols;
                 find_non_overlapping_position_in_column(
                     &runtime.terminals,
-                    area_for_placement,
+                    Vec2::new(viewport_w, area_for_placement.y),
                     pane.desired_size,
                     col,
                     0.0,
@@ -2342,6 +2476,7 @@ impl TermiteUi {
             pane.position = Some(position);
             runtime.terminals.push(pane);
             runtime.selections.push(None);
+            runtime.line_editors.push(LineEditor::new());
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
         self.next_terminal_id = next_terminal_id + 1;
@@ -2365,6 +2500,11 @@ impl TermiteUi {
         } else if runtime.selections.len() > runtime.terminals.len() {
             runtime.selections.truncate(runtime.terminals.len());
         }
+        if runtime.line_editors.len() < runtime.terminals.len() {
+            runtime.line_editors.resize_with(runtime.terminals.len(), LineEditor::new);
+        } else if runtime.line_editors.len() > runtime.terminals.len() {
+            runtime.line_editors.truncate(runtime.terminals.len());
+        }
         let Some(active_idx) = runtime.active_terminal else {
             return;
         };
@@ -2377,12 +2517,20 @@ impl TermiteUi {
         for event in events {
             match event {
                 egui::Event::Text(text) => {
+                    // Skip text generated by modifier shortcuts (e.g. Cmd+Z firing a
+                    // stray "z" Text event after the Key event already handled undo).
+                    let mods = ctx.input(|i| i.modifiers);
+                    if mods.command || mods.ctrl {
+                        continue;
+                    }
                     if !text.is_empty() {
+                        runtime.line_editors[active_idx].push_text(&text);
                         runtime.terminals[active_idx].backend.write_all(text.as_bytes());
                     }
                 }
                 egui::Event::Paste(text) => {
                     if !text.is_empty() {
+                        runtime.line_editors[active_idx].reset();
                         let bytes = clipboard::clipboard_text_to_pty_bytes(&text);
                         runtime.terminals[active_idx].backend.write_all(&bytes);
                     }
@@ -2399,15 +2547,35 @@ impl TermiteUi {
                         continue;
                     }
 
+                    let cmd = modifiers.command;
+                    let ctrl = modifiers.ctrl;
+                    let shift = modifiers.shift;
+
+                    // ── Undo / redo typed text ────────────────────────────────
+                    if cmd && !shift && key == egui::Key::Z {
+                        let ed = &mut runtime.line_editors[active_idx];
+                        let total_chars = ed.current.text.chars().count();
+                        if let Some(state) = ed.undo() {
+                            let bytes = build_restore_bytes(total_chars, &state);
+                            runtime.terminals[active_idx].backend.write_all(&bytes);
+                        }
+                        continue;
+                    }
+                    if cmd && shift && key == egui::Key::Z {
+                        let ed = &mut runtime.line_editors[active_idx];
+                        let total_chars = ed.current.text.chars().count();
+                        if let Some(state) = ed.redo() {
+                            let bytes = build_restore_bytes(total_chars, &state);
+                            runtime.terminals[active_idx].backend.write_all(&bytes);
+                        }
+                        continue;
+                    }
+
                     // macOS-like shortcuts:
                     // - Cmd/Ctrl+Shift+A = Select all
                     // - Cmd/Ctrl+Shift+C = Copy (rich text via ANSI SGR)
                     // - Cmd/Ctrl+Shift+V = Paste
                     // - Shift+Insert     = Paste
-                    let cmd = modifiers.command;
-                    let ctrl = modifiers.ctrl;
-                    let shift = modifiers.shift;
-
                     let is_select_all = (cmd && key == egui::Key::A)
                         || (cmd && shift && key == egui::Key::A)
                         || (ctrl && shift && key == egui::Key::A);
@@ -2453,6 +2621,32 @@ impl TermiteUi {
                             runtime.selections[active_idx] = None;
                             continue;
                         }
+                        // Track single backspace in line editor.
+                        if key == egui::Key::Backspace {
+                            runtime.line_editors[active_idx].push_backspace();
+                        }
+                    }
+
+                    // Update cursor offset for navigation keys so mid-line insertions
+                    // are tracked accurately; reset only when the line context is lost.
+                    let ed = &mut runtime.line_editors[active_idx];
+                    match key {
+                        egui::Key::ArrowLeft  => ed.move_left(),
+                        egui::Key::ArrowRight => ed.move_right(),
+                        egui::Key::Home       => ed.move_to_start(),
+                        egui::Key::End        => ed.move_to_end(),
+                        egui::Key::Enter
+                        | egui::Key::ArrowUp
+                        | egui::Key::ArrowDown
+                        | egui::Key::PageUp
+                        | egui::Key::PageDown
+                        | egui::Key::Escape   => ed.reset(),
+                        _ if ctrl && key == egui::Key::C => ed.reset(),
+                        _ if ctrl && key == egui::Key::U => ed.reset(),
+                        _ if ctrl && key == egui::Key::W => ed.reset(),
+                        _ if ctrl && key == egui::Key::A => ed.move_to_start(),
+                        _ if ctrl && key == egui::Key::E => ed.move_to_end(),
+                        _ => {}
                     }
 
                     if let Some(bytes) =
@@ -3043,6 +3237,29 @@ fn render_terminal_grid(
             }
         });
     clicked_cell
+}
+
+/// Build the PTY bytes that restore a `LineState` snapshot.
+///
+/// Protocol:
+///   1. `\x05` (Ctrl+E) — move to end of line regardless of current cursor pos.
+///   2. `\x7f` × `total_chars` — backspace the entire line.
+///   3. Type `state.text` — the restored content.
+///   4. `\x1b[D` × N — move cursor left to `state.cursor` within the new text.
+///
+/// Using Ctrl+E instead of tracking cursor_offset eliminates the drift that
+/// caused undo after a mouse-click to corrupt the line.
+fn build_restore_bytes(total_chars: usize, state: &LineState) -> Vec<u8> {
+    let text_char_len = state.text.chars().count();
+    let steps_left = text_char_len.saturating_sub(state.cursor);
+    let mut bytes = Vec::with_capacity(1 + total_chars + state.text.len() + steps_left * 3);
+    bytes.push(0x05); // Ctrl+E: move to end of line
+    bytes.extend(std::iter::repeat(0x7fu8).take(total_chars));
+    bytes.extend_from_slice(state.text.as_bytes());
+    for _ in 0..steps_left {
+        bytes.extend_from_slice(b"\x1b[D"); // cursor left × N to reach stored position
+    }
+    bytes
 }
 
 fn key_to_ansi_bytes(key: egui::Key, shift: bool, ctrl: bool) -> Option<Vec<u8>> {
@@ -3892,6 +4109,34 @@ impl TermiteUi {
         }
     }
 
+    /// Keep `selections` / `line_editors` aligned with `terminals` for every workspace.
+    ///
+    /// `handle_keyboard_input` only touches the active workspace, but the UI can switch
+    /// workspaces in the same frame *after* keyboard handling runs; painting then assumed
+    /// `selections[idx]` exists and panicked. Restoring persisted terminals also assigned
+    /// `terminals` without growing these sidecar vectors until that workspace became active.
+    fn sync_workspace_runtime_buffers(runtime: &mut WorkspaceRuntime) {
+        if runtime.selections.len() < runtime.terminals.len() {
+            runtime.selections.resize(runtime.terminals.len(), None);
+        } else if runtime.selections.len() > runtime.terminals.len() {
+            runtime.selections.truncate(runtime.terminals.len());
+        }
+        if runtime.line_editors.len() < runtime.terminals.len() {
+            runtime
+                .line_editors
+                .resize_with(runtime.terminals.len(), LineEditor::new);
+        } else if runtime.line_editors.len() > runtime.terminals.len() {
+            runtime.line_editors.truncate(runtime.terminals.len());
+        }
+    }
+
+    fn sync_all_workspace_runtime_buffers(&mut self) {
+        self.ensure_workspace_runtime_slots();
+        for runtime in &mut self.workspace_runtime {
+            Self::sync_workspace_runtime_buffers(runtime);
+        }
+    }
+
     fn active_workspace_runtime_mut(&mut self) -> Option<&mut WorkspaceRuntime> {
         self.ensure_workspace_runtime_slots();
         if self.workspaces.is_empty() {
@@ -4102,12 +4347,46 @@ impl TermiteUi {
 }
 
 fn workspace_content_height(terminals: &[TerminalPane], viewport_h: f32) -> f32 {
-    let mut bottom = viewport_h;
+    if terminals.is_empty() {
+        return viewport_h;
+    }
+    let mut bottom = 0.0_f32;
     for pane in terminals {
         let pos = pane.position.unwrap_or_default();
         bottom = bottom.max(pos.y + pane.desired_size.y);
     }
-    bottom + GRID_SPACING * 2.0
+    // Compare pane extent to the viewport *before* adding bottom margin. If we used
+    // `(bottom + margin) <= viewport` then a stack that exactly fills the height would
+    // still count as "overflow" (`bottom + 2*GRID > viewport`), inflating scroll content
+    // every frame — `reflow_panes_to_column_starts` then sees a wider area and grows panes.
+    //
+    // When content is *taller* than the viewport, do not add trailing padding to the
+    // scroll height: reflow/sync makes `bottom` match the previous scroll height, so
+    // `bottom + 2*GRID` would grow without bound (same class of bug as horizontal resize).
+    if bottom <= viewport_h {
+        viewport_h
+    } else {
+        bottom
+    }
+}
+
+fn workspace_content_width(terminals: &[TerminalPane], viewport_w: f32) -> f32 {
+    if terminals.is_empty() {
+        return viewport_w;
+    }
+    let mut right = 0.0_f32;
+    for pane in terminals {
+        let pos = pane.position.unwrap_or_default();
+        right = right.max(pos.x + pane.desired_size.x);
+    }
+    // When `right <= viewport`, use viewport (no horizontal scroll). When wider, size
+    // scroll to `right` only: adding padding here makes `content_w` exceed pane bounds;
+    // sync reflow fills that width so `right` equals old `content_w` next frame → loop.
+    if right <= viewport_w {
+        viewport_w
+    } else {
+        right
+    }
 }
 
 /// Minimum `y` among panes whose center lies in the given column band.
@@ -4200,14 +4479,16 @@ fn spawn_candidate_overlaps_pane(
 fn find_spawn_column_no_overlap(
     terminals: &[TerminalPane],
     area_size: Vec2,
+    column_layout_width: f32,
     column: usize,
     preferred_y: f32,
     preferred_max_h: f32,
     default_h: f32,
     layout: PanelLayout,
 ) -> (Pos2, Vec2) {
-    let slot_w = column_stripe_width(area_size.x, layout);
-    let stripe_left = column_band_left(area_size.x, column, layout);
+    let lw = column_layout_width.max(1.0);
+    let slot_w = column_stripe_width(lw, layout);
+    let stripe_left = column_band_left(lw, column, layout);
     let stripe_right = stripe_left + slot_w;
     let mut h = default_h.min(preferred_max_h).max(1.0);
     let min_h = 40.0_f32.min(h).max(1.0);
@@ -4264,7 +4545,7 @@ fn find_spawn_column_no_overlap(
         .max(1.0);
     let pos = find_non_overlapping_position_in_column(
         terminals,
-        area_size,
+        Vec2::new(lw, area_size.y),
         Vec2::new(slot_w, h),
         column,
         preferred_y,
@@ -4280,7 +4561,7 @@ fn find_spawn_column_no_overlap(
 
     // Hard fallback: never return an overlapping position. Append below the current stack in
     // this column (growing workspace height as needed).
-    let bottom = max_y_bottom_in_column(terminals, area_size.x, column, layout).unwrap_or(0.0);
+    let bottom = max_y_bottom_in_column(terminals, lw, column, layout).unwrap_or(0.0);
     let y = (bottom + STACK_GAP_Y).max(0.0);
     let left = intrusion_left_right_aligned(terminals, stripe_left, stripe_right, y, h, GRID_SPACING);
     let w = (stripe_right - left).max(min_spawn_w).min(slot_w);
@@ -4299,8 +4580,7 @@ fn reflow_panes_to_column_starts(
     let (_, _, n_cols) = column_slot_geometry(available_width, layout);
     let n_cols = n_cols.max(1);
     let slot = column_stripe_width(available_width, layout)
-        .max(TERMINAL_MIN_WIDTH)
-        .min(available_width.max(1.0));
+        .clamp(1.0, available_width.max(1.0));
     let max_x = (available_width - slot).max(0.0);
 
     let mut idxs: Vec<usize> = (0..terminals.len()).collect();
@@ -4352,15 +4632,14 @@ fn reflow_panes_uniform_equal(
     let cols = n_cols.max(1);
     let rows = (n + cols - 1) / cols;
     let grid_cell_w = column_stripe_width(available_width, layout)
-        .max(TERMINAL_MIN_WIDTH)
-        .min(available_width.max(TERMINAL_MIN_WIDTH));
+        .clamp(1.0, available_width.max(1.0));
     let gap_y = STACK_GAP_Y;
     let gap_total = (rows.saturating_sub(1)) as f32 * gap_y;
     let grid_cell_h = ((body_height - gap_total) / rows as f32).max(TERMINAL_MIN_HEIGHT);
     let cell_w = template_size
         .map(|s| s.x)
         .unwrap_or(grid_cell_w)
-        .clamp(TERMINAL_MIN_WIDTH, grid_cell_w.max(TERMINAL_MIN_WIDTH));
+        .clamp(1.0, grid_cell_w);
     let cell_h = template_size
         .map(|s| s.y)
         .unwrap_or(grid_cell_h)
