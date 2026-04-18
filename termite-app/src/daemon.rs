@@ -23,6 +23,7 @@ enum DaemonCmd {
         session_key: String,
         rows: u16,
         cols: u16,
+        working_dir: Option<String>,
         client_out_tx: Sender<Vec<u8>>,
         resp_tx: Sender<AttachResult>,
     },
@@ -102,13 +103,14 @@ fn default_shell() -> String {
     }
 }
 
-fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16)> {
+fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16, Option<String>)> {
     if payload.len() < 2 + 2 + 2 {
         anyhow::bail!("attach payload too small");
     }
     let key_len = u16::from_le_bytes(payload[0..2].try_into().expect("key_len")) as usize;
-    if payload.len() != 2 + key_len + 2 + 2 {
-        anyhow::bail!("attach payload length mismatch");
+    let base_len = 2 + key_len + 2 + 2;
+    if payload.len() < base_len {
+        anyhow::bail!("attach payload too small for key + rows/cols");
     }
     let key = String::from_utf8(payload[2..2 + key_len].to_vec()).map_err(|e| {
         anyhow::anyhow!("attach key utf8 decode error: {e}")
@@ -116,21 +118,63 @@ fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16)> {
     let rows_off = 2 + key_len;
     let rows = u16::from_le_bytes(payload[rows_off..rows_off + 2].try_into().expect("rows"));
     let cols = u16::from_le_bytes(payload[rows_off + 2..rows_off + 4].try_into().expect("cols"));
-    Ok((key, rows, cols))
+
+    if payload.len() == base_len {
+        return Ok((key, rows, cols, None));
+    }
+
+    let cwd_hdr_off = base_len;
+    if payload.len() < cwd_hdr_off + 2 {
+        anyhow::bail!("attach payload truncated (cwd length)");
+    }
+    let cwd_len = u16::from_le_bytes(payload[cwd_hdr_off..cwd_hdr_off + 2].try_into().unwrap()) as usize;
+    let expected = cwd_hdr_off + 2 + cwd_len;
+    if payload.len() != expected {
+        anyhow::bail!("attach payload length mismatch (cwd)");
+    }
+    let working_dir = if cwd_len == 0 {
+        None
+    } else {
+        Some(
+            String::from_utf8(payload[cwd_hdr_off + 2..expected].to_vec())
+                .map_err(|e| anyhow::anyhow!("attach cwd utf8 decode error: {e}"))?,
+        )
+    };
+    Ok((key, rows, cols, working_dir))
 }
 
-#[allow(dead_code)]
-fn build_attach_request(session_key: &str, rows: u16, cols: u16) -> anyhow::Result<Vec<u8>> {
-    if session_key.len() > u16::MAX as usize {
-        anyhow::bail!("session key too long");
-    }
+/// Build the binary payload for [`FRAME_ATTACH`]. Returns `None` if the session key or cwd is too long.
+pub fn attach_request_payload(
+    session_key: &str,
+    rows: u16,
+    cols: u16,
+    working_dir: Option<&str>,
+) -> Option<Vec<u8>> {
     let key_bytes = session_key.as_bytes();
-    let mut payload = Vec::with_capacity(2 + key_bytes.len() + 2 + 2);
+    if key_bytes.len() > u16::MAX as usize {
+        return None;
+    }
+    let cwd_bytes = match working_dir {
+        None | Some("") => None,
+        Some(dir) => {
+            let b = dir.as_bytes();
+            if b.len() > u16::MAX as usize {
+                return None;
+            }
+            Some(b)
+        }
+    };
+
+    let mut payload = Vec::with_capacity(2 + key_bytes.len() + 2 + 2 + 2 + cwd_bytes.map(|b| b.len()).unwrap_or(0));
     payload.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(key_bytes);
     payload.extend_from_slice(&rows.to_le_bytes());
     payload.extend_from_slice(&cols.to_le_bytes());
-    Ok(payload)
+    if let Some(b) = cwd_bytes {
+        payload.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        payload.extend_from_slice(b);
+    }
+    Some(payload)
 }
 
 fn history_max_bytes() -> usize {
@@ -143,7 +187,7 @@ fn history_max_bytes() -> usize {
 /// Run the background session daemon (PTY owner).
 ///
 /// Protocol overview:
-/// - Client -> daemon: `FRAME_ATTACH` (session key + rows/cols)
+/// - Client -> daemon: `FRAME_ATTACH` (session key + rows/cols, optional UTF-8 cwd)
 /// - Daemon -> client: `FRAME_OUTPUT` frames (history first, then live output)
 /// - Client -> daemon during session: `FRAME_INPUT` and `FRAME_RESIZE`
 pub fn run_daemon() -> anyhow::Result<()> {
@@ -188,6 +232,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     session_key,
                     rows,
                     cols,
+                    working_dir,
                     client_out_tx,
                     resp_tx,
                 } => {
@@ -197,7 +242,15 @@ pub fn run_daemon() -> anyhow::Result<()> {
                             let shell = default_shell();
                             let (pty_out_tx, pty_out_rx) = unbounded::<Vec<u8>>();
                             let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(|| {});
-                            let pty = spawn_pty(&shell, rows, cols, pty_out_tx, wake_up, None, None);
+                            let pty = spawn_pty(
+                                &shell,
+                                rows,
+                                cols,
+                                pty_out_tx,
+                                wake_up,
+                                working_dir.as_deref(),
+                                None,
+                            );
 
                             match pty {
                                 Ok(pty) => {
@@ -261,6 +314,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     session_key,
                     rows,
                     cols,
+                    working_dir,
                     client_out_tx,
                     resp_tx,
                 } => {
@@ -276,7 +330,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
                                 cols,
                                 pty_out_tx,
                                 wake_up,
-                                None,
+                                working_dir.as_deref(),
                                 None,
                             );
 
@@ -365,7 +419,7 @@ fn handle_client(
         anyhow::bail!("expected attach frame, got {frame_type}");
     }
 
-    let (session_key, rows, cols) = parse_attach_request(&payload)?;
+    let (session_key, rows, cols, working_dir) = parse_attach_request(&payload)?;
     let session_key_for_cmd = session_key.clone();
 
     let (out_tx, out_rx) = unbounded::<Vec<u8>>();
@@ -376,6 +430,7 @@ fn handle_client(
             session_key: session_key.clone(),
             rows,
             cols,
+            working_dir,
             client_out_tx: out_tx,
             resp_tx,
         })

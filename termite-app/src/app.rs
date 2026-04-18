@@ -347,19 +347,15 @@ exec "${{SHELL:-/bin/zsh}}" -i
             let mut reader = stream.try_clone().expect("clone daemon stream");
             let mut writer = stream;
 
-            let payload = {
-                let key_bytes = session_key.as_bytes();
-                if key_bytes.len() > u16::MAX as usize {
-                    None
-                } else {
-                    let mut p = Vec::with_capacity(2 + key_bytes.len() + 2 + 2);
-                    p.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
-                    p.extend_from_slice(key_bytes);
-                    p.extend_from_slice(&(rows as u16).to_le_bytes());
-                    p.extend_from_slice(&(cols as u16).to_le_bytes());
-                    Some(p)
-                }
-            };
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()));
+            let payload = crate::daemon::attach_request_payload(
+                &session_key,
+                rows as u16,
+                cols as u16,
+                cwd.as_deref(),
+            );
 
             if let Some(payload) = payload {
                 if Self::write_frame_tcp(&mut writer, FRAME_ATTACH, &payload).is_ok() {

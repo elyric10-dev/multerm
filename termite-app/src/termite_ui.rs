@@ -1,7 +1,8 @@
 use crossbeam_channel::unbounded;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke, Vec2,
+    self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke,
+    Vec2,
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -368,7 +369,7 @@ const RESIZE_HANDLE_SIZE: f32 = 14.0;
 const RESIZE_EDGE_THICKNESS: f32 = 6.0;
 const RESIZE_CORNER_HOTSPOT: f32 = 20.0;
 /// How close (px) an edge must be to a guide before it snaps — smaller = weaker magnet.
-const RESIZE_SNAP_DISTANCE: f32 = 2.0;
+const RESIZE_SNAP_DISTANCE: f32 = 1.0;
 const RESIZE_SNAP_OVERLAP_MIN: f32 = 0.0;
 /// Pixels past the pane outer edge where the BR diagonal grip lives (outside the border).
 const CORNER_GRIP_OUTSET: f32 = 2.0;
@@ -1609,6 +1610,31 @@ impl eframe::App for TermiteUi {
                                         pos.y = ny;
                                         drag_guide_y = Some(gy);
                                     }
+
+                                    let gap_snap =
+                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
+                                    let (used_h, used_v) =
+                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                    let dims_drag = pane_neighbor_dimensions(
+                                        pos,
+                                        Vec2::new(w, h),
+                                        left_group.iter().chain(right_group.iter()),
+                                        canvas_width,
+                                        content_height,
+                                    );
+                                    snap_drag_pos_to_used_neighbor_gaps(
+                                        &mut pos,
+                                        w,
+                                        h,
+                                        max_y,
+                                        &dims_drag,
+                                        &used_h,
+                                        &used_v,
+                                    );
+
+                                    pos.x = pos.x.round().max(0.0);
+                                    pos.y = pos.y.round().clamp(0.0, max_y);
+
                                     pane.position = Some(pos);
 
                                     if let Some(gx) = drag_guide_x {
@@ -1765,7 +1791,11 @@ impl eframe::App for TermiteUi {
                                     || resize_tr.dragged()
                                     || resize_bl.dragged()
                                     || resize_br.dragged();
+                                let show_layout_metrics =
+                                    drag_response.dragged() || any_resize_dragged;
                                 if any_resize_dragged {
+                                    let init_right = pos.x + pane.desired_size.x;
+                                    let init_bottom = pos.y + pane.desired_size.y;
                                     let delta = ui.input(|i| i.pointer.delta());
                                     let mut new_x = pos.x;
                                     let mut new_y = pos.y;
@@ -1788,21 +1818,19 @@ impl eframe::App for TermiteUi {
                                         || resize_br.dragged();
 
                                     if left_dragged {
-                                        let right = pos.x + pane.desired_size.x;
-                                        let max_left = (right - TERMINAL_MIN_WIDTH).max(0.0);
+                                        let max_left = (init_right - TERMINAL_MIN_WIDTH).max(0.0);
                                         let proposed_left = (pos.x + delta.x).clamp(0.0, max_left);
                                         new_x = proposed_left;
-                                        new_w = right - proposed_left;
+                                        new_w = init_right - proposed_left;
                                     }
                                     if right_dragged {
                                         new_w = (new_w + delta.x).max(TERMINAL_MIN_WIDTH);
                                     }
                                     if top_dragged {
-                                        let bottom = pos.y + pane.desired_size.y;
-                                        let max_top = (bottom - TERMINAL_MIN_HEIGHT).max(0.0);
+                                        let max_top = (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0);
                                         let proposed_top = (pos.y + delta.y).clamp(0.0, max_top);
                                         new_y = proposed_top;
-                                        new_h = bottom - proposed_top;
+                                        new_h = init_bottom - proposed_top;
                                     }
                                     if bottom_dragged {
                                         let max_h =
@@ -1924,10 +1952,9 @@ impl eframe::App for TermiteUi {
                                             new_w = (snap_x - new_x).max(TERMINAL_MIN_WIDTH);
                                             snap_guide_x = Some(snap_x);
                                         } else if !snapped_right_edge && left_dragged {
-                                            let right = new_x + new_w;
                                             new_x = (snap_x)
-                                                .clamp(0.0, (right - TERMINAL_MIN_WIDTH).max(0.0));
-                                            new_w = right - new_x;
+                                                .clamp(0.0, (init_right - TERMINAL_MIN_WIDTH).max(0.0));
+                                            new_w = init_right - new_x;
                                             snap_guide_x = Some(snap_x);
                                         }
                                     }
@@ -1942,14 +1969,55 @@ impl eframe::App for TermiteUi {
                                             );
                                             snap_guide_y = Some(snap_y);
                                         } else if !snapped_bottom_edge && top_dragged {
-                                            let bottom = new_y + new_h;
                                             new_y = (snap_y).clamp(
                                                 0.0,
-                                                (bottom - TERMINAL_MIN_HEIGHT).max(0.0),
+                                                (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0),
                                             );
-                                            new_h = bottom - new_y;
+                                            new_h = init_bottom - new_y;
                                             snap_guide_y = Some(snap_y);
                                         }
+                                    }
+
+                                    let gap_snap =
+                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
+                                    let (used_h, used_v) =
+                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                    snap_resize_rect_to_used_neighbor_gaps(
+                                        &mut new_x,
+                                        &mut new_y,
+                                        &mut new_w,
+                                        &mut new_h,
+                                        left_group,
+                                        right_group,
+                                        left_dragged,
+                                        right_dragged,
+                                        top_dragged,
+                                        bottom_dragged,
+                                        &used_h,
+                                        &used_v,
+                                        init_right,
+                                        init_bottom,
+                                        canvas_width,
+                                        content_height,
+                                        content_height,
+                                    );
+
+                                    new_x = new_x.round().max(0.0);
+                                    new_y = new_y.round().max(0.0);
+                                    if left_dragged && !right_dragged {
+                                        new_w = (init_right - new_x).max(TERMINAL_MIN_WIDTH);
+                                    } else {
+                                        new_w = new_w.round().max(TERMINAL_MIN_WIDTH);
+                                    }
+                                    if top_dragged && !bottom_dragged {
+                                        new_h = (init_bottom - new_y).max(TERMINAL_MIN_HEIGHT);
+                                    } else {
+                                        new_h = new_h.round().max(TERMINAL_MIN_HEIGHT);
+                                    }
+                                    if bottom_dragged && !top_dragged {
+                                        let max_h =
+                                            (content_height - new_y).max(TERMINAL_MIN_HEIGHT);
+                                        new_h = new_h.min(max_h);
                                     }
 
                                     pane.desired_size.x = new_w;
@@ -2142,6 +2210,47 @@ impl eframe::App for TermiteUi {
                                         br_grip_rect,
                                         resize_br.hovered() || resize_br.dragged(),
                                         p,
+                                    );
+                                }
+
+                                if show_layout_metrics {
+                                    let pos = pane.position.unwrap_or(Pos2::ZERO);
+                                    let dims = pane_neighbor_dimensions(
+                                        pos,
+                                        pane.desired_size,
+                                        left_group.iter().chain(right_group.iter()),
+                                        canvas_width,
+                                        content_height,
+                                    );
+                                    let gap_snap =
+                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
+                                    let (used_h, used_v) =
+                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                    paint_terminal_neighbor_gap_guides(
+                                        ui.painter(),
+                                        content_origin,
+                                        &dims,
+                                        &used_h,
+                                        &used_v,
+                                    );
+                                    let grid = pane.session.parser.grid();
+                                    let pty_w = pane.desired_size.x;
+                                    let pty_h = (pane.desired_size.y - TERMINAL_GRID_CHROME_Y)
+                                        .max(120.0);
+                                    let (pad_x, pad_y) = terminal_cell_slack_px(
+                                        pty_w,
+                                        pty_h,
+                                        grid.cols,
+                                        grid.rows,
+                                    );
+                                    let fill = Color32::from_rgba_unmultiplied(0, 0, 0, 200);
+                                    paint_pane_layout_metrics_overlay(
+                                        ui.painter(),
+                                        pane_rect,
+                                        pad_x,
+                                        pad_y,
+                                        p.text,
+                                        fill,
                                     );
                                 }
                             }
@@ -2778,16 +2887,9 @@ fn spawn_terminal_pane(
     // survives closing/reopening this UI.
     if let Some(mut stream) = connect_daemon() {
         if let Ok(mut reader) = stream.try_clone() {
-            // Attach request payload:
-            // [u16 key_len][key bytes][u16 rows][u16 cols]
-            let key_bytes = tmux_session.as_bytes();
-            if key_bytes.len() <= u16::MAX as usize {
-                let mut payload = Vec::with_capacity(2 + key_bytes.len() + 2 + 2);
-                payload.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
-                payload.extend_from_slice(key_bytes);
-                payload.extend_from_slice(&(24u16).to_le_bytes());
-                payload.extend_from_slice(&(80u16).to_le_bytes());
-
+            // Attach payload is built in `daemon::attach_request_payload` (key, rows/cols, optional cwd).
+            let cwd = (!working_dir.is_empty()).then_some(working_dir);
+            if let Some(payload) = crate::daemon::attach_request_payload(tmux_session, 24, 80, cwd) {
                 if write_frame_tcp(&mut stream, FRAME_ATTACH, &payload).is_ok() {
                     if let Ok((ft, first_payload)) = read_frame_tcp(&mut reader) {
                         if ft == FRAME_OUTPUT {
@@ -2859,6 +2961,569 @@ fn resize_terminal_for_size(pane: &mut TerminalPane, size: Vec2) {
     let rows = (size.y / CELL_H).max(1.0) as usize;
     pane.session.parser.resize(rows, cols);
     pane.backend.resize(rows as u16, cols as u16);
+}
+
+/// Vertical space above the PTY grid inside a pane frame (title row, separator, margins).
+const TERMINAL_GRID_CHROME_Y: f32 = 44.0;
+
+/// How closely a live gap must match a gap measured elsewhere to count as the same (px).
+/// Integer-rounded gaps use strict pixel equality for highlight (`gap_matches_used`).
+const USED_GAP_MATCH_EPS: f32 = 0.51;
+/// Magnet distance (px): snap a live neighbor gap to a gap already used between other terminals.
+const USED_GAP_SNAP_DISTANCE: f32 = 2.0;
+
+#[derive(Clone, Copy)]
+struct PaneGapDim {
+    px: f32,
+    /// Workspace-local segment endpoints (add `content_origin` to paint).
+    a: Pos2,
+    b: Pos2,
+    /// `true` when this measures horizontal distance (compare to other terminals' side gaps).
+    is_horizontal: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PaneNeighborDimensions {
+    left: PaneGapDim,
+    right: PaneGapDim,
+    top: PaneGapDim,
+    bottom: PaneGapDim,
+}
+
+/// Gaps from this pane to the nearest neighbor on each axis, with segment geometry for guides.
+/// `others` must not include the pane being measured.
+fn pane_neighbor_dimensions<'a>(
+    pos: Pos2,
+    size: Vec2,
+    others: impl Iterator<Item = &'a TerminalPane>,
+    workspace_right: f32,
+    workspace_bottom: f32,
+) -> PaneNeighborDimensions {
+    let x0 = pos.x;
+    let y0 = pos.y;
+    let x1 = pos.x + size.x;
+    let y1 = pos.y + size.y;
+
+    let horiz_overlap = |oy0: f32, oy1: f32| -> bool {
+        (y1.min(oy1) - y0.max(oy0)).max(0.0) > 0.0
+    };
+    let vert_overlap = |ox0: f32, ox1: f32| -> bool {
+        (x1.min(ox1) - x0.max(ox0)).max(0.0) > 0.0
+    };
+
+    let mut best_left: Option<(f32, f32)> = None; // (neighbor_right_x, y_mid)
+    let mut best_right: Option<(f32, f32)> = None; // (neighbor_left_x, y_mid)
+    let mut best_top: Option<(f32, f32)> = None; // (neighbor_bottom_y, x_mid)
+    let mut best_bottom: Option<(f32, f32)> = None; // (neighbor_top_y, x_mid)
+
+    for other in others {
+        let op = other.position.unwrap_or(Pos2::ZERO);
+        let ox0 = op.x;
+        let oy0 = op.y;
+        let ox1 = op.x + other.desired_size.x;
+        let oy1 = op.y + other.desired_size.y;
+
+        if horiz_overlap(oy0, oy1) && ox1 <= x0 {
+            let y_lo = y0.max(oy0);
+            let y_hi = y1.min(oy1);
+            let y_mid = (y_lo + y_hi) * 0.5;
+            best_left = Some(match best_left {
+                None => (ox1, y_mid),
+                Some((xr, _ym)) if ox1 > xr => (ox1, y_mid),
+                Some(keep) => keep,
+            });
+        }
+        if horiz_overlap(oy0, oy1) && ox0 >= x1 {
+            let y_lo = y0.max(oy0);
+            let y_hi = y1.min(oy1);
+            let y_mid = (y_lo + y_hi) * 0.5;
+            best_right = Some(match best_right {
+                None => (ox0, y_mid),
+                Some((xl, _ym)) if ox0 < xl => (ox0, y_mid),
+                Some(keep) => keep,
+            });
+        }
+        if vert_overlap(ox0, ox1) && oy1 <= y0 {
+            let x_lo = x0.max(ox0);
+            let x_hi = x1.min(ox1);
+            let x_mid = (x_lo + x_hi) * 0.5;
+            best_top = Some(match best_top {
+                None => (oy1, x_mid),
+                Some((yb, _xm)) if oy1 > yb => (oy1, x_mid),
+                Some(keep) => keep,
+            });
+        }
+        if vert_overlap(ox0, ox1) && oy0 >= y1 {
+            let x_lo = x0.max(ox0);
+            let x_hi = x1.min(ox1);
+            let x_mid = (x_lo + x_hi) * 0.5;
+            best_bottom = Some(match best_bottom {
+                None => (oy0, x_mid),
+                Some((yt, _xm)) if oy0 < yt => (oy0, x_mid),
+                Some(keep) => keep,
+            });
+        }
+    }
+
+    let y_center = (y0 + y1) * 0.5;
+    let x_center = (x0 + x1) * 0.5;
+
+    let left = if let Some((xr, y_mid)) = best_left {
+        let px = x0 - xr;
+        PaneGapDim {
+            px,
+            a: Pos2::new(xr, y_mid),
+            b: Pos2::new(x0, y_mid),
+            is_horizontal: true,
+        }
+    } else {
+        let px = x0;
+        PaneGapDim {
+            px,
+            a: Pos2::new(0.0, y_center),
+            b: Pos2::new(x0, y_center),
+            is_horizontal: true,
+        }
+    };
+
+    let right = if let Some((xl, y_mid)) = best_right {
+        let px = xl - x1;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x1, y_mid),
+            b: Pos2::new(xl, y_mid),
+            is_horizontal: true,
+        }
+    } else {
+        let px = workspace_right - x1;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x1, y_center),
+            b: Pos2::new(workspace_right, y_center),
+            is_horizontal: true,
+        }
+    };
+
+    let top = if let Some((yb, x_mid)) = best_top {
+        let px = y0 - yb;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x_mid, yb),
+            b: Pos2::new(x_mid, y0),
+            is_horizontal: false,
+        }
+    } else {
+        let px = y0;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x_center, 0.0),
+            b: Pos2::new(x_center, y0),
+            is_horizontal: false,
+        }
+    };
+
+    let bottom = if let Some((yt, x_mid)) = best_bottom {
+        let px = yt - y1;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x_mid, y1),
+            b: Pos2::new(x_mid, yt),
+            is_horizontal: false,
+        }
+    } else {
+        let px = workspace_bottom - y1;
+        PaneGapDim {
+            px,
+            a: Pos2::new(x_center, y1),
+            b: Pos2::new(x_center, workspace_bottom),
+            is_horizontal: false,
+        }
+    };
+
+    PaneNeighborDimensions {
+        left,
+        right,
+        top,
+        bottom,
+    }
+}
+
+fn gap_matches_used(px: f32, used: &[f32]) -> bool {
+    let p = px.round();
+    used.iter().any(|&u| (p - u.round()).abs() <= USED_GAP_MATCH_EPS)
+}
+
+fn gap_rect_snapshot_three_way(
+    left_group: &[TerminalPane],
+    mid: &TerminalPane,
+    right_group: &[TerminalPane],
+) -> Vec<Option<(f32, f32, f32, f32)>> {
+    let mut gap_snap: Vec<Option<(f32, f32, f32, f32)>> =
+        Vec::with_capacity(left_group.len() + 1 + right_group.len());
+    for p in left_group.iter() {
+        gap_snap.push(p.position.map(|op| {
+            (
+                op.x,
+                op.y,
+                op.x + p.desired_size.x,
+                op.y + p.desired_size.y,
+            )
+        }));
+    }
+    gap_snap.push(mid.position.map(|op| {
+        (
+            op.x,
+            op.y,
+            op.x + mid.desired_size.x,
+            op.y + mid.desired_size.y,
+        )
+    }));
+    for p in right_group.iter() {
+        gap_snap.push(p.position.map(|op| {
+            (
+                op.x,
+                op.y,
+                op.x + p.desired_size.x,
+                op.y + p.desired_size.y,
+            )
+        }));
+    }
+    gap_snap
+}
+
+/// If `current` is within `snap_dist` of some entry in `used`, returns the closest such target.
+/// Compares in **integer pixel** space so a horizontal 20 and vertical measurement ~20.4
+/// both agree on 20.
+fn closest_used_gap_target(current: f32, used: &[f32], snap_dist: f32) -> Option<f32> {
+    let c = current.round();
+    let mut best: Option<(f32, f32)> = None; // (abs_diff, target_u_rounded)
+    for &u in used {
+        let ur = u.round();
+        let d = (c - ur).abs();
+        if d <= snap_dist && best.is_none_or(|(bd, _)| d < bd - 1e-5) {
+            best = Some((d, ur));
+        }
+    }
+    best.map(|(_, ur)| ur)
+}
+
+/// All distinct gap sizes seen between other terminals (horizontal *and* vertical pairs),
+/// so snapping and highlights can match either orientation.
+fn merged_used_gap_targets(used_h: &[f32], used_v: &[f32]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(used_h.len() + used_v.len());
+    for &g in used_h.iter().chain(used_v.iter()) {
+        let gr = g.round();
+        if gr < 1.0 {
+            continue;
+        }
+        if !out.iter().any(|&x| (x - gr).abs() <= USED_GAP_MATCH_EPS) {
+            out.push(gr);
+        }
+    }
+    out
+}
+
+fn snap_drag_pos_to_used_neighbor_gaps(
+    pos: &mut Pos2,
+    _w: f32,
+    _h: f32,
+    max_y: f32,
+    dims: &PaneNeighborDimensions,
+    used_h: &[f32],
+    used_v: &[f32],
+) {
+    let used_all = merged_used_gap_targets(used_h, used_v);
+    if used_all.is_empty() {
+        return;
+    }
+
+    let l = dims.left.px.round();
+    let r = dims.right.px.round();
+    let mut best_dx: Option<(f32, f32)> = None;
+    for &u in &used_all {
+        let ur = u.round();
+        let dx_l = ur - l;
+        if dx_l.abs() <= USED_GAP_SNAP_DISTANCE
+            && best_dx.is_none_or(|(ab, _)| dx_l.abs() < ab - 1e-5)
+        {
+            best_dx = Some((dx_l.abs(), dx_l));
+        }
+        let dx_r = r - ur;
+        if dx_r.abs() <= USED_GAP_SNAP_DISTANCE
+            && best_dx.is_none_or(|(ab, _)| dx_r.abs() < ab - 1e-5)
+        {
+            best_dx = Some((dx_r.abs(), dx_r));
+        }
+    }
+    if let Some((_, dx)) = best_dx {
+        pos.x = (pos.x + dx).max(0.0);
+    }
+
+    let t = dims.top.px.round();
+    let b = dims.bottom.px.round();
+    let mut best_dy: Option<(f32, f32)> = None;
+    for &u in &used_all {
+        let ur = u.round();
+        let dy_t = ur - t;
+        if dy_t.abs() <= USED_GAP_SNAP_DISTANCE
+            && best_dy.is_none_or(|(ab, _)| dy_t.abs() < ab - 1e-5)
+        {
+            best_dy = Some((dy_t.abs(), dy_t));
+        }
+        let dy_b = b - ur;
+        if dy_b.abs() <= USED_GAP_SNAP_DISTANCE
+            && best_dy.is_none_or(|(ab, _)| dy_b.abs() < ab - 1e-5)
+        {
+            best_dy = Some((dy_b.abs(), dy_b));
+        }
+    }
+    if let Some((_, dy)) = best_dy {
+        pos.y = (pos.y + dy).clamp(0.0, max_y);
+    }
+}
+
+fn snap_resize_rect_to_used_neighbor_gaps<'a>(
+    new_x: &mut f32,
+    new_y: &mut f32,
+    new_w: &mut f32,
+    new_h: &mut f32,
+    left_group: &'a [TerminalPane],
+    right_group: &'a [TerminalPane],
+    left_dragged: bool,
+    right_dragged: bool,
+    top_dragged: bool,
+    bottom_dragged: bool,
+    used_h: &[f32],
+    used_v: &[f32],
+    init_right: f32,
+    init_bottom: f32,
+    workspace_right: f32,
+    workspace_bottom: f32,
+    content_height: f32,
+) {
+    let others = || left_group.iter().chain(right_group.iter());
+    let used_all = merged_used_gap_targets(used_h, used_v);
+
+    let snap_left = left_dragged && !right_dragged;
+    let snap_right = right_dragged && !left_dragged;
+    let snap_top = top_dragged && !bottom_dragged;
+    let snap_bottom = bottom_dragged && !top_dragged;
+
+    if !used_all.is_empty() && (snap_left || snap_right) {
+        let dims = pane_neighbor_dimensions(
+            Pos2::new(*new_x, *new_y),
+            Vec2::new(*new_w, *new_h),
+            others(),
+            workspace_right,
+            workspace_bottom,
+        );
+        if snap_right {
+            if let Some(u) =
+                closest_used_gap_target(dims.right.px, &used_all, USED_GAP_SNAP_DISTANCE)
+            {
+                let xl = dims.right.b.x;
+                *new_w = (xl - *new_x - u).max(TERMINAL_MIN_WIDTH);
+            }
+        }
+        if snap_left {
+            if let Some(u) =
+                closest_used_gap_target(dims.left.px, &used_all, USED_GAP_SNAP_DISTANCE)
+            {
+                let xr = dims.left.a.x;
+                *new_x = (xr + u).clamp(0.0, (init_right - TERMINAL_MIN_WIDTH).max(0.0));
+                *new_w = (init_right - *new_x).max(TERMINAL_MIN_WIDTH);
+            }
+        }
+    }
+
+    if !used_all.is_empty() && (snap_top || snap_bottom) {
+        let dims = pane_neighbor_dimensions(
+            Pos2::new(*new_x, *new_y),
+            Vec2::new(*new_w, *new_h),
+            others(),
+            workspace_right,
+            workspace_bottom,
+        );
+        if snap_bottom {
+            if let Some(u) =
+                closest_used_gap_target(dims.bottom.px, &used_all, USED_GAP_SNAP_DISTANCE)
+            {
+                let yt = dims.bottom.b.y;
+                let max_h = (content_height - *new_y).max(TERMINAL_MIN_HEIGHT);
+                *new_h = (yt - *new_y - u).clamp(TERMINAL_MIN_HEIGHT, max_h);
+            }
+        }
+        if snap_top {
+            if let Some(u) =
+                closest_used_gap_target(dims.top.px, &used_all, USED_GAP_SNAP_DISTANCE)
+            {
+                let yb = dims.top.a.y;
+                *new_y = (yb + u).clamp(0.0, (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0));
+                *new_h = (init_bottom - *new_y).max(TERMINAL_MIN_HEIGHT);
+            }
+        }
+    }
+}
+
+fn push_gap_unique(list: &mut Vec<f32>, g: f32) {
+    let g = g.round();
+    if g < 1.0 {
+        return;
+    }
+    if !list.iter().any(|&x| (x - g).abs() <= USED_GAP_MATCH_EPS) {
+        list.push(g);
+    }
+}
+
+/// Horizontal and vertical clearances already present between *other* terminals (excludes
+/// `exclude_idx` so the dragged pane does not define the reference set).
+/// Uses a precomputed snapshot so we can read gaps while the pane loop holds `split_at_mut`.
+fn collect_pair_gaps_from_rect_snapshot(
+    rects: &[Option<(f32, f32, f32, f32)>],
+    exclude_idx: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut h = Vec::new();
+    let mut v = Vec::new();
+    let n = rects.len();
+    for i in 0..n {
+        if i == exclude_idx {
+            continue;
+        }
+        let Some((ax0, ay0, ax1, ay1)) = rects[i] else {
+            continue;
+        };
+        for j in (i + 1)..n {
+            if j == exclude_idx {
+                continue;
+            }
+            let Some((bx0, by0, bx1, by1)) = rects[j] else {
+                continue;
+            };
+
+            let y_overlap = (ay1.min(by1) - ay0.max(by0)).max(0.0);
+            if y_overlap > 0.0 {
+                if ax1 <= bx0 - 0.05 {
+                    push_gap_unique(&mut h, bx0 - ax1);
+                } else if bx1 <= ax0 - 0.05 {
+                    push_gap_unique(&mut h, ax0 - bx1);
+                }
+            }
+
+            let x_overlap = (ax1.min(bx1) - ax0.max(bx0)).max(0.0);
+            if x_overlap > 0.0 {
+                if ay1 <= by0 - 0.05 {
+                    push_gap_unique(&mut v, by0 - ay1);
+                } else if by1 <= ay0 - 0.05 {
+                    push_gap_unique(&mut v, ay0 - by1);
+                }
+            }
+        }
+    }
+    (h, v)
+}
+
+fn format_gap_label_px(px: f32) -> String {
+    format!("{}", px.abs().round() as i32)
+}
+
+fn paint_gap_dimension_guide(
+    painter: &egui::Painter,
+    content_origin: Pos2,
+    dim: PaneGapDim,
+    used_any_orientation: &[f32],
+) {
+    if dim.px < 0.25 {
+        return;
+    }
+    let matches_used = gap_matches_used(dim.px, used_any_orientation);
+
+    let stroke = if matches_used {
+        Stroke::new(1.8, Color32::from_rgb(235, 70, 210))
+    } else {
+        Stroke::new(1.15, Color32::from_rgb(175, 130, 215))
+    };
+
+    let a = content_origin + dim.a.to_vec2();
+    let b = content_origin + dim.b.to_vec2();
+    painter.line_segment([a, b], stroke);
+
+    let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    let (label_anchor, align) = if dim.is_horizontal {
+        (mid + Vec2::new(0.0, -11.0), Align2::CENTER_BOTTOM)
+    } else {
+        (mid + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER)
+    };
+
+    let label = format_gap_label_px(dim.px);
+    let font = FontId::monospace(10.0);
+    let text_color = Color32::WHITE;
+    let galley = painter.layout_no_wrap(label, font.clone(), text_color);
+    let pad = 3.0_f32;
+    let bubble_size = galley.size() + 2.0 * Vec2::splat(pad);
+    let bubble_rect = align.anchor_size(label_anchor, bubble_size);
+    let fill = if matches_used {
+        Color32::from_rgba_unmultiplied(220, 55, 195, 238)
+    } else {
+        Color32::from_rgba_unmultiplied(95, 65, 125, 228)
+    };
+    painter.rect_filled(bubble_rect, 4.0, fill);
+    painter.galley(
+        bubble_rect.min + Vec2::splat(pad),
+        galley,
+        text_color,
+    );
+}
+
+fn paint_terminal_neighbor_gap_guides(
+    painter: &egui::Painter,
+    content_origin: Pos2,
+    dims: &PaneNeighborDimensions,
+    used_h: &[f32],
+    used_v: &[f32],
+) {
+    let used_all = merged_used_gap_targets(used_h, used_v);
+    const MAX_SPAN: f32 = 900.0;
+    for dim in [
+        dims.left,
+        dims.right,
+        dims.top,
+        dims.bottom,
+    ] {
+        if dim.px > MAX_SPAN {
+            continue;
+        }
+        paint_gap_dimension_guide(painter, content_origin, dim, &used_all);
+    }
+}
+
+/// Leftover pixels after fitting an integer cell grid at [`CELL_W`] × [`CELL_H`].
+fn terminal_cell_slack_px(pty_w: f32, pty_h: f32, grid_cols: usize, grid_rows: usize) -> (f32, f32) {
+    let pad_x = pty_w - grid_cols as f32 * CELL_W;
+    let pad_y = pty_h - grid_rows as f32 * CELL_H;
+    (pad_x.max(0.0), pad_y.max(0.0))
+}
+
+fn paint_pane_layout_metrics_overlay(
+    painter: &egui::Painter,
+    pane_screen_rect: egui::Rect,
+    pad_x: f32,
+    pad_y: f32,
+    text_color: Color32,
+    fill: Color32,
+) {
+    let font = FontId::monospace(10.0);
+    let line = format!(
+        "grid +{} +{} px\nref gutter {}×{}",
+        pad_x.round() as i32,
+        pad_y.round() as i32,
+        GRID_SPACING.round() as i32,
+        STACK_GAP_Y.round() as i32,
+    );
+    let galley = painter.layout(line, font, text_color, f32::INFINITY);
+    let anchor = pane_screen_rect.right_bottom() + Vec2::new(-6.0, -6.0);
+    let text_rect = Align2::RIGHT_BOTTOM.anchor_size(anchor, galley.size());
+    painter.rect_filled(text_rect.expand(3.0), 3.0, fill);
+    painter.galley(text_rect.min, galley, text_color);
 }
 
 fn paint_br_resize_line(painter: &egui::Painter, grip_rect: egui::Rect, hot: bool, p: UiPalette) {
