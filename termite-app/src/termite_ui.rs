@@ -699,8 +699,6 @@ struct WorkspaceSpawnNotice {
 
 struct TabDragState {
     source_idx: usize,
-    /// Pointer x minus tab left-edge x at the moment drag started.
-    grab_offset_x: f32,
     /// Current left-edge x of the ghost tab (follows the pointer).
     ghost_x: f32,
     /// Index into the "others" array (tabs excluding source) where the tab would be inserted.
@@ -2994,6 +2992,13 @@ impl TermiteUi {
                                 runtime.terminals[active_idx].backend.write_all(&bytes);
                             }
                             runtime.selections[active_idx] = None;
+                            // Clear egui's label galley selection too; otherwise the blue
+                            // overlay persists after grid-based deletion.
+                            ctx.with_plugin(
+                                |label_sel: &mut egui::text_selection::LabelSelectionState| {
+                                    label_sel.clear_selection();
+                                },
+                            );
                             continue;
                         }
                         // Track single backspace in line editor.
@@ -3946,6 +3951,76 @@ fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
     end
 }
 
+#[inline]
+fn terminal_char_category(ch: char) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
+    }
+}
+
+fn snap_to_leading_cell(grid: &TerminalGrid, row: usize, mut col: usize) -> usize {
+    if grid.cell(row, col).wide == WideKind::Trailing && col > 0 {
+        col -= 1;
+    }
+    col
+}
+
+fn wide_span_end_col(grid: &TerminalGrid, row: usize, start_col: usize) -> usize {
+    if grid.cell(row, start_col).wide == WideKind::Leading && start_col + 1 < grid.cols {
+        start_col + 1
+    } else {
+        start_col
+    }
+}
+
+fn prev_char_start_col(grid: &TerminalGrid, row: usize, col: usize) -> Option<usize> {
+    if col == 0 {
+        return None;
+    }
+    let mut pc = col - 1;
+    if grid.cell(row, pc).wide == WideKind::Trailing {
+        pc = pc.checked_sub(1)?;
+    }
+    Some(pc)
+}
+
+fn next_char_start_after_end_col(grid: &TerminalGrid, row: usize, end_col: usize) -> Option<usize> {
+    let next = end_col + 1;
+    if next >= grid.cols {
+        return None;
+    }
+    Some(snap_to_leading_cell(grid, row, next))
+}
+
+/// Inclusive `(start_col, end_col)` on `row` for double-click word selection.
+fn terminal_word_selection_span(grid: &TerminalGrid, row: usize, col: usize) -> Option<(usize, usize)> {
+    if row >= grid.rows || grid.cols == 0 {
+        return None;
+    }
+    let col = col.min(grid.cols - 1);
+    let anchor = snap_to_leading_cell(grid, row, col);
+    let cat = terminal_char_category(grid.cell(row, anchor).ch);
+    let mut start = anchor;
+    let mut end = wide_span_end_col(grid, row, anchor);
+    while let Some(ps) = prev_char_start_col(grid, row, start) {
+        if terminal_char_category(grid.cell(row, ps).ch) != cat {
+            break;
+        }
+        start = ps;
+    }
+    while let Some(ns) = next_char_start_after_end_col(grid, row, end) {
+        if terminal_char_category(grid.cell(row, ns).ch) != cat {
+            break;
+        }
+        end = wide_span_end_col(grid, row, ns);
+    }
+    Some((start, end))
+}
+
 fn render_terminal_grid(
     ui: &mut egui::Ui,
     pane_id: u64,
@@ -4104,7 +4179,20 @@ fn render_terminal_grid(
                 (row, col)
             };
 
-            if response.clicked() {
+            if response.double_clicked() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let (row, col) = pointer_to_cell(pointer);
+                    if let Some((sc, ec)) = terminal_word_selection_span(grid, row, col) {
+                        *selection = Some(SelectionRange {
+                            start_row: row,
+                            start_col: sc,
+                            end_row: row,
+                            end_col: ec,
+                            active: true,
+                        });
+                    }
+                }
+            } else if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     let (row, col) = pointer_to_cell(pointer);
                     clicked_cell = Some((row, col));
@@ -4551,7 +4639,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
             if is_editing {
                 // Inline rename editor.
                 let icon_color = tc;
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tab_rect), |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(tab_rect), |ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(inner_x);
                         ui.label(
@@ -4663,11 +4751,8 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                 changed = true;
             }
             if label_resp.drag_started() && n_tabs > 1 && app.tab_drag.is_none() {
-                let ptr_x =
-                    ui.input(|i| i.pointer.hover_pos().map(|pos| pos.x).unwrap_or(tx));
                 app.tab_drag = Some(TabDragState {
                     source_idx: idx,
-                    grab_offset_x: ptr_x - tx,
                     ghost_x: tx,
                     insert_before: idx, // initial = "no change"
                 });
