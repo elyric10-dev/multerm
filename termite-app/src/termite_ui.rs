@@ -10,7 +10,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -254,7 +254,6 @@ struct UiPalette {
     vt_default_fg: Color32,
     header_strip: Color32,
     popover_fill: Color32,
-    path_picker_icon: Color32,
     tab_label_active: Color32,
     resize_grip_hot: Color32,
     resize_grip_cold: Color32,
@@ -283,7 +282,6 @@ impl UiTheme {
                 vt_default_fg: Color32::from_rgb(212, 212, 216),
                 header_strip: Color32::from_rgb(9, 13, 21),
                 popover_fill: Color32::from_rgb(8, 14, 24),
-                path_picker_icon: Color32::from_rgb(52, 217, 113),
                 tab_label_active: Color32::WHITE,
                 resize_grip_hot: Color32::from_rgb(160, 196, 245),
                 resize_grip_cold: Color32::from_rgb(96, 130, 184),
@@ -308,7 +306,6 @@ impl UiTheme {
                 vt_default_fg: Color32::from_rgb(36, 40, 52),
                 header_strip: Color32::from_rgb(226, 231, 240),
                 popover_fill: Color32::from_rgb(248, 250, 252),
-                path_picker_icon: Color32::from_rgb(34, 150, 90),
                 tab_label_active: Color32::WHITE,
                 resize_grip_hot: Color32::from_rgb(70, 120, 200),
                 resize_grip_cold: Color32::from_rgb(140, 160, 190),
@@ -679,6 +676,8 @@ struct TermiteUi {
     color_picker_original_rgba: Option<[u8; 4]>,
     color_picker_rendered_this_frame: bool,
     editing_working_dir: bool,
+    /// After opening the path editor, focus the field once (avoid stealing focus every frame).
+    working_dir_editor_focus_next_frame: bool,
     working_dir_input: String,
     pending_terminal_spawn_pos: Option<Pos2>,
     pending_context_terminal: Option<usize>,
@@ -816,6 +815,7 @@ impl Default for TermiteUi {
                 color_picker_original_rgba: None,
                 color_picker_rendered_this_frame: false,
                 editing_working_dir: false,
+                working_dir_editor_focus_next_frame: false,
                 working_dir_input: String::new(),
                 pending_terminal_spawn_pos: None,
                 pending_context_terminal: None,
@@ -947,6 +947,7 @@ impl Default for TermiteUi {
             color_picker_original_rgba: None,
             color_picker_rendered_this_frame: false,
             editing_working_dir: false,
+            working_dir_editor_focus_next_frame: false,
             working_dir_input: String::new(),
             pending_terminal_spawn_pos: None,
             pending_context_terminal: None,
@@ -1137,9 +1138,11 @@ impl eframe::App for TermiteUi {
         let p = self.ui_theme.palette().with_style(self.ui_style);
         apply_egui_visuals(ctx, self.ui_theme, p);
 
+        // Height follows content (PanelState). Avoid `exact_height`: it pins `height_range`
+        // and forces a tall inner `min_height`, leaving a large empty band when no alert row.
         egui::TopBottomPanel::top("workspace_tabs")
             .resizable(false)
-            .exact_height(70.0)
+            .default_height(96.0)
             .frame(
                 egui::Frame::default()
                     .fill(p.header_strip)
@@ -1241,6 +1244,38 @@ impl eframe::App for TermiteUi {
                     self.terminal_workspace_viewport = ui.available_size();
                     let area_rect = ui.max_rect();
                     let viewport = Vec2::new(area_rect.width(), area_rect.height());
+
+                    let path_str = effective_workspace_working_dir_path(self);
+                    let cwd_ready_for_terminals = self.workspaces.is_empty()
+                        || workspace_dir_exists_for_terminals(&path_str);
+
+                    if !self.workspaces.is_empty() && !cwd_ready_for_terminals {
+                        let explanation = working_directory_path_alert(&path_str)
+                            .map(|(_, m)| m)
+                            .unwrap_or_else(|| {
+                                "Set a valid workspace folder above to use terminals.".to_string()
+                            });
+                        ui.add_space(viewport.y * 0.18);
+                        ui.vertical_centered(|ui| {
+                            ui.set_max_width((viewport.x - 48.0).max(200.0));
+                            ui.label(
+                                RichText::new(
+                                    "Terminals are disabled until this workspace folder exists and is usable.",
+                                )
+                                .size(14.0)
+                                .strong()
+                                .color(p.text),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(explanation).size(13.0).color(p.muted),
+                            );
+                        });
+                    }
+
+                    if !cwd_ready_for_terminals {
+                        ui.disable();
+                    }
 
                     let Some(runtime_ref) = self.active_workspace_runtime() else {
                         let response = ui.interact(
@@ -1369,25 +1404,29 @@ impl eframe::App for TermiteUi {
                             };
 
                             if runtime.terminals.is_empty() {
-                                let hint = ui.label(
-                                    RichText::new("Right-click and choose \"New Terminal\".")
-                                        .size(13.0)
-                                        .color(p.muted),
-                                );
-                                if hint.secondary_clicked() {
-                                    self.pending_context_terminal = None;
-                                    if let Some(pointer_pos) = hint.interact_pointer_pos() {
-                                        let local_pos = Pos2::new(
-                                            pointer_pos.x - content_origin.x,
-                                            pointer_pos.y - content_origin.y,
-                                        );
-                                        self.pending_terminal_spawn_pos = Some(local_pos);
-                                        self.trigger_spawn_flash(local_pos);
+                                if cwd_ready_for_terminals {
+                                    let hint = ui.label(
+                                        RichText::new("Right-click and choose \"New Terminal\".")
+                                            .size(13.0)
+                                            .color(p.muted),
+                                    );
+                                    if hint.secondary_clicked() {
+                                        self.pending_context_terminal = None;
+                                        if let Some(pointer_pos) = hint.interact_pointer_pos() {
+                                            let local_pos = Pos2::new(
+                                                pointer_pos.x - content_origin.x,
+                                                pointer_pos.y - content_origin.y,
+                                            );
+                                            self.pending_terminal_spawn_pos = Some(local_pos);
+                                            self.trigger_spawn_flash(local_pos);
+                                        }
                                     }
+                                    egui::Popup::context_menu(&hint)
+                                        .close_behavior(
+                                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                                        )
+                                        .show(|ui| new_terminal_context_menu(ui, self, None));
                                 }
-                                egui::Popup::context_menu(&hint)
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .show(|ui| new_terminal_context_menu(ui, self, None));
                                 return;
                             }
 
@@ -2601,9 +2640,13 @@ impl TermiteUi {
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
         self.ensure_workspace_runtime_slots();
+        let cwd_ok = workspace_dir_exists_for_terminals(&effective_workspace_working_dir_path(self));
         let Some(runtime) = self.active_workspace_runtime_mut() else {
             return;
         };
+        if !cwd_ok {
+            return;
+        }
         if runtime.selections.len() < runtime.terminals.len() {
             runtime.selections.resize(runtime.terminals.len(), None);
         } else if runtime.selections.len() > runtime.terminals.len() {
@@ -2882,13 +2925,14 @@ fn spawn_terminal_pane(
     tmux_session: &str,
 ) -> TerminalPane {
     let (tx, rx) = unbounded::<Vec<u8>>();
+    let cwd_resolved = ensure_working_dir_for_spawn(working_dir);
 
     // Prefer the built-in daemon so terminal state (e.g. a running Claude session)
     // survives closing/reopening this UI.
     if let Some(mut stream) = connect_daemon() {
         if let Ok(mut reader) = stream.try_clone() {
             // Attach payload is built in `daemon::attach_request_payload` (key, rows/cols, optional cwd).
-            let cwd = (!working_dir.is_empty()).then_some(working_dir);
+            let cwd = (!cwd_resolved.is_empty()).then_some(cwd_resolved.as_str());
             if let Some(payload) = crate::daemon::attach_request_payload(tmux_session, 24, 80, cwd) {
                 if write_frame_tcp(&mut stream, FRAME_ATTACH, &payload).is_ok() {
                     if let Ok((ft, first_payload)) = read_frame_tcp(&mut reader) {
@@ -2936,7 +2980,7 @@ fn spawn_terminal_pane(
         80,
         tx,
         wake_up,
-        Some(working_dir),
+        Some(cwd_resolved.as_str()),
         None,
     )
     .expect("spawn terminal pty");
@@ -4131,15 +4175,22 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let tab_btn = egui::Button::new(
-                                RichText::new(&title)
+                                RichText::new(format!(">_  {}", title))
                                     .size(12.0)
                                     .family(FontFamily::Monospace)
                                     .color(text_color),
                             )
                             .frame(false)
-                            .min_size(Vec2::new(74.0, 20.0));
+                            .min_size(Vec2::new(88.0, 20.0));
                             let is_editing = app.editing_workspace_idx == Some(idx);
                             if is_editing {
+                                ui.label(
+                                    RichText::new(">_")
+                                        .size(12.0)
+                                        .family(FontFamily::Monospace)
+                                        .color(text_color),
+                                );
+                                ui.add_space(4.0);
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut app.editing_workspace_input)
                                         .desired_width(110.0)
@@ -4498,6 +4549,175 @@ fn workspace_tab_context_menu(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlertSeverity {
+    Warning,
+    Error,
+}
+
+fn alert_strip_colors(severity: AlertSeverity, theme: UiTheme) -> (Color32, Color32, Color32) {
+    match (severity, theme) {
+        (AlertSeverity::Warning, UiTheme::Dark) => (
+            Color32::from_rgb(52, 45, 28),
+            Color32::from_rgb(200, 160, 80),
+            Color32::from_rgb(255, 224, 170),
+        ),
+        (AlertSeverity::Warning, UiTheme::Light) => (
+            Color32::from_rgb(255, 248, 220),
+            Color32::from_rgb(210, 170, 90),
+            Color32::from_rgb(90, 70, 30),
+        ),
+        (AlertSeverity::Error, UiTheme::Dark) => (
+            Color32::from_rgb(52, 28, 28),
+            Color32::from_rgb(200, 90, 90),
+            Color32::from_rgb(255, 190, 190),
+        ),
+        (AlertSeverity::Error, UiTheme::Light) => (
+            Color32::from_rgb(255, 235, 235),
+            Color32::from_rgb(200, 100, 100),
+            Color32::from_rgb(90, 35, 35),
+        ),
+    }
+}
+
+/// Max width for wrapped alert copy so the strip stays compact and can be centered under the path.
+const PATH_ALERT_LABEL_MAX_W: f32 = 280.0;
+
+/// Reusable inline alert (banner) for validation and notices.
+fn alert_message_strip(ui: &mut egui::Ui, severity: AlertSeverity, message: &str, theme: UiTheme) {
+    let (fill, stroke, text) = alert_strip_colors(severity, theme);
+    egui::Frame::default()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .corner_radius(4.0)
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_max_width(PATH_ALERT_LABEL_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(message).size(11.0).color(text)).wrap(),
+            );
+        });
+}
+
+/// Same as [`alert_message_strip`], with a trailing control inside the same frame (e.g. “Create folder”).
+fn alert_message_strip_with_trailing_action<F: FnOnce(&mut egui::Ui)>(
+    ui: &mut egui::Ui,
+    severity: AlertSeverity,
+    message: &str,
+    theme: UiTheme,
+    trailing: F,
+) {
+    let (fill, stroke, text) = alert_strip_colors(severity, theme);
+    egui::Frame::default()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .corner_radius(4.0)
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(PATH_ALERT_LABEL_MAX_W);
+                    ui.add(
+                        egui::Label::new(RichText::new(message).size(11.0).color(text)).wrap(),
+                    );
+                });
+                ui.add_space(12.0);
+                trailing(ui);
+            });
+        });
+}
+
+/// When the working-directory path should surface guidance (missing, not a folder, unreadable).
+fn working_directory_path_alert(path_str: &str) -> Option<(AlertSeverity, String)> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return Some((
+            AlertSeverity::Warning,
+            "No folder path set. Use Browse… or type a directory path.".to_string(),
+        ));
+    }
+    let path = PathBuf::from(trimmed);
+
+    if path.is_dir() {
+        return None;
+    }
+
+    if path.exists() {
+        return Some((
+            AlertSeverity::Error,
+            "This path is not a folder (for example it is a file). Correct the path or choose Browse…."
+                .to_string(),
+        ));
+    }
+
+    // Path does not exist (or is an unreachable/broken symlink).
+    let missing_msg = "This folder does not exist yet. Create folder instead".to_string();
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => Some((
+            AlertSeverity::Error,
+            "The parent folder does not exist. Fix the path first.".to_string(),
+        )),
+        _ => Some((AlertSeverity::Warning, missing_msg)),
+    }
+}
+
+/// Same path string the header bar uses for alerts (includes in-progress edit text).
+fn effective_workspace_working_dir_path(app: &TermiteUi) -> String {
+    let selected_idx = app
+        .selected_workspace
+        .min(app.workspaces.len().saturating_sub(1));
+    let displayed_dir = app
+        .workspaces
+        .get(selected_idx)
+        .map(|w| w.working_dir.clone())
+        .unwrap_or_else(default_working_dir);
+    if app.editing_working_dir {
+        let t = app.working_dir_input.trim();
+        if t.is_empty() {
+            displayed_dir
+        } else {
+            t.to_string()
+        }
+    } else {
+        displayed_dir
+    }
+}
+
+/// Whether the effective workspace path is an existing directory (PTY cwd is valid).
+fn workspace_dir_exists_for_terminals(path_str: &str) -> bool {
+    let t = path_str.trim();
+    !t.is_empty() && Path::new(t).is_dir()
+}
+
+/// `create_dir_all` is expected to succeed (parent exists and is a directory).
+fn can_create_missing_workspace_dir(path: &Path) -> bool {
+    if path.as_os_str().is_empty() || path.exists() {
+        return false;
+    }
+    match path.parent() {
+        None => false,
+        Some(p) if p.as_os_str().is_empty() => false,
+        Some(p) => p.is_dir(),
+    }
+}
+
+/// Rough width for centering slack (`horizontal_centered` does not shrink-wrap this strip).
+fn estimate_path_alert_strip_width(message: &str, with_create_button: bool) -> f32 {
+    const MONO11_EW: f32 = 6.35;
+    const CREATE_BTN_W: f32 = 118.0;
+    const TEXT_BTN_GAP: f32 = 12.0;
+    // Frame inner margin (10+10) + stroke; small cushion for font metrics.
+    const FRAME_PAD_X: f32 = 28.0;
+    let n = message.chars().count() as f32;
+    let text_w = (n * MONO11_EW).min(PATH_ALERT_LABEL_MAX_W).max(72.0);
+    let body = if with_create_button {
+        text_w + TEXT_BTN_GAP + CREATE_BTN_W
+    } else {
+        text_w
+    };
+    (body + FRAME_PAD_X).min(560.0)
+}
+
 fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
     let full_width = ui.available_width();
     let bar_stroke = if app.ui_theme == UiTheme::Light {
@@ -4519,74 +4739,197 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                 .get(selected_idx)
                 .map(|w| w.working_dir.clone())
                 .unwrap_or_else(default_working_dir);
-            ui.horizontal(|ui| {
-                let picker_btn =
-                    egui::Button::new(RichText::new("◻").size(10.0).color(p.path_picker_icon))
-                        .frame(false);
-                if ui
-                    .add(picker_btn)
-                    .on_hover_text("Choose working directory")
-                    .clicked()
-                {
-                    let mut dialog = FileDialog::new();
-                    if PathBuf::from(&displayed_dir).is_dir() {
-                        dialog = dialog.set_directory(&displayed_dir);
-                    }
-                    if let Some(folder) = dialog.pick_folder() {
-                        if let Some(path) = folder.to_str() {
-                            if let Some(w) = app.workspaces.get_mut(selected_idx) {
-                                w.working_dir = path.to_string();
-                                save_workspace_state(app);
-                            }
-                            app.editing_working_dir = false;
-                            app.working_dir_input.clear();
-                        }
-                    }
-                }
-                ui.add_space(2.0);
-                if app.editing_working_dir {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut app.working_dir_input)
-                            .desired_width((full_width - 110.0).max(220.0))
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    response.request_focus();
-                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    if esc_pressed {
-                        app.editing_working_dir = false;
-                        app.working_dir_input.clear();
-                    } else if ui.small_button("Apply").clicked() || enter_pressed {
-                        let candidate = app.working_dir_input.trim();
-                        if !candidate.is_empty() && PathBuf::from(candidate).is_dir() {
-                            if let Some(w) = app.workspaces.get_mut(selected_idx) {
-                                w.working_dir = candidate.to_string();
-                                save_workspace_state(app);
-                            }
-                            app.editing_working_dir = false;
-                            app.working_dir_input.clear();
-                        }
-                    }
+            let path_for_alert: String = if app.editing_working_dir {
+                let t = app.working_dir_input.trim();
+                if t.is_empty() {
+                    displayed_dir.clone()
                 } else {
-                    let path_btn = egui::Button::new(
-                        RichText::new(displayed_dir)
-                            .size(12.0)
+                    t.to_string()
+                }
+            } else {
+                displayed_dir.clone()
+            };
+            let path_alert = working_directory_path_alert(&path_for_alert);
+            let path_pb = PathBuf::from(&path_for_alert);
+
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let row_h = ui.spacing().interact_size.y.max(20.0);
+                    let path_field_stroke = Stroke::new(1.0, p.path_bar_border);
+                    let path_field_fill = p.term_bg;
+                    let picker_btn = egui::Button::new(
+                        RichText::new("Browse…")
+                            .size(11.0)
                             .family(FontFamily::Monospace)
                             .color(p.muted),
                     )
-                    .frame(false);
+                    .frame(true)
+                    .fill(path_field_fill)
+                    .stroke(path_field_stroke)
+                    .corner_radius(3.0)
+                    .min_size(egui::vec2(72.0, row_h));
                     if ui
-                        .add(path_btn)
-                        .on_hover_text("Click to edit working directory")
+                        .add(picker_btn)
+                        .on_hover_text("Open the folder picker")
                         .clicked()
                     {
-                        app.editing_working_dir = true;
-                        app.working_dir_input = app
-                            .workspaces
-                            .get(selected_idx)
-                            .map(|w| w.working_dir.clone())
-                            .unwrap_or_else(default_working_dir);
+                        let mut dialog = FileDialog::new();
+                        if PathBuf::from(&displayed_dir).is_dir() {
+                            dialog = dialog.set_directory(&displayed_dir);
+                        }
+                        if let Some(folder) = dialog.pick_folder() {
+                            if let Some(path) = folder.to_str() {
+                                if let Some(w) = app.workspaces.get_mut(selected_idx) {
+                                    w.working_dir = path.to_string();
+                                    save_workspace_state(app);
+                                }
+                                app.editing_working_dir = false;
+                                app.working_dir_editor_focus_next_frame = false;
+                                app.working_dir_input.clear();
+                            }
+                        }
                     }
+                    ui.add_space(6.0);
+                    let path_slot_width = ui.available_width();
+                    if app.editing_working_dir {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut app.working_dir_input)
+                                .frame(true)
+                                .background_color(path_field_fill)
+                                .horizontal_align(egui::Align::Min)
+                                .vertical_align(egui::Align::Center)
+                                .desired_width(path_slot_width.max(120.0))
+                                .min_size(egui::vec2(path_slot_width.max(120.0), row_h))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if app.working_dir_editor_focus_next_frame {
+                            response.request_focus();
+                            app.working_dir_editor_focus_next_frame = false;
+                        }
+                        if response.changed() {
+                            let candidate = app.working_dir_input.trim();
+                            if working_dir_path_ok_to_store(Path::new(candidate)) {
+                                if let Some(w) = app.workspaces.get_mut(selected_idx) {
+                                    if w.working_dir.as_str() != candidate {
+                                        w.working_dir = candidate.to_string();
+                                        save_workspace_state(app);
+                                    }
+                                }
+                            }
+                        }
+                        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if esc_pressed || enter_pressed || response.clicked_elsewhere() {
+                            app.editing_working_dir = false;
+                            app.working_dir_editor_focus_next_frame = false;
+                            app.working_dir_input.clear();
+                        }
+                    } else {
+                        let slot_w = path_slot_width.max(0.0);
+                        // `Button` always paints its text centered in the atom rect; use a framed label
+                        // so the path stays left-aligned when not editing (same as the TextEdit).
+                        let path_response = ui
+                            .allocate_ui(egui::vec2(slot_w, row_h), |ui| {
+                                egui::Frame::default()
+                                    .fill(path_field_fill)
+                                    .stroke(path_field_stroke)
+                                    .corner_radius(3.0)
+                                    .inner_margin(Margin::symmetric(8, 5))
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(ui.available_size());
+                                        let grab_rect = ui.max_rect();
+                                        // `Label` only hit-tests the text galley; add a full-rect click target
+                                        // so the empty area to the right of the path is also clickable.
+                                        let full_click = ui.interact(
+                                            grab_rect,
+                                            ui.id().with("cwd_path_slot_click"),
+                                            Sense::click(),
+                                        );
+                                        let label_resp = ui
+                                            .new_child(
+                                                egui::UiBuilder::new()
+                                                    .max_rect(grab_rect)
+                                                    .layout(egui::Layout::top_down(egui::Align::Min))
+                                                    .id_salt("cwd_path_label"),
+                                            )
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(&displayed_dir)
+                                                        .size(12.0)
+                                                        .family(FontFamily::Monospace)
+                                                        .color(p.muted),
+                                                )
+                                                .halign(egui::Align::Min)
+                                                .truncate(),
+                                            );
+                                        full_click.union(label_resp)
+                                    })
+                                    .inner
+                            })
+                            .inner;
+                        if path_response
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(
+                                "Click to edit. Saves unless the path is an existing file; missing folders are created when you open a terminal.",
+                            )
+                            .clicked()
+                        {
+                            app.editing_working_dir = true;
+                            app.working_dir_editor_focus_next_frame = true;
+                            app.working_dir_input = app
+                                .workspaces
+                                .get(selected_idx)
+                                .map(|w| w.working_dir.clone())
+                                .unwrap_or_else(default_working_dir);
+                        }
+                    }
+                });
+
+                if let Some((severity, message)) = path_alert {
+                    ui.add_space(6.0);
+                    let full_w = ui.available_width();
+                    let show_create = severity == AlertSeverity::Warning
+                        && can_create_missing_workspace_dir(&path_pb);
+                    let est_w = estimate_path_alert_strip_width(&message, show_create).min(full_w);
+                    let row_h = ui.spacing().interact_size.y.max(20.0);
+                    ui.horizontal(|ui| {
+                        // Three siblings (slack, strip, slack): default item_spacing would add two
+                        // horizontal gaps and make the row wider than `full_w`, so the placer squeezes
+                        // the trailing slack and the strip sits off-center to the left.
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let slack = ((full_w - est_w) * 0.5).max(0.0);
+                        ui.allocate_space(egui::vec2(slack, row_h));
+                        if show_create {
+                            alert_message_strip_with_trailing_action(
+                                ui,
+                                severity,
+                                &message,
+                                app.ui_theme,
+                                |ui| {
+                                    if ui
+                                        .small_button("Create folder")
+                                        .on_hover_text(
+                                            "Create this folder and all missing parents",
+                                        )
+                                        .clicked()
+                                    {
+                                        let _ = fs::create_dir_all(&path_pb);
+                                        if path_pb.is_dir() {
+                                            if let Some(w) = app.workspaces.get_mut(selected_idx)
+                                            {
+                                                w.working_dir =
+                                                    path_pb.to_string_lossy().into_owned();
+                                                save_workspace_state(app);
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        } else {
+                            alert_message_strip(ui, severity, &message, app.ui_theme);
+                        }
+                        ui.allocate_space(egui::vec2(slack, row_h));
+                    });
                 }
             });
         });
@@ -5591,6 +5934,36 @@ fn default_working_dir() -> String {
         .ok()
         .and_then(|p| p.to_str().map(ToString::to_string))
         .unwrap_or_else(|| ".".to_string())
+}
+
+/// Reject only paths that already exist and are not directories (e.g. files).
+/// Missing paths are allowed so the user can type a new folder; see [`ensure_working_dir_for_spawn`].
+fn working_dir_path_ok_to_store(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    match fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(_) => true,
+    }
+}
+
+/// Returns a directory suitable for `spawn_pty` cwd: creates missing directories when possible.
+fn ensure_working_dir_for_spawn(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_working_dir();
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_dir() {
+        return path.to_string_lossy().into_owned();
+    }
+    let _ = fs::create_dir_all(&path);
+    if path.is_dir() {
+        path.to_string_lossy().into_owned()
+    } else {
+        default_working_dir()
+    }
 }
 
 fn parse_hex_color(input: &str) -> Option<Color32> {
