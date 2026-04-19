@@ -16,7 +16,9 @@ const FRAME_OUTPUT: u8 = 3;
 const FRAME_INPUT: u8 = 4;
 const FRAME_RESIZE: u8 = 5;
 
-type AttachResult = Result<Vec<Vec<u8>>, String>;
+// AttachResult carries the history snapshot and the attach generation (used to
+// ignore stale Detach commands from the previous connection on fast restarts).
+type AttachResult = Result<(Vec<Vec<u8>>, u64), String>;
 
 enum DaemonCmd {
     Attach {
@@ -29,6 +31,9 @@ enum DaemonCmd {
     },
     Detach {
         session_key: String,
+        /// The generation this Detach belongs to. Stale Detaches (gen < current)
+        /// are silently ignored so a quick restart can't cancel a fresh attach.
+        gen: u64,
     },
     Input {
         session_key: String,
@@ -47,6 +52,8 @@ struct Session {
     history: VecDeque<Vec<u8>>,
     history_bytes: usize,
     attached_client: Option<Sender<Vec<u8>>>,
+    /// Incremented on every attach so stale Detach commands can be ignored.
+    attach_gen: u64,
 }
 
 fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
@@ -112,12 +119,15 @@ fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16, Opt
     if payload.len() < base_len {
         anyhow::bail!("attach payload too small for key + rows/cols");
     }
-    let key = String::from_utf8(payload[2..2 + key_len].to_vec()).map_err(|e| {
-        anyhow::anyhow!("attach key utf8 decode error: {e}")
-    })?;
+    let key = String::from_utf8(payload[2..2 + key_len].to_vec())
+        .map_err(|e| anyhow::anyhow!("attach key utf8 decode error: {e}"))?;
     let rows_off = 2 + key_len;
     let rows = u16::from_le_bytes(payload[rows_off..rows_off + 2].try_into().expect("rows"));
-    let cols = u16::from_le_bytes(payload[rows_off + 2..rows_off + 4].try_into().expect("cols"));
+    let cols = u16::from_le_bytes(
+        payload[rows_off + 2..rows_off + 4]
+            .try_into()
+            .expect("cols"),
+    );
 
     if payload.len() == base_len {
         return Ok((key, rows, cols, None));
@@ -127,7 +137,8 @@ fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16, Opt
     if payload.len() < cwd_hdr_off + 2 {
         anyhow::bail!("attach payload truncated (cwd length)");
     }
-    let cwd_len = u16::from_le_bytes(payload[cwd_hdr_off..cwd_hdr_off + 2].try_into().unwrap()) as usize;
+    let cwd_len =
+        u16::from_le_bytes(payload[cwd_hdr_off..cwd_hdr_off + 2].try_into().unwrap()) as usize;
     let expected = cwd_hdr_off + 2 + cwd_len;
     if payload.len() != expected {
         anyhow::bail!("attach payload length mismatch (cwd)");
@@ -165,7 +176,9 @@ pub fn attach_request_payload(
         }
     };
 
-    let mut payload = Vec::with_capacity(2 + key_bytes.len() + 2 + 2 + 2 + cwd_bytes.map(|b| b.len()).unwrap_or(0));
+    let mut payload = Vec::with_capacity(
+        2 + key_bytes.len() + 2 + 2 + 2 + cwd_bytes.map(|b| b.len()).unwrap_or(0),
+    );
     payload.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(key_bytes);
     payload.extend_from_slice(&rows.to_le_bytes());
@@ -260,10 +273,11 @@ pub fn run_daemon() -> anyhow::Result<()> {
                                         history: VecDeque::new(),
                                         history_bytes: 0,
                                         attached_client: Some(client_out_tx),
+                                        attach_gen: 1,
                                     });
 
                                     let snapshot = Vec::<Vec<u8>>::new();
-                                    let _ = resp_tx.send(Ok(snapshot));
+                                    let _ = resp_tx.send(Ok((snapshot, 1)));
                                 }
                                 Err(e) => {
                                     let _ = resp_tx.send(Err(format!("spawn_pty failed: {e}")));
@@ -272,20 +286,23 @@ pub fn run_daemon() -> anyhow::Result<()> {
                         }
                         std::collections::hash_map::Entry::Occupied(mut o) => {
                             let session = o.get_mut();
-                            if session.attached_client.is_some() {
-                                let _ = resp_tx.send(Err("session already attached".into()));
-                            } else {
-                                session.attached_client = Some(client_out_tx);
-                                let _ = session.pty.resize(rows, cols);
-                                let snapshot = session.history.iter().cloned().collect();
-                                let _ = resp_tx.send(Ok(snapshot));
-                            }
+                            // Force-replace any existing client (handles the race where a quick
+                            // app restart connects before the old Detach is processed).
+                            session.attach_gen += 1;
+                            let gen = session.attach_gen;
+                            session.attached_client = Some(client_out_tx);
+                            let _ = session.pty.resize(rows, cols);
+                            let snapshot = session.history.iter().cloned().collect();
+                            let _ = resp_tx.send(Ok((snapshot, gen)));
                         }
                     }
                 }
-                DaemonCmd::Detach { session_key } => {
+                DaemonCmd::Detach { session_key, gen } => {
                     if let Some(session) = sessions.get_mut(&session_key) {
-                        session.attached_client = None;
+                        // Only clear if this Detach belongs to the current attach generation.
+                        if session.attach_gen == gen {
+                            session.attached_client = None;
+                        }
                     }
                 }
                 DaemonCmd::Input { session_key, data } => {
@@ -342,10 +359,11 @@ pub fn run_daemon() -> anyhow::Result<()> {
                                         history: VecDeque::new(),
                                         history_bytes: 0,
                                         attached_client: Some(client_out_tx),
+                                        attach_gen: 1,
                                     });
 
                                     let snapshot = Vec::<Vec<u8>>::new();
-                                    let _ = resp_tx.send(Ok(snapshot));
+                                    let _ = resp_tx.send(Ok((snapshot, 1)));
                                 }
                                 Err(e) => {
                                     let _ = resp_tx.send(Err(format!("spawn_pty failed: {e}")));
@@ -354,20 +372,23 @@ pub fn run_daemon() -> anyhow::Result<()> {
                         }
                         std::collections::hash_map::Entry::Occupied(mut o) => {
                             let session = o.get_mut();
-                            if session.attached_client.is_some() {
-                                let _ = resp_tx.send(Err("session already attached".into()));
-                            } else {
-                                session.attached_client = Some(client_out_tx);
-                                let _ = session.pty.resize(rows, cols);
-                                let snapshot = session.history.iter().cloned().collect();
-                                let _ = resp_tx.send(Ok(snapshot));
-                            }
+                            // Force-replace any existing client (handles the race where a quick
+                            // app restart connects before the old Detach is processed).
+                            session.attach_gen += 1;
+                            let gen = session.attach_gen;
+                            session.attached_client = Some(client_out_tx);
+                            let _ = session.pty.resize(rows, cols);
+                            let snapshot = session.history.iter().cloned().collect();
+                            let _ = resp_tx.send(Ok((snapshot, gen)));
                         }
                     }
                 }
-                DaemonCmd::Detach { session_key } => {
+                DaemonCmd::Detach { session_key, gen } => {
                     if let Some(session) = sessions.get_mut(&session_key) {
-                        session.attached_client = None;
+                        // Only clear if this Detach belongs to the current attach generation.
+                        if session.attach_gen == gen {
+                            session.attached_client = None;
+                        }
                     }
                 }
                 DaemonCmd::Input { session_key, data } => {
@@ -410,10 +431,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_client(
-    mut stream: TcpStream,
-    cmd_tx: Sender<DaemonCmd>,
-) -> anyhow::Result<()> {
+fn handle_client(mut stream: TcpStream, cmd_tx: Sender<DaemonCmd>) -> anyhow::Result<()> {
     let (frame_type, payload) = read_frame(&mut stream)?;
     if frame_type != FRAME_ATTACH {
         anyhow::bail!("expected attach frame, got {frame_type}");
@@ -436,8 +454,8 @@ fn handle_client(
         })
         .map_err(|e| anyhow::anyhow!("failed to send attach cmd: {e}"))?;
 
-    let attach_history = match resp_rx.recv()? {
-        Ok(h) => h,
+    let (attach_history, attach_gen) = match resp_rx.recv()? {
+        Ok((h, gen)) => (h, gen),
         Err(msg) => {
             let mut s = stream.try_clone()?;
             write_frame(&mut s, FRAME_ATTACH_ERROR, msg.as_bytes())?;
@@ -451,36 +469,35 @@ fn handle_client(
 
     // Spawn command reader thread.
     let cmd_tx_for_cmd = cmd_tx.clone();
-    thread::spawn(move || {
-        loop {
-            let frame = read_frame(&mut cmd_stream);
-            let Ok((ft, payload)) = frame else {
-                let _ = cmd_tx_for_cmd.send(DaemonCmd::Detach {
-                    session_key: session_key_for_cmd.clone(),
-                });
-                break;
-            };
+    thread::spawn(move || loop {
+        let frame = read_frame(&mut cmd_stream);
+        let Ok((ft, payload)) = frame else {
+            let _ = cmd_tx_for_cmd.send(DaemonCmd::Detach {
+                session_key: session_key_for_cmd.clone(),
+                gen: attach_gen,
+            });
+            break;
+        };
 
-            match ft {
-                FRAME_INPUT => {
-                    let _ = cmd_tx_for_cmd.send(DaemonCmd::Input {
+        match ft {
+            FRAME_INPUT => {
+                let _ = cmd_tx_for_cmd.send(DaemonCmd::Input {
+                    session_key: session_key_for_cmd.clone(),
+                    data: payload,
+                });
+            }
+            FRAME_RESIZE => {
+                if payload.len() == 4 {
+                    let rows = u16::from_le_bytes(payload[0..2].try_into().unwrap());
+                    let cols = u16::from_le_bytes(payload[2..4].try_into().unwrap());
+                    let _ = cmd_tx_for_cmd.send(DaemonCmd::Resize {
                         session_key: session_key_for_cmd.clone(),
-                        data: payload,
+                        rows,
+                        cols,
                     });
                 }
-                FRAME_RESIZE => {
-                    if payload.len() == 4 {
-                        let rows = u16::from_le_bytes(payload[0..2].try_into().unwrap());
-                        let cols = u16::from_le_bytes(payload[2..4].try_into().unwrap());
-                        let _ = cmd_tx_for_cmd.send(DaemonCmd::Resize {
-                            session_key: session_key_for_cmd.clone(),
-                            rows,
-                            cols,
-                        });
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     });
 
@@ -492,14 +509,11 @@ fn handle_client(
     // Then forward live output until disconnected.
     while let Ok(chunk) = out_rx.recv() {
         if let Err(e) = write_frame(&mut out_stream, FRAME_OUTPUT, &chunk) {
-            let _ = cmd_tx.send(DaemonCmd::Detach {
-                session_key,
-            });
+            let _ = cmd_tx.send(DaemonCmd::Detach { session_key, gen: attach_gen });
             return Err(e.into());
         }
     }
 
-    let _ = cmd_tx.send(DaemonCmd::Detach { session_key });
+    let _ = cmd_tx.send(DaemonCmd::Detach { session_key, gen: attach_gen });
     Ok(())
 }
-

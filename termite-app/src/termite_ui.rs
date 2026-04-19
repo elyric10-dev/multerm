@@ -16,8 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{
-    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
-    get_current_pid,
+    get_current_pid, CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, System,
 };
 use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
 use termite_render::color::ansi_indexed_to_rgb;
@@ -25,8 +25,8 @@ use termite_render::SelectionRange;
 use termite_vt::cell::{Cell, CellAttrs, Color, WideKind};
 use termite_vt::TerminalGrid;
 
-mod daemon;
 mod clipboard;
+mod daemon;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -59,7 +59,10 @@ struct LineState {
 
 impl LineState {
     fn new() -> Self {
-        Self { text: String::new(), cursor: 0 }
+        Self {
+            text: String::new(),
+            cursor: 0,
+        }
     }
 }
 
@@ -79,11 +82,16 @@ struct LineEditor {
 
 impl LineEditor {
     fn new() -> Self {
-        Self { current: LineState::new(), undo_stack: Vec::new(), redo_stack: Vec::new() }
+        Self {
+            current: LineState::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
     }
 
     fn cursor_byte_pos(&self) -> usize {
-        self.current.text
+        self.current
+            .text
             .char_indices()
             .nth(self.current.cursor)
             .map(|(b, _)| b)
@@ -91,8 +99,14 @@ impl LineEditor {
     }
 
     fn char_before_cursor(&self) -> Option<char> {
-        if self.current.cursor == 0 { return None; }
-        self.current.text.char_indices().nth(self.current.cursor - 1).map(|(_, c)| c)
+        if self.current.cursor == 0 {
+            return None;
+        }
+        self.current
+            .text
+            .char_indices()
+            .nth(self.current.cursor - 1)
+            .map(|(_, c)| c)
     }
 
     fn push_snapshot(&mut self) {
@@ -106,7 +120,8 @@ impl LineEditor {
     fn push_text(&mut self, text: &str) {
         for ch in text.chars() {
             let is_word = ch.is_alphanumeric() || ch == '_';
-            let last_is_word = self.char_before_cursor()
+            let last_is_word = self
+                .char_before_cursor()
                 .map(|c| c.is_alphanumeric() || c == '_')
                 .unwrap_or(false);
             if self.current.text.is_empty() || is_word != last_is_word {
@@ -119,9 +134,13 @@ impl LineEditor {
     }
 
     fn push_backspace(&mut self) {
-        if self.current.cursor == 0 { return; }
+        if self.current.cursor == 0 {
+            return;
+        }
         self.push_snapshot();
-        let (byte_start, _) = self.current.text
+        let (byte_start, _) = self
+            .current
+            .text
             .char_indices()
             .nth(self.current.cursor - 1)
             .expect("cursor > 0 guarantees char exists");
@@ -135,10 +154,14 @@ impl LineEditor {
 
     fn move_right(&mut self) {
         let max = self.current.text.chars().count();
-        if self.current.cursor < max { self.current.cursor += 1; }
+        if self.current.cursor < max {
+            self.current.cursor += 1;
+        }
     }
 
-    fn move_to_start(&mut self) { self.current.cursor = 0; }
+    fn move_to_start(&mut self) {
+        self.current.cursor = 0;
+    }
 
     fn move_to_end(&mut self) {
         self.current.cursor = self.current.text.chars().count();
@@ -230,7 +253,10 @@ impl PanelLayout {
         }
         let rows = self.rows.max(1) as f32;
         let h = viewport_h / rows;
-        Some(h.max(TERMINAL_MIN_HEIGHT).min(viewport_h.max(TERMINAL_MIN_HEIGHT)))
+        Some(
+            h.max(TERMINAL_MIN_HEIGHT)
+                .min(viewport_h.max(TERMINAL_MIN_HEIGHT)),
+        )
     }
 }
 
@@ -553,6 +579,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 860.0])
@@ -653,6 +683,20 @@ struct TerminalPaneState {
     y: Option<f32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkspaceTerminalCwdBlock {
+    Empty,
+    NotADir,
+    Missing,
+}
+
+#[derive(Clone)]
+struct WorkspaceSpawnNotice {
+    message: String,
+    /// When `Some`, show **Create folder** for `create_dir_all` on this path (parent must exist).
+    create_target: Option<PathBuf>,
+}
+
 struct TermiteUi {
     ui_theme: UiTheme,
     ui_style: UiStyle,
@@ -683,6 +727,9 @@ struct TermiteUi {
     pending_context_terminal: Option<usize>,
     pending_spawn_flash_pos: Option<Pos2>,
     pending_spawn_flash_until: Option<Instant>,
+    /// Shown when a new terminal cannot spawn (missing / invalid workspace folder).
+    workspace_terminal_spawn_notice: Option<WorkspaceSpawnNotice>,
+    workspace_terminal_spawn_notice_until: Option<Instant>,
     /// Live CPU / RAM / load readings (`sysinfo`).
     system: System,
     system_last_sample: Instant,
@@ -694,6 +741,8 @@ struct TermiteUi {
     equal_size_picker_selection: Option<u64>,
     equal_size_template_blink_terminal_id: Option<u64>,
     equal_size_template_blink_started_at: Option<Instant>,
+    /// Flush workspace JSON periodically so abrupt quits still persist open terminals.
+    workspace_autosave_deadline: Instant,
 }
 
 #[derive(Default)]
@@ -821,6 +870,8 @@ impl Default for TermiteUi {
                 pending_context_terminal: None,
                 pending_spawn_flash_pos: None,
                 pending_spawn_flash_until: None,
+                workspace_terminal_spawn_notice: None,
+                workspace_terminal_spawn_notice_until: None,
                 system: system_status_probe_new(),
                 system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
                 usage_panel_open_order: if state.usage_panel_open_order.is_empty() {
@@ -833,6 +884,7 @@ impl Default for TermiteUi {
                 equal_size_picker_selection: None,
                 equal_size_template_blink_terminal_id: None,
                 equal_size_template_blink_started_at: None,
+                workspace_autosave_deadline: Instant::now(),
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -871,7 +923,8 @@ impl Default for TermiteUi {
                                 None
                             }
                         });
-                        runtime.equal_size_source_terminal_id = saved_tab.equal_size_source_terminal_id;
+                        runtime.equal_size_source_terminal_id =
+                            saved_tab.equal_size_source_terminal_id;
                     }
                 }
             }
@@ -953,6 +1006,8 @@ impl Default for TermiteUi {
             pending_context_terminal: None,
             pending_spawn_flash_pos: None,
             pending_spawn_flash_until: None,
+            workspace_terminal_spawn_notice: None,
+            workspace_terminal_spawn_notice_until: None,
             system: system_status_probe_new(),
             system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
             usage_panel_open_order: Vec::new(),
@@ -961,6 +1016,7 @@ impl Default for TermiteUi {
             equal_size_picker_selection: None,
             equal_size_template_blink_terminal_id: None,
             equal_size_template_blink_started_at: None,
+            workspace_autosave_deadline: Instant::now(),
         }
     }
 }
@@ -975,6 +1031,96 @@ fn system_status_probe_new() -> System {
 
 fn format_gib(n: u64) -> String {
     format!("{:.1} GiB", n as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn paint_workspace_terminal_spawn_notice_bar(ui: &mut egui::Ui, app: &mut TermiteUi) {
+    let (message, create_target) = match &app.workspace_terminal_spawn_notice {
+        Some(n) => (n.message.clone(), n.create_target.clone()),
+        None => return,
+    };
+    let (fill, stroke, text) = match app.ui_theme {
+        UiTheme::Dark => (
+            Color32::from_rgb(52, 28, 28),
+            Color32::from_rgb(180, 90, 90),
+            Color32::from_rgb(255, 200, 200),
+        ),
+        UiTheme::Light => (
+            Color32::from_rgb(255, 235, 235),
+            Color32::from_rgb(200, 100, 100),
+            Color32::from_rgb(90, 35, 35),
+        ),
+    };
+    let dismiss_notice = egui::Frame::default()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .corner_radius(4.0)
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            let mut dismiss = false;
+            ui.vertical(|ui| {
+                ui.add(egui::Label::new(RichText::new(&message).size(12.0).color(text)).wrap());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if let Some(ref path) = create_target {
+                        if ui
+                            .button(RichText::new("Create folder").size(12.0).color(text))
+                            .on_hover_text("Create this folder and any missing parents")
+                            .clicked()
+                        {
+                            let _ = fs::create_dir_all(path);
+                            if path.is_dir() {
+                                let idx = app
+                                    .selected_workspace
+                                    .min(app.workspaces.len().saturating_sub(1));
+                                if let Some(w) = app.workspaces.get_mut(idx) {
+                                    w.working_dir = path.to_string_lossy().into_owned();
+                                    save_workspace_state(app);
+                                }
+                                dismiss = true;
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if ui
+                        .button(RichText::new("Choose folder…").size(12.0).color(text))
+                        .on_hover_text("Open the folder picker")
+                        .clicked()
+                    {
+                        let idx = app
+                            .selected_workspace
+                            .min(app.workspaces.len().saturating_sub(1));
+                        let displayed_dir = app
+                            .workspaces
+                            .get(idx)
+                            .map(|w| w.working_dir.clone())
+                            .unwrap_or_else(default_working_dir);
+                        let mut dialog = FileDialog::new();
+                        if PathBuf::from(&displayed_dir).is_dir() {
+                            dialog = dialog.set_directory(&displayed_dir);
+                        }
+                        if let Some(folder) = dialog.pick_folder() {
+                            if let Some(path_s) = folder.to_str() {
+                                if let Some(w) = app.workspaces.get_mut(idx) {
+                                    w.working_dir = path_s.to_string();
+                                    save_workspace_state(app);
+                                }
+                                app.editing_working_dir = false;
+                                app.working_dir_editor_focus_next_frame = false;
+                                app.working_dir_input.clear();
+                                dismiss = true;
+                            }
+                        }
+                    }
+                });
+            });
+            dismiss
+        })
+        .inner;
+    if dismiss_notice {
+        app.workspace_terminal_spawn_notice = None;
+        app.workspace_terminal_spawn_notice_until = None;
+    }
+    ui.add_space(6.0);
 }
 
 fn usage_meter_row(
@@ -1016,46 +1162,52 @@ fn new_terminal_context_menu(
     if ui.button("New Terminal").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        app.add_terminal(spawn_pos, anchor_terminal);
+        let _ = app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal);
         app.pending_context_terminal = None;
         ui.close();
     }
     if ui.button("New Claude Code").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        app.add_terminal(spawn_pos, anchor_terminal);
-        app.launch_cli_tool(None, "claude");
+        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
+            app.launch_cli_tool(ui.ctx(), None, "claude");
+        }
         app.pending_context_terminal = None;
         ui.close();
     }
     if ui.button("New Codex").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        app.add_terminal(spawn_pos, anchor_terminal);
-        app.launch_cli_tool(None, "codex");
+        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
+            app.launch_cli_tool(ui.ctx(), None, "codex");
+        }
         app.pending_context_terminal = None;
         ui.close();
     }
     if is_cli_command_available("gemini") && ui.button("New Gemini").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        app.add_terminal(spawn_pos, anchor_terminal);
-        app.launch_cli_tool(None, "gemini");
+        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
+            app.launch_cli_tool(ui.ctx(), None, "gemini");
+        }
         app.pending_context_terminal = None;
         ui.close();
     }
     if is_cli_command_available("agent") && ui.button("New Cursor").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        app.add_terminal(spawn_pos, anchor_terminal);
-        app.launch_cli_tool(None, "agent");
+        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
+            app.launch_cli_tool(ui.ctx(), None, "agent");
+        }
         app.pending_context_terminal = None;
         ui.close();
     }
     ui.separator();
     if app.active_workspace_tab_mut().is_some() {
         let mut panel_layout = app.active_panel_layout();
-        let ws_idx = app.selected_workspace.min(app.workspaces.len().saturating_sub(1));
+        let ws_idx = app
+            .selected_workspace
+            .min(app.workspaces.len().saturating_sub(1));
         let mut sync_terminals_to_columns = app.workspaces[ws_idx].sync_terminals_to_columns;
         let mut uniform_equal_terminals = app.workspaces[ws_idx].uniform_equal_terminals;
         let mut open_equal_picker = false;
@@ -1131,6 +1283,7 @@ impl eframe::App for TermiteUi {
         self.sync_all_workspace_runtime_buffers();
         ctx.request_repaint_after(Duration::from_millis(16));
         self.drain_terminals();
+        self.tick_workspace_terminal_spawn_notice();
         self.handle_keyboard_input(ctx);
         self.color_picker_rendered_this_frame = false;
         self.refresh_system_status_if_due();
@@ -1166,15 +1319,12 @@ impl eframe::App for TermiteUi {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let term_resp = ui.add(
-                            egui::Label::new(
-                                RichText::new("Termite")
-                                    .size(11.0)
-                                    .color(p.text),
+                        let term_resp = ui
+                            .add(
+                                egui::Label::new(RichText::new("Termite").size(11.0).color(p.text))
+                                    .sense(Sense::click()),
                             )
-                            .sense(Sense::click()),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand);
+                            .on_hover_cursor(CursorIcon::PointingHand);
                         if term_resp.clicked() {
                             self.toggle_usage_panel(true);
                         }
@@ -1182,27 +1332,20 @@ impl eframe::App for TermiteUi {
                         let sep_resp = ui.label(RichText::new("|").size(11.0).color(p.muted));
                         let mut selector_resp = term_resp.union(sep_resp);
 
-                        let sys_resp = ui.add(
-                            egui::Label::new(
-                                RichText::new("System")
-                                    .size(11.0)
-                                    .color(p.text),
+                        let sys_resp = ui
+                            .add(
+                                egui::Label::new(RichText::new("System").size(11.0).color(p.text))
+                                    .sense(Sense::click()),
                             )
-                            .sense(Sense::click()),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand);
+                            .on_hover_cursor(CursorIcon::PointingHand);
                         if sys_resp.clicked() {
                             self.toggle_usage_panel(false);
                         }
                         selector_resp = selector_resp.union(sys_resp);
 
                         ui.add_space(6.0);
-                        let usage_resp = ui.label(
-                            RichText::new("Usage:")
-                                .size(11.0)
-                                .strong()
-                                .color(p.muted),
-                        );
+                        let usage_resp =
+                            ui.label(RichText::new("Usage:").size(11.0).strong().color(p.muted));
                         selector_resp = selector_resp.union(usage_resp);
                         let _ = selector_resp;
                     });
@@ -1241,41 +1384,10 @@ impl eframe::App for TermiteUi {
                 .fill(p.bg)
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
+                    paint_workspace_terminal_spawn_notice_bar(ui, self);
                     self.terminal_workspace_viewport = ui.available_size();
                     let area_rect = ui.max_rect();
                     let viewport = Vec2::new(area_rect.width(), area_rect.height());
-
-                    let path_str = effective_workspace_working_dir_path(self);
-                    let cwd_ready_for_terminals = self.workspaces.is_empty()
-                        || workspace_dir_exists_for_terminals(&path_str);
-
-                    if !self.workspaces.is_empty() && !cwd_ready_for_terminals {
-                        let explanation = working_directory_path_alert(&path_str)
-                            .map(|(_, m)| m)
-                            .unwrap_or_else(|| {
-                                "Set a valid workspace folder above to use terminals.".to_string()
-                            });
-                        ui.add_space(viewport.y * 0.18);
-                        ui.vertical_centered(|ui| {
-                            ui.set_max_width((viewport.x - 48.0).max(200.0));
-                            ui.label(
-                                RichText::new(
-                                    "Terminals are disabled until this workspace folder exists and is usable.",
-                                )
-                                .size(14.0)
-                                .strong()
-                                .color(p.text),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(explanation).size(13.0).color(p.muted),
-                            );
-                        });
-                    }
-
-                    if !cwd_ready_for_terminals {
-                        ui.disable();
-                    }
 
                     let Some(runtime_ref) = self.active_workspace_runtime() else {
                         let response = ui.interact(
@@ -1404,488 +1516,162 @@ impl eframe::App for TermiteUi {
                             };
 
                             if runtime.terminals.is_empty() {
-                                if cwd_ready_for_terminals {
-                                    let hint = ui.label(
-                                        RichText::new("Right-click and choose \"New Terminal\".")
-                                            .size(13.0)
-                                            .color(p.muted),
-                                    );
-                                    if hint.secondary_clicked() {
-                                        self.pending_context_terminal = None;
-                                        if let Some(pointer_pos) = hint.interact_pointer_pos() {
-                                            let local_pos = Pos2::new(
-                                                pointer_pos.x - content_origin.x,
-                                                pointer_pos.y - content_origin.y,
-                                            );
-                                            self.pending_terminal_spawn_pos = Some(local_pos);
-                                            self.trigger_spawn_flash(local_pos);
-                                        }
+                                let hint = ui.label(
+                                    RichText::new("Right-click and choose \"New Terminal\".")
+                                        .size(13.0)
+                                        .color(p.muted),
+                                );
+                                if hint.secondary_clicked() {
+                                    self.pending_context_terminal = None;
+                                    if let Some(pointer_pos) = hint.interact_pointer_pos() {
+                                        let local_pos = Pos2::new(
+                                            pointer_pos.x - content_origin.x,
+                                            pointer_pos.y - content_origin.y,
+                                        );
+                                        self.pending_terminal_spawn_pos = Some(local_pos);
+                                        self.trigger_spawn_flash(local_pos);
                                     }
-                                    egui::Popup::context_menu(&hint)
-                                        .close_behavior(
-                                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                                        )
-                                        .show(|ui| new_terminal_context_menu(ui, self, None));
                                 }
+                                egui::Popup::context_menu(&hint)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .show(|ui| new_terminal_context_menu(ui, self, None));
                                 return;
                             }
 
                             let mut close_idx: Option<usize> = None;
                             let mut clicked_on_pane = false;
-                            let content_height = content_h;
-                            // Equal grid must not use full `content_h`: `workspace_content_height` adds
-                            // `2 * GRID_SPACING` below the deepest pane, so dividing that height makes the
-                            // grid grow by that padding every frame (slow "animation"). Use body height only.
-                            let uniform_grid_body_h = (content_h - 2.0 * GRID_SPACING)
-                                .max(viewport.y)
-                                .max(TERMINAL_MIN_HEIGHT);
-                            let (_, _, n_cols) = column_slot_geometry(layout_width, layout);
-                            let slot_w = column_stripe_width(layout_width, layout);
+                            {
+                                let content_height = content_h;
+                                // Equal grid must not use full `content_h`: `workspace_content_height` adds
+                                // `2 * GRID_SPACING` below the deepest pane, so dividing that height makes the
+                                // grid grow by that padding every frame (slow "animation"). Use body height only.
+                                let uniform_grid_body_h = (content_h - 2.0 * GRID_SPACING)
+                                    .max(viewport.y)
+                                    .max(TERMINAL_MIN_HEIGHT);
+                                let (_, _, n_cols) = column_slot_geometry(layout_width, layout);
+                                let slot_w = column_stripe_width(layout_width, layout);
 
-                            let ptr_up = !ui.input(|i| i.pointer.any_down());
-                            if ptr_up {
-                                if uniform_equal_terminals && !equal_size_picker_open {
-                                    let template_size = runtime
-                                        .equal_size_source_terminal_id
-                                        .and_then(|source_id| {
-                                            runtime
-                                                .terminals
-                                                .iter()
-                                                .find(|pane| pane.id == source_id)
-                                                .map(|pane| pane.desired_size)
-                                        });
-                                    reflow_panes_uniform_equal(
-                                        &mut runtime.terminals,
-                                        layout_width,
-                                        uniform_grid_body_h,
-                                        layout,
-                                        template_size,
-                                    );
-                                } else if sync_terminals_to_columns {
-                                    reflow_panes_to_column_starts(
-                                        &mut runtime.terminals,
-                                        layout_width,
-                                        layout,
-                                    );
-                                }
-                            }
-
-                            // Next Y for stacking in each column (must use the pane *above*'s height, not row index).
-                            let mut column_floor_y = vec![0.0_f32; n_cols];
-                            for pane in runtime.terminals.iter() {
-                                if let Some(pos) = pane.position {
-                                    let col = pick_column_at_x(
-                                        pos.x + pane.desired_size.x * 0.5,
-                                        layout_width,
-                                        layout,
-                                    );
-                                    if col < n_cols {
-                                        let bottom = pos.y + pane.desired_size.y + STACK_GAP_Y;
-                                        column_floor_y[col] = column_floor_y[col].max(bottom);
+                                let ptr_up = !ui.input(|i| i.pointer.any_down());
+                                if ptr_up {
+                                    if uniform_equal_terminals && !equal_size_picker_open {
+                                        let template_size = runtime
+                                            .equal_size_source_terminal_id
+                                            .and_then(|source_id| {
+                                                runtime
+                                                    .terminals
+                                                    .iter()
+                                                    .find(|pane| pane.id == source_id)
+                                                    .map(|pane| pane.desired_size)
+                                            });
+                                        reflow_panes_uniform_equal(
+                                            &mut runtime.terminals,
+                                            layout_width,
+                                            uniform_grid_body_h,
+                                            layout,
+                                            template_size,
+                                        );
+                                    } else if sync_terminals_to_columns {
+                                        reflow_panes_to_column_starts(
+                                            &mut runtime.terminals,
+                                            layout_width,
+                                            layout,
+                                        );
                                     }
                                 }
-                            }
 
-                            let total_panes = runtime.terminals.len();
-                            for idx in 0..total_panes {
-                                let (left_group, right_group) = runtime.terminals.split_at_mut(idx);
-                                let Some((pane, right_group)) = right_group.split_first_mut()
-                                else {
-                                    continue;
-                                };
-
-                                if pane.position.is_none() {
-                                    // `slot_w` splits `layout_width` across `n` columns with gutters.
-                                    pane.desired_size.x =
-                                        slot_w.clamp(1.0, layout_width.max(1.0));
-                                    let mut h =
-                                        pane.desired_size.y.max(content_height.max(260.0));
-                                    if let Some(rh) = layout.default_pane_height_hint(viewport.y) {
-                                        h = h.max(rh);
+                                // Next Y for stacking in each column (must use the pane *above*'s height, not row index).
+                                let mut column_floor_y = vec![0.0_f32; n_cols];
+                                for pane in runtime.terminals.iter() {
+                                    if let Some(pos) = pane.position {
+                                        let col = pick_column_at_x(
+                                            pos.x + pane.desired_size.x * 0.5,
+                                            layout_width,
+                                            layout,
+                                        );
+                                        if col < n_cols {
+                                            let bottom = pos.y + pane.desired_size.y + STACK_GAP_Y;
+                                            column_floor_y[col] = column_floor_y[col].max(bottom);
+                                        }
                                     }
-                                    pane.desired_size.y = h;
-                                    let col = idx % n_cols.max(1);
-                                    let x = column_band_left(layout_width, col, layout);
-                                    let y = column_floor_y[col];
-                                    pane.position = Some(Pos2::new(x, y));
-                                    column_floor_y[col] = y + pane.desired_size.y + STACK_GAP_Y;
                                 }
 
-                                let mut pos = pane.position.unwrap_or(Pos2::ZERO);
-                                // With horizontal scrolling the scroll area grows to fit all
-                                // terminals, so we only clamp x to be non-negative. Previously
-                                // clamping to the scroll canvas width caused right-side terminals to
-                                // be pushed left and overlap neighbours when the window shrank.
-                                // `content_height` is captured early in the frame. If a pane is
-                                // spawned lower in this same frame, clamping to that stale value
-                                // pulls it upward and can visually overlap neighbours.
-                                let max_y = (content_height - pane.desired_size.y)
-                                    .max(0.0)
-                                    .max(pos.y);
-                                pos.x = pos.x.max(0.0);
-                                pos.y = pos.y.clamp(0.0, max_y);
-                                pane.position = Some(pos);
-
-                                let pane_rect = egui::Rect::from_min_size(
-                                    content_origin + pos.to_vec2(),
-                                    pane.desired_size,
-                                );
-                                let header_rect = egui::Rect::from_min_size(
-                                    pane_rect.min,
-                                    Vec2::new(pane_rect.width(), 24.0),
-                                );
-                                let drag_response = ui
-                                    .interact(
-                                        header_rect,
-                                        ui.id().with(("pane_drag", pane.id)),
-                                        Sense::click_and_drag(),
-                                    )
-                                    .on_hover_cursor(CursorIcon::Grab);
-                                if drag_response.dragged() {
-                                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                                }
-                                if drag_response.dragged() {
-                                    let delta = ui.input(|i| i.pointer.delta());
-                                    pos.x = (pos.x + delta.x).max(0.0);
-                                    pos.y = (pos.y + delta.y).clamp(0.0, max_y);
-
-                                    // Snap dragged pane edges to other terminals (same thresholds as resize).
-                                    let w = pane.desired_size.x;
-                                    let h = pane.desired_size.y;
-                                    let pane_y0 = pos.y;
-                                    let pane_y1 = pos.y + h;
-                                    let pane_x0 = pos.x;
-                                    let pane_x1 = pos.x + w;
-
-                                    let mut best_x_snap: Option<(f32, f32, f32)> = None;
-                                    let mut best_y_snap: Option<(f32, f32, f32)> = None;
-
-                                    let mut inspect_drag_neighbor = |other: &TerminalPane| {
-                                        let other_pos = other.position.unwrap_or(Pos2::ZERO);
-                                        let other_left = other_pos.x;
-                                        let other_right = other_pos.x + other.desired_size.x;
-                                        let other_top = other_pos.y;
-                                        let other_bottom = other_pos.y + other.desired_size.y;
-
-                                        let y_overlap = (pane_y1.min(other_bottom)
-                                            - pane_y0.max(other_top))
-                                        .max(0.0);
-                                        let x_overlap = (pane_x1.min(other_right)
-                                            - pane_x0.max(other_left))
-                                        .max(0.0);
-
-                                        if y_overlap >= RESIZE_SNAP_OVERLAP_MIN {
-                                            for snap_x in [other_left, other_right] {
-                                                let d_left = (pos.x - snap_x).abs();
-                                                if d_left <= RESIZE_SNAP_DISTANCE {
-                                                    let nx = snap_x.max(0.0);
-                                                    if best_x_snap
-                                                        .is_none_or(|(best, _, _)| d_left < best)
-                                                    {
-                                                        best_x_snap = Some((d_left, nx, snap_x));
-                                                    }
-                                                }
-                                                let d_right = ((pos.x + w) - snap_x).abs();
-                                                if d_right <= RESIZE_SNAP_DISTANCE {
-                                                    let nx = (snap_x - w).max(0.0);
-                                                    if best_x_snap
-                                                        .is_none_or(|(best, _, _)| d_right < best)
-                                                    {
-                                                        best_x_snap = Some((d_right, nx, snap_x));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if x_overlap >= RESIZE_SNAP_OVERLAP_MIN {
-                                            for snap_y in [other_top, other_bottom] {
-                                                let d_top = (pos.y - snap_y).abs();
-                                                if d_top <= RESIZE_SNAP_DISTANCE {
-                                                    let ny = snap_y.clamp(0.0, max_y);
-                                                    if best_y_snap
-                                                        .is_none_or(|(best, _, _)| d_top < best)
-                                                    {
-                                                        best_y_snap = Some((d_top, ny, snap_y));
-                                                    }
-                                                }
-                                                let d_bottom = ((pos.y + h) - snap_y).abs();
-                                                if d_bottom <= RESIZE_SNAP_DISTANCE {
-                                                    let ny = (snap_y - h).clamp(0.0, max_y);
-                                                    if best_y_snap
-                                                        .is_none_or(|(best, _, _)| d_bottom < best)
-                                                    {
-                                                        best_y_snap = Some((d_bottom, ny, snap_y));
-                                                    }
-                                                }
-                                            }
-                                        }
+                                let total_panes = runtime.terminals.len();
+                                for idx in 0..total_panes {
+                                    let (left_group, right_group) =
+                                        runtime.terminals.split_at_mut(idx);
+                                    let Some((pane, right_group)) = right_group.split_first_mut()
+                                    else {
+                                        continue;
                                     };
 
-                                    for other in left_group.iter() {
-                                        inspect_drag_neighbor(other);
-                                    }
-                                    for other in right_group.iter() {
-                                        inspect_drag_neighbor(other);
-                                    }
-
-                                    merge_layout_guide_drag_snaps(
-                                        layout_width,
-                                        spawn_flash_edges,
-                                        pos,
-                                        w,
-                                        h,
-                                        max_y,
-                                        &mut best_x_snap,
-                                        &mut best_y_snap,
-                                        layout,
-                                    );
-
-                                    let mut drag_guide_x: Option<f32> = None;
-                                    let mut drag_guide_y: Option<f32> = None;
-                                    if let Some((_, nx, gx)) = best_x_snap {
-                                        pos.x = nx;
-                                        drag_guide_x = Some(gx);
-                                    }
-                                    if let Some((_, ny, gy)) = best_y_snap {
-                                        pos.y = ny;
-                                        drag_guide_y = Some(gy);
+                                    if pane.position.is_none() {
+                                        // `slot_w` splits `layout_width` across `n` columns with gutters.
+                                        pane.desired_size.x =
+                                            slot_w.clamp(1.0, layout_width.max(1.0));
+                                        let mut h =
+                                            pane.desired_size.y.max(content_height.max(260.0));
+                                        if let Some(rh) =
+                                            layout.default_pane_height_hint(viewport.y)
+                                        {
+                                            h = h.max(rh);
+                                        }
+                                        pane.desired_size.y = h;
+                                        let col = idx % n_cols.max(1);
+                                        let x = column_band_left(layout_width, col, layout);
+                                        let y = column_floor_y[col];
+                                        pane.position = Some(Pos2::new(x, y));
+                                        column_floor_y[col] = y + pane.desired_size.y + STACK_GAP_Y;
                                     }
 
-                                    let gap_snap =
-                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
-                                    let (used_h, used_v) =
-                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
-                                    let dims_drag = pane_neighbor_dimensions(
-                                        pos,
-                                        Vec2::new(w, h),
-                                        left_group.iter().chain(right_group.iter()),
-                                        canvas_width,
-                                        content_height,
-                                    );
-                                    snap_drag_pos_to_used_neighbor_gaps(
-                                        &mut pos,
-                                        w,
-                                        h,
-                                        max_y,
-                                        &dims_drag,
-                                        &used_h,
-                                        &used_v,
-                                    );
-
-                                    pos.x = pos.x.round().max(0.0);
-                                    pos.y = pos.y.round().clamp(0.0, max_y);
-
+                                    let mut pos = pane.position.unwrap_or(Pos2::ZERO);
+                                    // With horizontal scrolling the scroll area grows to fit all
+                                    // terminals, so we only clamp x to be non-negative. Previously
+                                    // clamping to the scroll canvas width caused right-side terminals to
+                                    // be pushed left and overlap neighbours when the window shrank.
+                                    // `content_height` is captured early in the frame. If a pane is
+                                    // spawned lower in this same frame, clamping to that stale value
+                                    // pulls it upward and can visually overlap neighbours.
+                                    let max_y =
+                                        (content_height - pane.desired_size.y).max(0.0).max(pos.y);
+                                    pos.x = pos.x.max(0.0);
+                                    pos.y = pos.y.clamp(0.0, max_y);
                                     pane.position = Some(pos);
 
-                                    if let Some(gx) = drag_guide_x {
-                                        let x = content_origin.x + gx;
-                                        ui.painter().line_segment(
-                                            [
-                                                Pos2::new(x, content_origin.y),
-                                                Pos2::new(x, content_origin.y + content_height),
-                                            ],
-                                            Stroke::new(1.3, p.resize_grip_hot),
-                                        );
+                                    let pane_rect = egui::Rect::from_min_size(
+                                        content_origin + pos.to_vec2(),
+                                        pane.desired_size,
+                                    );
+                                    let header_rect = egui::Rect::from_min_size(
+                                        pane_rect.min,
+                                        Vec2::new(pane_rect.width(), 24.0),
+                                    );
+                                    let drag_response = ui
+                                        .interact(
+                                            header_rect,
+                                            ui.id().with(("pane_drag", pane.id)),
+                                            Sense::click_and_drag(),
+                                        )
+                                        .on_hover_cursor(CursorIcon::Grab);
+                                    if drag_response.dragged() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                                     }
-                                    if let Some(gy) = drag_guide_y {
-                                        let y = content_origin.y + gy;
-                                        ui.painter().line_segment(
-                                            [
-                                                Pos2::new(content_origin.x, y),
-                                                Pos2::new(content_origin.x + canvas_width, y),
-                                            ],
-                                            Stroke::new(1.3, p.resize_grip_hot),
-                                        );
-                                    }
-                                }
+                                    if drag_response.dragged() {
+                                        let delta = ui.input(|i| i.pointer.delta());
+                                        pos.x = (pos.x + delta.x).max(0.0);
+                                        pos.y = (pos.y + delta.y).clamp(0.0, max_y);
 
-                                let left_rect = egui::Rect::from_min_max(
-                                    pane_rect.min,
-                                    Pos2::new(
-                                        pane_rect.min.x + RESIZE_EDGE_THICKNESS,
-                                        pane_rect.max.y,
-                                    ),
-                                );
-                                let right_rect = egui::Rect::from_min_max(
-                                    Pos2::new(
-                                        pane_rect.max.x - RESIZE_EDGE_THICKNESS,
-                                        pane_rect.min.y,
-                                    ),
-                                    pane_rect.max,
-                                );
-                                let top_rect = egui::Rect::from_min_max(
-                                    pane_rect.min,
-                                    Pos2::new(
-                                        pane_rect.max.x,
-                                        pane_rect.min.y + RESIZE_EDGE_THICKNESS,
-                                    ),
-                                );
-                                let bottom_rect = egui::Rect::from_min_max(
-                                    Pos2::new(
-                                        pane_rect.min.x,
-                                        pane_rect.max.y - RESIZE_EDGE_THICKNESS,
-                                    ),
-                                    pane_rect.max,
-                                );
+                                        // Snap dragged pane edges to other terminals (same thresholds as resize).
+                                        let w = pane.desired_size.x;
+                                        let h = pane.desired_size.y;
+                                        let pane_y0 = pos.y;
+                                        let pane_y1 = pos.y + h;
+                                        let pane_x0 = pos.x;
+                                        let pane_x1 = pos.x + w;
 
-                                let tl_rect = egui::Rect::from_min_size(
-                                    pane_rect.min,
-                                    Vec2::splat(RESIZE_HANDLE_SIZE),
-                                );
-                                let tr_rect = egui::Rect::from_min_size(
-                                    Pos2::new(
-                                        pane_rect.max.x - RESIZE_HANDLE_SIZE,
-                                        pane_rect.min.y,
-                                    ),
-                                    Vec2::splat(RESIZE_HANDLE_SIZE),
-                                );
-                                let bl_rect = egui::Rect::from_min_size(
-                                    Pos2::new(
-                                        pane_rect.min.x,
-                                        pane_rect.max.y - RESIZE_HANDLE_SIZE,
-                                    ),
-                                    Vec2::splat(RESIZE_HANDLE_SIZE),
-                                );
-                                // Bottom-right grip: interaction + visuals sit outside the pane border.
-                                let br_grip_rect = egui::Rect::from_min_size(
-                                    pane_rect.right_bottom()
-                                        + Vec2::new(CORNER_GRIP_OUTSET, CORNER_GRIP_OUTSET),
-                                    Vec2::splat(RESIZE_CORNER_HOTSPOT),
-                                );
+                                        let mut best_x_snap: Option<(f32, f32, f32)> = None;
+                                        let mut best_y_snap: Option<(f32, f32, f32)> = None;
 
-                                let resize_left = ui.interact(
-                                    left_rect,
-                                    ui.id().with(("pane_resize_left", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_right = ui.interact(
-                                    right_rect,
-                                    ui.id().with(("pane_resize_right", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_top = ui.interact(
-                                    top_rect,
-                                    ui.id().with(("pane_resize_top", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_bottom = ui.interact(
-                                    bottom_rect,
-                                    ui.id().with(("pane_resize_bottom", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_tl = ui.interact(
-                                    tl_rect,
-                                    ui.id().with(("pane_resize_tl", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_tr = ui.interact(
-                                    tr_rect,
-                                    ui.id().with(("pane_resize_tr", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_bl = ui.interact(
-                                    bl_rect,
-                                    ui.id().with(("pane_resize_bl", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-                                let resize_br = ui.interact(
-                                    br_grip_rect,
-                                    ui.id().with(("pane_resize_br", pane.id)),
-                                    Sense::click_and_drag(),
-                                );
-
-                                let left_active = resize_left.hovered() || resize_left.dragged();
-                                let right_active = resize_right.hovered() || resize_right.dragged();
-                                let top_active = resize_top.hovered() || resize_top.dragged();
-                                let bottom_active =
-                                    resize_bottom.hovered() || resize_bottom.dragged();
-                                let tl_active = resize_tl.hovered() || resize_tl.dragged();
-                                let tr_active = resize_tr.hovered() || resize_tr.dragged();
-                                let bl_active = resize_bl.hovered() || resize_bl.dragged();
-                                let br_active = resize_br.hovered() || resize_br.dragged();
-                                let near_br_corner = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|p| {
-                                        p.x >= pane_rect.max.x - BR_CURSOR_HOVER_RADIUS
-                                            && p.y >= pane_rect.max.y - BR_CURSOR_HOVER_RADIUS
-                                            && p.x <= pane_rect.max.x + BR_CURSOR_HOVER_RADIUS
-                                            && p.y <= pane_rect.max.y + BR_CURSOR_HOVER_RADIUS
-                                    })
-                                });
-
-                                // Cursor priority: corners first, then edges.
-                                if tl_active || br_active || near_br_corner {
-                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
-                                } else if tr_active || bl_active {
-                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw);
-                                } else if left_active || right_active {
-                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                                } else if top_active || bottom_active {
-                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
-                                }
-
-                                let any_resize_dragged = resize_left.dragged()
-                                    || resize_right.dragged()
-                                    || resize_top.dragged()
-                                    || resize_bottom.dragged()
-                                    || resize_tl.dragged()
-                                    || resize_tr.dragged()
-                                    || resize_bl.dragged()
-                                    || resize_br.dragged();
-                                let show_layout_metrics =
-                                    drag_response.dragged() || any_resize_dragged;
-                                if any_resize_dragged {
-                                    let init_right = pos.x + pane.desired_size.x;
-                                    let init_bottom = pos.y + pane.desired_size.y;
-                                    let delta = ui.input(|i| i.pointer.delta());
-                                    let mut new_x = pos.x;
-                                    let mut new_y = pos.y;
-                                    let mut new_w = pane.desired_size.x;
-                                    let mut new_h = pane.desired_size.y;
-                                    let mut snap_guide_x: Option<f32> = None;
-                                    let mut snap_guide_y: Option<f32> = None;
-
-                                    let left_dragged = resize_left.dragged()
-                                        || resize_tl.dragged()
-                                        || resize_bl.dragged();
-                                    let right_dragged = resize_right.dragged()
-                                        || resize_tr.dragged()
-                                        || resize_br.dragged();
-                                    let top_dragged = resize_top.dragged()
-                                        || resize_tl.dragged()
-                                        || resize_tr.dragged();
-                                    let bottom_dragged = resize_bottom.dragged()
-                                        || resize_bl.dragged()
-                                        || resize_br.dragged();
-
-                                    if left_dragged {
-                                        let max_left = (init_right - TERMINAL_MIN_WIDTH).max(0.0);
-                                        let proposed_left = (pos.x + delta.x).clamp(0.0, max_left);
-                                        new_x = proposed_left;
-                                        new_w = init_right - proposed_left;
-                                    }
-                                    if right_dragged {
-                                        new_w = (new_w + delta.x).max(TERMINAL_MIN_WIDTH);
-                                    }
-                                    if top_dragged {
-                                        let max_top = (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0);
-                                        let proposed_top = (pos.y + delta.y).clamp(0.0, max_top);
-                                        new_y = proposed_top;
-                                        new_h = init_bottom - proposed_top;
-                                    }
-                                    if bottom_dragged {
-                                        let max_h =
-                                            (content_height - new_y).max(TERMINAL_MIN_HEIGHT);
-                                        new_h = (new_h + delta.y).clamp(TERMINAL_MIN_HEIGHT, max_h);
-                                    }
-
-                                    let mut best_x_snap: Option<(f32, f32, bool, usize)> = None;
-                                    let mut best_y_snap: Option<(f32, f32, bool, usize)> = None;
-                                    let pane_y0 = new_y;
-                                    let pane_y1 = new_y + new_h;
-                                    let pane_x0 = new_x;
-                                    let pane_x1 = new_x + new_w;
-
-                                    let mut inspect_other =
-                                        |other_idx: usize, other: &TerminalPane| {
+                                        let mut inspect_drag_neighbor = |other: &TerminalPane| {
                                             let other_pos = other.position.unwrap_or(Pos2::ZERO);
                                             let other_left = other_pos.x;
                                             let other_right = other_pos.x + other.desired_size.x;
@@ -1899,452 +1685,845 @@ impl eframe::App for TermiteUi {
                                                 - pane_x0.max(other_left))
                                             .max(0.0);
 
-                                            if right_dragged && y_overlap >= RESIZE_SNAP_OVERLAP_MIN
-                                            {
+                                            if y_overlap >= RESIZE_SNAP_OVERLAP_MIN {
                                                 for snap_x in [other_left, other_right] {
-                                                    let dist = (pane_x1 - snap_x).abs();
-                                                    if dist <= RESIZE_SNAP_DISTANCE {
-                                                        if best_x_snap.is_none_or(
-                                                            |(best, _, _, _)| dist < best,
-                                                        ) {
-                                                            best_x_snap = Some((
-                                                                dist, snap_x, true, other_idx,
-                                                            ));
+                                                    let d_left = (pos.x - snap_x).abs();
+                                                    if d_left <= RESIZE_SNAP_DISTANCE {
+                                                        let nx = snap_x.max(0.0);
+                                                        if best_x_snap.is_none_or(|(best, _, _)| {
+                                                            d_left < best
+                                                        }) {
+                                                            best_x_snap =
+                                                                Some((d_left, nx, snap_x));
+                                                        }
+                                                    }
+                                                    let d_right = ((pos.x + w) - snap_x).abs();
+                                                    if d_right <= RESIZE_SNAP_DISTANCE {
+                                                        let nx = (snap_x - w).max(0.0);
+                                                        if best_x_snap.is_none_or(|(best, _, _)| {
+                                                            d_right < best
+                                                        }) {
+                                                            best_x_snap =
+                                                                Some((d_right, nx, snap_x));
                                                         }
                                                     }
                                                 }
                                             }
-                                            if left_dragged && y_overlap >= RESIZE_SNAP_OVERLAP_MIN
-                                            {
-                                                for snap_x in [other_left, other_right] {
-                                                    let dist = (pane_x0 - snap_x).abs();
-                                                    if dist <= RESIZE_SNAP_DISTANCE {
-                                                        if best_x_snap.is_none_or(
-                                                            |(best, _, _, _)| dist < best,
-                                                        ) {
-                                                            best_x_snap = Some((
-                                                                dist, snap_x, false, other_idx,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if bottom_dragged
-                                                && x_overlap >= RESIZE_SNAP_OVERLAP_MIN
-                                            {
+                                            if x_overlap >= RESIZE_SNAP_OVERLAP_MIN {
                                                 for snap_y in [other_top, other_bottom] {
-                                                    let dist = (pane_y1 - snap_y).abs();
-                                                    if dist <= RESIZE_SNAP_DISTANCE {
-                                                        if best_y_snap.is_none_or(
-                                                            |(best, _, _, _)| dist < best,
-                                                        ) {
-                                                            best_y_snap = Some((
-                                                                dist, snap_y, true, other_idx,
-                                                            ));
+                                                    let d_top = (pos.y - snap_y).abs();
+                                                    if d_top <= RESIZE_SNAP_DISTANCE {
+                                                        let ny = snap_y.clamp(0.0, max_y);
+                                                        if best_y_snap
+                                                            .is_none_or(|(best, _, _)| d_top < best)
+                                                        {
+                                                            best_y_snap = Some((d_top, ny, snap_y));
                                                         }
                                                     }
-                                                }
-                                            }
-                                            if top_dragged && x_overlap >= RESIZE_SNAP_OVERLAP_MIN {
-                                                for snap_y in [other_top, other_bottom] {
-                                                    let dist = (pane_y0 - snap_y).abs();
-                                                    if dist <= RESIZE_SNAP_DISTANCE {
-                                                        if best_y_snap.is_none_or(
-                                                            |(best, _, _, _)| dist < best,
-                                                        ) {
-                                                            best_y_snap = Some((
-                                                                dist, snap_y, false, other_idx,
-                                                            ));
+                                                    let d_bottom = ((pos.y + h) - snap_y).abs();
+                                                    if d_bottom <= RESIZE_SNAP_DISTANCE {
+                                                        let ny = (snap_y - h).clamp(0.0, max_y);
+                                                        if best_y_snap.is_none_or(|(best, _, _)| {
+                                                            d_bottom < best
+                                                        }) {
+                                                            best_y_snap =
+                                                                Some((d_bottom, ny, snap_y));
                                                         }
                                                     }
                                                 }
                                             }
                                         };
 
-                                    for (other_idx, other) in left_group.iter().enumerate() {
-                                        inspect_other(other_idx, other);
-                                    }
-                                    for (off, other) in right_group.iter().enumerate() {
-                                        inspect_other(idx + 1 + off, other);
-                                    }
+                                        for other in left_group.iter() {
+                                            inspect_drag_neighbor(other);
+                                        }
+                                        for other in right_group.iter() {
+                                            inspect_drag_neighbor(other);
+                                        }
 
-                                    merge_layout_guide_resize_snaps(
-                                        layout_width,
-                                        spawn_flash_edges,
-                                        right_dragged,
-                                        left_dragged,
-                                        top_dragged,
-                                        bottom_dragged,
-                                        pane_x0,
-                                        pane_x1,
-                                        pane_y0,
-                                        pane_y1,
-                                        &mut best_x_snap,
-                                        &mut best_y_snap,
-                                        layout,
-                                    );
+                                        merge_layout_guide_drag_snaps(
+                                            layout_width,
+                                            spawn_flash_edges,
+                                            pos,
+                                            w,
+                                            h,
+                                            max_y,
+                                            &mut best_x_snap,
+                                            &mut best_y_snap,
+                                            layout,
+                                        );
 
-                                    if let Some((_, snap_x, snapped_right_edge, _other_idx)) =
-                                        best_x_snap
-                                    {
-                                        if snapped_right_edge && right_dragged {
-                                            new_w = (snap_x - new_x).max(TERMINAL_MIN_WIDTH);
-                                            snap_guide_x = Some(snap_x);
-                                        } else if !snapped_right_edge && left_dragged {
-                                            new_x = (snap_x)
-                                                .clamp(0.0, (init_right - TERMINAL_MIN_WIDTH).max(0.0));
-                                            new_w = init_right - new_x;
-                                            snap_guide_x = Some(snap_x);
+                                        let mut drag_guide_x: Option<f32> = None;
+                                        let mut drag_guide_y: Option<f32> = None;
+                                        if let Some((_, nx, gx)) = best_x_snap {
+                                            pos.x = nx;
+                                            drag_guide_x = Some(gx);
+                                        }
+                                        if let Some((_, ny, gy)) = best_y_snap {
+                                            pos.y = ny;
+                                            drag_guide_y = Some(gy);
+                                        }
+
+                                        let gap_snap = gap_rect_snapshot_three_way(
+                                            left_group,
+                                            pane,
+                                            right_group,
+                                        );
+                                        let (used_h, used_v) =
+                                            collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                        let dims_drag = pane_neighbor_dimensions(
+                                            pos,
+                                            Vec2::new(w, h),
+                                            left_group.iter().chain(right_group.iter()),
+                                            canvas_width,
+                                            content_height,
+                                        );
+                                        snap_drag_pos_to_used_neighbor_gaps(
+                                            &mut pos, w, h, max_y, &dims_drag, &used_h, &used_v,
+                                        );
+
+                                        pos.x = pos.x.round().max(0.0);
+                                        pos.y = pos.y.round().clamp(0.0, max_y);
+
+                                        pane.position = Some(pos);
+
+                                        if let Some(gx) = drag_guide_x {
+                                            let x = content_origin.x + gx;
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(x, content_origin.y),
+                                                    Pos2::new(x, content_origin.y + content_height),
+                                                ],
+                                                Stroke::new(1.3, p.resize_grip_hot),
+                                            );
+                                        }
+                                        if let Some(gy) = drag_guide_y {
+                                            let y = content_origin.y + gy;
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(content_origin.x, y),
+                                                    Pos2::new(content_origin.x + canvas_width, y),
+                                                ],
+                                                Stroke::new(1.3, p.resize_grip_hot),
+                                            );
                                         }
                                     }
 
-                                    if let Some((_, snap_y, snapped_bottom_edge, _other_idx)) =
-                                        best_y_snap
-                                    {
-                                        if snapped_bottom_edge && bottom_dragged {
-                                            new_h = (snap_y - new_y).clamp(
-                                                TERMINAL_MIN_HEIGHT,
-                                                (content_height - new_y).max(TERMINAL_MIN_HEIGHT),
-                                            );
-                                            snap_guide_y = Some(snap_y);
-                                        } else if !snapped_bottom_edge && top_dragged {
-                                            new_y = (snap_y).clamp(
-                                                0.0,
-                                                (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0),
-                                            );
-                                            new_h = init_bottom - new_y;
-                                            snap_guide_y = Some(snap_y);
-                                        }
-                                    }
-
-                                    let gap_snap =
-                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
-                                    let (used_h, used_v) =
-                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
-                                    snap_resize_rect_to_used_neighbor_gaps(
-                                        &mut new_x,
-                                        &mut new_y,
-                                        &mut new_w,
-                                        &mut new_h,
-                                        left_group,
-                                        right_group,
-                                        left_dragged,
-                                        right_dragged,
-                                        top_dragged,
-                                        bottom_dragged,
-                                        &used_h,
-                                        &used_v,
-                                        init_right,
-                                        init_bottom,
-                                        canvas_width,
-                                        content_height,
-                                        content_height,
+                                    let left_rect = egui::Rect::from_min_max(
+                                        pane_rect.min,
+                                        Pos2::new(
+                                            pane_rect.min.x + RESIZE_EDGE_THICKNESS,
+                                            pane_rect.max.y,
+                                        ),
+                                    );
+                                    let right_rect = egui::Rect::from_min_max(
+                                        Pos2::new(
+                                            pane_rect.max.x - RESIZE_EDGE_THICKNESS,
+                                            pane_rect.min.y,
+                                        ),
+                                        pane_rect.max,
+                                    );
+                                    let top_rect = egui::Rect::from_min_max(
+                                        pane_rect.min,
+                                        Pos2::new(
+                                            pane_rect.max.x,
+                                            pane_rect.min.y + RESIZE_EDGE_THICKNESS,
+                                        ),
+                                    );
+                                    let bottom_rect = egui::Rect::from_min_max(
+                                        Pos2::new(
+                                            pane_rect.min.x,
+                                            pane_rect.max.y - RESIZE_EDGE_THICKNESS,
+                                        ),
+                                        pane_rect.max,
                                     );
 
-                                    new_x = new_x.round().max(0.0);
-                                    new_y = new_y.round().max(0.0);
-                                    if left_dragged && !right_dragged {
-                                        new_w = (init_right - new_x).max(TERMINAL_MIN_WIDTH);
-                                    } else {
-                                        new_w = new_w.round().max(TERMINAL_MIN_WIDTH);
-                                    }
-                                    if top_dragged && !bottom_dragged {
-                                        new_h = (init_bottom - new_y).max(TERMINAL_MIN_HEIGHT);
-                                    } else {
-                                        new_h = new_h.round().max(TERMINAL_MIN_HEIGHT);
-                                    }
-                                    if bottom_dragged && !top_dragged {
-                                        let max_h =
-                                            (content_height - new_y).max(TERMINAL_MIN_HEIGHT);
-                                        new_h = new_h.min(max_h);
-                                    }
+                                    let tl_rect = egui::Rect::from_min_size(
+                                        pane_rect.min,
+                                        Vec2::splat(RESIZE_HANDLE_SIZE),
+                                    );
+                                    let tr_rect = egui::Rect::from_min_size(
+                                        Pos2::new(
+                                            pane_rect.max.x - RESIZE_HANDLE_SIZE,
+                                            pane_rect.min.y,
+                                        ),
+                                        Vec2::splat(RESIZE_HANDLE_SIZE),
+                                    );
+                                    let bl_rect = egui::Rect::from_min_size(
+                                        Pos2::new(
+                                            pane_rect.min.x,
+                                            pane_rect.max.y - RESIZE_HANDLE_SIZE,
+                                        ),
+                                        Vec2::splat(RESIZE_HANDLE_SIZE),
+                                    );
+                                    // Bottom-right grip: interaction + visuals sit outside the pane border.
+                                    let br_grip_rect = egui::Rect::from_min_size(
+                                        pane_rect.right_bottom()
+                                            + Vec2::new(CORNER_GRIP_OUTSET, CORNER_GRIP_OUTSET),
+                                        Vec2::splat(RESIZE_CORNER_HOTSPOT),
+                                    );
 
-                                    pane.desired_size.x = new_w;
-                                    pane.desired_size.y = new_h;
-                                    pos.x = new_x;
-                                    pos.y = new_y;
-                                    pane.position = Some(pos);
-
-                                    if let Some(guide_x) = snap_guide_x {
-                                        let x = content_origin.x + guide_x;
-                                        ui.painter().line_segment(
-                                            [
-                                                Pos2::new(x, content_origin.y),
-                                                Pos2::new(x, content_origin.y + content_height),
-                                            ],
-                                            Stroke::new(1.3, p.resize_grip_hot),
-                                        );
-                                    }
-                                    if let Some(guide_y) = snap_guide_y {
-                                        let y = content_origin.y + guide_y;
-                                        ui.painter().line_segment(
-                                            [
-                                                Pos2::new(content_origin.x, y),
-                                                Pos2::new(content_origin.x + canvas_width, y),
-                                            ],
-                                            Stroke::new(1.3, p.resize_grip_hot),
-                                        );
-                                    }
-                                }
-
-                                let is_active = runtime.active_terminal == Some(idx)
-                                    || (runtime.active_terminal.is_none() && total_panes == 1);
-                                let mut border = if is_active { p.terminal_border_active } else { p.border };
-                                let mut stroke_w: f32 = 2.0;
-                                if let (Some(blink_id), Some(started_at)) = (equal_size_template_blink_terminal_id, equal_size_template_blink_started_at) {
-                                    if pane.id == blink_id && equal_size_picker_open {
-                                        let elapsed = equal_size_template_blink_now.duration_since(started_at);
-                                        // Keep blinking continuously while picker is open.
-                                        stroke_w = 5.0;
-                                        const BLINK_PERIOD_MS: u128 = 550;
-                                        let phase_ms =
-                                            (elapsed.as_millis() % BLINK_PERIOD_MS) as f32;
-                                        let phase = phase_ms / (BLINK_PERIOD_MS as f32);
-                                        // Smooth sine-based fade for a less "jittery" look.
-                                        let intensity = 0.5 + 0.5 * (std::f32::consts::TAU * phase).sin(); // 0..1
-
-                                        let base = p.border;
-                                        let peak = p.terminal_border_active;
-                                        let lerp_u8 = |a: u8, b: u8, t: f32| -> u8 {
-                                            (a as f32 + (b as f32 - a as f32) * t)
-                                                .round()
-                                                .clamp(0.0, 255.0) as u8
-                                        };
-                                        border = Color32::from_rgba_unmultiplied(
-                                            lerp_u8(base.r(), peak.r(), intensity),
-                                            lerp_u8(base.g(), peak.g(), intensity),
-                                            lerp_u8(base.b(), peak.b(), intensity),
-                                            lerp_u8(base.a(), peak.a(), intensity),
-                                        );
-                                    }
-                                }
-
-                                let pane_response = ui.allocate_rect(pane_rect, Sense::click());
-                                let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().max_rect(pane_rect),
-                                    |ui| {
-                                        egui::Frame::default()
-                                            .fill(p.term_bg)
-                                            .stroke(Stroke::new(stroke_w, border))
-                                            .inner_margin(Margin::same(6))
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(&pane.title)
-                                                                .family(FontFamily::Monospace)
-                                                                .size(12.0)
-                                                                .color(p.text),
-                                                        )
-                                                        .selectable(false)
-                                                        .sense(Sense::hover()),
-                                                    );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            if ui.small_button("x").clicked() {
-                                                                close_idx = Some(idx);
-                                                            }
-                                                        },
-                                                    );
-                                                });
-                                                ui.separator();
-                                                let terminal_height =
-                                                    ui.available_height().max(120.0);
-                                                let terminal_size =
-                                                    Vec2::new(pane.desired_size.x, terminal_height);
-                                                resize_terminal_for_size(pane, terminal_size);
-                                                let selection = runtime
-                                                    .selections
-                                                    .get_mut(idx)
-                                                    .expect("selection slot should exist");
-                                                let grid = pane.session.parser.grid();
-                                                let show_caret = pane.session.parser.cursor_visible()
-                                                    || pane.session.parser.app_cursor_keys()
-                                                    || grid.in_alt;
-                                                clicked_cell_from_grid = render_terminal_grid(
-                                                    ui,
-                                                    pane.id,
-                                                    grid,
-                                                    p,
-                                                    selection,
-                                                    is_active,
-                                                    show_caret,
-                                                );
-
-                                                if let Some((clicked_row, clicked_col)) = clicked_cell_from_grid
-                                                {
-                                                    runtime.active_terminal = Some(idx);
-                                                    clicked_on_pane = true;
-                                                    let grid = pane.session.parser.grid();
-                                                    if grid.cols > 0 {
-                                                        let target_row = clicked_row
-                                                            .min(grid.rows.saturating_sub(1));
-                                                        let row_end = row_render_end(grid, target_row)
-                                                            .min(grid.cols.saturating_sub(1));
-                                                        let target_col = clicked_col
-                                                            .min(row_end.saturating_add(1))
-                                                            .min(grid.cols.saturating_sub(1));
-
-                                                        let mut bytes = Vec::new();
-                                                        // Horizontal targeting only (do not send Up/Down,
-                                                        // which can trigger shell/TUI history navigation).
-                                                        if clicked_col >= row_end {
-                                                            // For readline-like prompts, this reliably lands at line end.
-                                                            bytes.push(0x05); // Ctrl+E
-                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
-                                                                ed.move_to_end();
-                                                            }
-                                                        } else if target_col > grid.cursor.col {
-                                                            let steps = target_col - grid.cursor.col;
-                                                            bytes.reserve(steps * 3);
-                                                            for _ in 0..steps {
-                                                                bytes.extend_from_slice(b"\x1b[C");
-                                                            }
-                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
-                                                                ed.move_cursor_delta(steps as isize);
-                                                            }
-                                                        } else if target_col < grid.cursor.col {
-                                                            let steps = grid.cursor.col - target_col;
-                                                            bytes.reserve(steps * 3);
-                                                            for _ in 0..steps {
-                                                                bytes.extend_from_slice(b"\x1b[D");
-                                                            }
-                                                            if let Some(ed) = runtime.line_editors.get_mut(idx) {
-                                                                ed.move_cursor_delta(-(steps as isize));
-                                                            }
-                                                        }
-
-                                                        if !bytes.is_empty() {
-                                                            pane.backend.write_all(&bytes);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                    },
-                                );
-
-                                if pane_response.clicked() {
-                                    runtime.active_terminal = Some(idx);
-                                    clicked_on_pane = true;
-                                    // If user clicked inside pane but not on rendered text content,
-                                    // treat it as "move caret to end of current input line".
-                                    if clicked_cell_from_grid.is_none() {
-                                        pane.backend.write_all(&[0x05]); // Ctrl+E
-                                    }
-                                    // Allow egui to forward `Event::Text` into the PTY.
-                                    // Without this, we only see some Key events (e.g. delete/backspace).
-                                }
-                                if pane_response.secondary_clicked() {
-                                    runtime.active_terminal = Some(idx);
-                                    clicked_on_pane = true;
-                                    // Allow egui to forward `Event::Text` into the PTY.
-                                }
-                                if near_br_corner || resize_br.hovered() || resize_br.dragged() {
-                                    paint_br_resize_line(
-                                        ui.painter(),
+                                    let resize_left = ui.interact(
+                                        left_rect,
+                                        ui.id().with(("pane_resize_left", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_right = ui.interact(
+                                        right_rect,
+                                        ui.id().with(("pane_resize_right", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_top = ui.interact(
+                                        top_rect,
+                                        ui.id().with(("pane_resize_top", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_bottom = ui.interact(
+                                        bottom_rect,
+                                        ui.id().with(("pane_resize_bottom", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_tl = ui.interact(
+                                        tl_rect,
+                                        ui.id().with(("pane_resize_tl", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_tr = ui.interact(
+                                        tr_rect,
+                                        ui.id().with(("pane_resize_tr", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_bl = ui.interact(
+                                        bl_rect,
+                                        ui.id().with(("pane_resize_bl", pane.id)),
+                                        Sense::click_and_drag(),
+                                    );
+                                    let resize_br = ui.interact(
                                         br_grip_rect,
-                                        resize_br.hovered() || resize_br.dragged(),
-                                        p,
+                                        ui.id().with(("pane_resize_br", pane.id)),
+                                        Sense::click_and_drag(),
                                     );
-                                }
 
-                                if show_layout_metrics {
-                                    let pos = pane.position.unwrap_or(Pos2::ZERO);
-                                    let dims = pane_neighbor_dimensions(
-                                        pos,
-                                        pane.desired_size,
-                                        left_group.iter().chain(right_group.iter()),
-                                        canvas_width,
-                                        content_height,
-                                    );
-                                    let gap_snap =
-                                        gap_rect_snapshot_three_way(left_group, pane, right_group);
-                                    let (used_h, used_v) =
-                                        collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
-                                    paint_terminal_neighbor_gap_guides(
-                                        ui.painter(),
-                                        content_origin,
-                                        &dims,
-                                        &used_h,
-                                        &used_v,
-                                    );
-                                    let grid = pane.session.parser.grid();
-                                    let pty_w = pane.desired_size.x;
-                                    let pty_h = (pane.desired_size.y - TERMINAL_GRID_CHROME_Y)
-                                        .max(120.0);
-                                    let (pad_x, pad_y) = terminal_cell_slack_px(
-                                        pty_w,
-                                        pty_h,
-                                        grid.cols,
-                                        grid.rows,
-                                    );
-                                    let fill = Color32::from_rgba_unmultiplied(0, 0, 0, 200);
-                                    paint_pane_layout_metrics_overlay(
-                                        ui.painter(),
-                                        pane_rect,
-                                        pad_x,
-                                        pad_y,
-                                        p.text,
-                                        fill,
-                                    );
-                                }
-                            }
-
-                            if scroll_bg.clicked() {
-                                // Clear active terminal only when the click was truly outside all
-                                // pane rectangles (border/title clicks can be ambiguous with the per-pane
-                                // `clicked_on_pane` flag).
-                                if let Some(pointer_pos) = scroll_bg.interact_pointer_pos() {
-                                    let local_pos = Pos2::new(
-                                        pointer_pos.x - content_origin.x,
-                                        pointer_pos.y - content_origin.y,
-                                    );
-                                    let clicked_on_terminal = runtime.terminals.iter().any(|pane| {
-                                        let pos = pane.position.unwrap_or(Pos2::ZERO);
-                                        let rect = egui::Rect::from_min_size(pos, pane.desired_size);
-                                        rect.contains(local_pos)
+                                    let left_active =
+                                        resize_left.hovered() || resize_left.dragged();
+                                    let right_active =
+                                        resize_right.hovered() || resize_right.dragged();
+                                    let top_active = resize_top.hovered() || resize_top.dragged();
+                                    let bottom_active =
+                                        resize_bottom.hovered() || resize_bottom.dragged();
+                                    let tl_active = resize_tl.hovered() || resize_tl.dragged();
+                                    let tr_active = resize_tr.hovered() || resize_tr.dragged();
+                                    let bl_active = resize_bl.hovered() || resize_bl.dragged();
+                                    let br_active = resize_br.hovered() || resize_br.dragged();
+                                    let near_br_corner = ui.input(|i| {
+                                        i.pointer.hover_pos().is_some_and(|p| {
+                                            p.x >= pane_rect.max.x - BR_CURSOR_HOVER_RADIUS
+                                                && p.y >= pane_rect.max.y - BR_CURSOR_HOVER_RADIUS
+                                                && p.x <= pane_rect.max.x + BR_CURSOR_HOVER_RADIUS
+                                                && p.y <= pane_rect.max.y + BR_CURSOR_HOVER_RADIUS
+                                        })
                                     });
-                                    if !clicked_on_terminal {
+
+                                    // Cursor priority: corners first, then edges.
+                                    if tl_active || br_active || near_br_corner {
+                                        ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
+                                    } else if tr_active || bl_active {
+                                        ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw);
+                                    } else if left_active || right_active {
+                                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                                    } else if top_active || bottom_active {
+                                        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+                                    }
+
+                                    let any_resize_dragged = resize_left.dragged()
+                                        || resize_right.dragged()
+                                        || resize_top.dragged()
+                                        || resize_bottom.dragged()
+                                        || resize_tl.dragged()
+                                        || resize_tr.dragged()
+                                        || resize_bl.dragged()
+                                        || resize_br.dragged();
+                                    let show_layout_metrics =
+                                        drag_response.dragged() || any_resize_dragged;
+                                    if any_resize_dragged {
+                                        let init_right = pos.x + pane.desired_size.x;
+                                        let init_bottom = pos.y + pane.desired_size.y;
+                                        let delta = ui.input(|i| i.pointer.delta());
+                                        let mut new_x = pos.x;
+                                        let mut new_y = pos.y;
+                                        let mut new_w = pane.desired_size.x;
+                                        let mut new_h = pane.desired_size.y;
+                                        let mut snap_guide_x: Option<f32> = None;
+                                        let mut snap_guide_y: Option<f32> = None;
+
+                                        let left_dragged = resize_left.dragged()
+                                            || resize_tl.dragged()
+                                            || resize_bl.dragged();
+                                        let right_dragged = resize_right.dragged()
+                                            || resize_tr.dragged()
+                                            || resize_br.dragged();
+                                        let top_dragged = resize_top.dragged()
+                                            || resize_tl.dragged()
+                                            || resize_tr.dragged();
+                                        let bottom_dragged = resize_bottom.dragged()
+                                            || resize_bl.dragged()
+                                            || resize_br.dragged();
+
+                                        if left_dragged {
+                                            let max_left =
+                                                (init_right - TERMINAL_MIN_WIDTH).max(0.0);
+                                            let proposed_left =
+                                                (pos.x + delta.x).clamp(0.0, max_left);
+                                            new_x = proposed_left;
+                                            new_w = init_right - proposed_left;
+                                        }
+                                        if right_dragged {
+                                            new_w = (new_w + delta.x).max(TERMINAL_MIN_WIDTH);
+                                        }
+                                        if top_dragged {
+                                            let max_top =
+                                                (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0);
+                                            let proposed_top =
+                                                (pos.y + delta.y).clamp(0.0, max_top);
+                                            new_y = proposed_top;
+                                            new_h = init_bottom - proposed_top;
+                                        }
+                                        if bottom_dragged {
+                                            let max_h =
+                                                (content_height - new_y).max(TERMINAL_MIN_HEIGHT);
+                                            new_h =
+                                                (new_h + delta.y).clamp(TERMINAL_MIN_HEIGHT, max_h);
+                                        }
+
+                                        let mut best_x_snap: Option<(f32, f32, bool, usize)> = None;
+                                        let mut best_y_snap: Option<(f32, f32, bool, usize)> = None;
+                                        let pane_y0 = new_y;
+                                        let pane_y1 = new_y + new_h;
+                                        let pane_x0 = new_x;
+                                        let pane_x1 = new_x + new_w;
+
+                                        let mut inspect_other =
+                                            |other_idx: usize, other: &TerminalPane| {
+                                                let other_pos =
+                                                    other.position.unwrap_or(Pos2::ZERO);
+                                                let other_left = other_pos.x;
+                                                let other_right =
+                                                    other_pos.x + other.desired_size.x;
+                                                let other_top = other_pos.y;
+                                                let other_bottom =
+                                                    other_pos.y + other.desired_size.y;
+
+                                                let y_overlap = (pane_y1.min(other_bottom)
+                                                    - pane_y0.max(other_top))
+                                                .max(0.0);
+                                                let x_overlap = (pane_x1.min(other_right)
+                                                    - pane_x0.max(other_left))
+                                                .max(0.0);
+
+                                                if right_dragged
+                                                    && y_overlap >= RESIZE_SNAP_OVERLAP_MIN
+                                                {
+                                                    for snap_x in [other_left, other_right] {
+                                                        let dist = (pane_x1 - snap_x).abs();
+                                                        if dist <= RESIZE_SNAP_DISTANCE {
+                                                            if best_x_snap.is_none_or(
+                                                                |(best, _, _, _)| dist < best,
+                                                            ) {
+                                                                best_x_snap = Some((
+                                                                    dist, snap_x, true, other_idx,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if left_dragged
+                                                    && y_overlap >= RESIZE_SNAP_OVERLAP_MIN
+                                                {
+                                                    for snap_x in [other_left, other_right] {
+                                                        let dist = (pane_x0 - snap_x).abs();
+                                                        if dist <= RESIZE_SNAP_DISTANCE {
+                                                            if best_x_snap.is_none_or(
+                                                                |(best, _, _, _)| dist < best,
+                                                            ) {
+                                                                best_x_snap = Some((
+                                                                    dist, snap_x, false, other_idx,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if bottom_dragged
+                                                    && x_overlap >= RESIZE_SNAP_OVERLAP_MIN
+                                                {
+                                                    for snap_y in [other_top, other_bottom] {
+                                                        let dist = (pane_y1 - snap_y).abs();
+                                                        if dist <= RESIZE_SNAP_DISTANCE {
+                                                            if best_y_snap.is_none_or(
+                                                                |(best, _, _, _)| dist < best,
+                                                            ) {
+                                                                best_y_snap = Some((
+                                                                    dist, snap_y, true, other_idx,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if top_dragged
+                                                    && x_overlap >= RESIZE_SNAP_OVERLAP_MIN
+                                                {
+                                                    for snap_y in [other_top, other_bottom] {
+                                                        let dist = (pane_y0 - snap_y).abs();
+                                                        if dist <= RESIZE_SNAP_DISTANCE {
+                                                            if best_y_snap.is_none_or(
+                                                                |(best, _, _, _)| dist < best,
+                                                            ) {
+                                                                best_y_snap = Some((
+                                                                    dist, snap_y, false, other_idx,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            };
+
+                                        for (other_idx, other) in left_group.iter().enumerate() {
+                                            inspect_other(other_idx, other);
+                                        }
+                                        for (off, other) in right_group.iter().enumerate() {
+                                            inspect_other(idx + 1 + off, other);
+                                        }
+
+                                        merge_layout_guide_resize_snaps(
+                                            layout_width,
+                                            spawn_flash_edges,
+                                            right_dragged,
+                                            left_dragged,
+                                            top_dragged,
+                                            bottom_dragged,
+                                            pane_x0,
+                                            pane_x1,
+                                            pane_y0,
+                                            pane_y1,
+                                            &mut best_x_snap,
+                                            &mut best_y_snap,
+                                            layout,
+                                        );
+
+                                        if let Some((_, snap_x, snapped_right_edge, _other_idx)) =
+                                            best_x_snap
+                                        {
+                                            if snapped_right_edge && right_dragged {
+                                                new_w = (snap_x - new_x).max(TERMINAL_MIN_WIDTH);
+                                                snap_guide_x = Some(snap_x);
+                                            } else if !snapped_right_edge && left_dragged {
+                                                new_x = (snap_x).clamp(
+                                                    0.0,
+                                                    (init_right - TERMINAL_MIN_WIDTH).max(0.0),
+                                                );
+                                                new_w = init_right - new_x;
+                                                snap_guide_x = Some(snap_x);
+                                            }
+                                        }
+
+                                        if let Some((_, snap_y, snapped_bottom_edge, _other_idx)) =
+                                            best_y_snap
+                                        {
+                                            if snapped_bottom_edge && bottom_dragged {
+                                                new_h = (snap_y - new_y).clamp(
+                                                    TERMINAL_MIN_HEIGHT,
+                                                    (content_height - new_y)
+                                                        .max(TERMINAL_MIN_HEIGHT),
+                                                );
+                                                snap_guide_y = Some(snap_y);
+                                            } else if !snapped_bottom_edge && top_dragged {
+                                                new_y = (snap_y).clamp(
+                                                    0.0,
+                                                    (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0),
+                                                );
+                                                new_h = init_bottom - new_y;
+                                                snap_guide_y = Some(snap_y);
+                                            }
+                                        }
+
+                                        let gap_snap = gap_rect_snapshot_three_way(
+                                            left_group,
+                                            pane,
+                                            right_group,
+                                        );
+                                        let (used_h, used_v) =
+                                            collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                        snap_resize_rect_to_used_neighbor_gaps(
+                                            &mut new_x,
+                                            &mut new_y,
+                                            &mut new_w,
+                                            &mut new_h,
+                                            left_group,
+                                            right_group,
+                                            left_dragged,
+                                            right_dragged,
+                                            top_dragged,
+                                            bottom_dragged,
+                                            &used_h,
+                                            &used_v,
+                                            init_right,
+                                            init_bottom,
+                                            canvas_width,
+                                            content_height,
+                                            content_height,
+                                        );
+
+                                        new_x = new_x.round().max(0.0);
+                                        new_y = new_y.round().max(0.0);
+                                        if left_dragged && !right_dragged {
+                                            new_w = (init_right - new_x).max(TERMINAL_MIN_WIDTH);
+                                        } else {
+                                            new_w = new_w.round().max(TERMINAL_MIN_WIDTH);
+                                        }
+                                        if top_dragged && !bottom_dragged {
+                                            new_h = (init_bottom - new_y).max(TERMINAL_MIN_HEIGHT);
+                                        } else {
+                                            new_h = new_h.round().max(TERMINAL_MIN_HEIGHT);
+                                        }
+                                        if bottom_dragged && !top_dragged {
+                                            let max_h =
+                                                (content_height - new_y).max(TERMINAL_MIN_HEIGHT);
+                                            new_h = new_h.min(max_h);
+                                        }
+
+                                        pane.desired_size.x = new_w;
+                                        pane.desired_size.y = new_h;
+                                        pos.x = new_x;
+                                        pos.y = new_y;
+                                        pane.position = Some(pos);
+
+                                        if let Some(guide_x) = snap_guide_x {
+                                            let x = content_origin.x + guide_x;
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(x, content_origin.y),
+                                                    Pos2::new(x, content_origin.y + content_height),
+                                                ],
+                                                Stroke::new(1.3, p.resize_grip_hot),
+                                            );
+                                        }
+                                        if let Some(guide_y) = snap_guide_y {
+                                            let y = content_origin.y + guide_y;
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(content_origin.x, y),
+                                                    Pos2::new(content_origin.x + canvas_width, y),
+                                                ],
+                                                Stroke::new(1.3, p.resize_grip_hot),
+                                            );
+                                        }
+                                    }
+
+                                    let is_active = runtime.active_terminal == Some(idx);
+                                    let mut border = if is_active {
+                                        p.terminal_border_active
+                                    } else {
+                                        p.border
+                                    };
+                                    let mut stroke_w: f32 = 2.0;
+                                    if let (Some(blink_id), Some(started_at)) = (
+                                        equal_size_template_blink_terminal_id,
+                                        equal_size_template_blink_started_at,
+                                    ) {
+                                        if pane.id == blink_id && equal_size_picker_open {
+                                            let elapsed = equal_size_template_blink_now
+                                                .duration_since(started_at);
+                                            // Keep blinking continuously while picker is open.
+                                            stroke_w = 5.0;
+                                            const BLINK_PERIOD_MS: u128 = 550;
+                                            let phase_ms =
+                                                (elapsed.as_millis() % BLINK_PERIOD_MS) as f32;
+                                            let phase = phase_ms / (BLINK_PERIOD_MS as f32);
+                                            // Smooth sine-based fade for a less "jittery" look.
+                                            let intensity =
+                                                0.5 + 0.5 * (std::f32::consts::TAU * phase).sin(); // 0..1
+
+                                            let base = p.border;
+                                            let peak = p.terminal_border_active;
+                                            let lerp_u8 = |a: u8, b: u8, t: f32| -> u8 {
+                                                (a as f32 + (b as f32 - a as f32) * t)
+                                                    .round()
+                                                    .clamp(0.0, 255.0)
+                                                    as u8
+                                            };
+                                            border = Color32::from_rgba_unmultiplied(
+                                                lerp_u8(base.r(), peak.r(), intensity),
+                                                lerp_u8(base.g(), peak.g(), intensity),
+                                                lerp_u8(base.b(), peak.b(), intensity),
+                                                lerp_u8(base.a(), peak.a(), intensity),
+                                            );
+                                        }
+                                    }
+
+                                    let pane_response = ui.allocate_rect(pane_rect, Sense::click());
+                                    let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(pane_rect),
+                                        |ui| {
+                                            egui::Frame::default()
+                                                .fill(p.term_bg)
+                                                .stroke(Stroke::new(stroke_w, border))
+                                                .inner_margin(Margin::same(6))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&pane.title)
+                                                                    .family(FontFamily::Monospace)
+                                                                    .size(12.0)
+                                                                    .color(p.text),
+                                                            )
+                                                            .selectable(false)
+                                                            .sense(Sense::hover()),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if ui.small_button("x").clicked() {
+                                                                    close_idx = Some(idx);
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+                                                    ui.separator();
+                                                    let terminal_height =
+                                                        ui.available_height().max(120.0);
+                                                    let terminal_size = Vec2::new(
+                                                        pane.desired_size.x,
+                                                        terminal_height,
+                                                    );
+                                                    resize_terminal_for_size(pane, terminal_size);
+                                                    let selection = runtime
+                                                        .selections
+                                                        .get_mut(idx)
+                                                        .expect("selection slot should exist");
+                                                    let grid = pane.session.parser.grid();
+                                                    let show_caret = pane
+                                                        .session
+                                                        .parser
+                                                        .cursor_visible()
+                                                        || pane.session.parser.app_cursor_keys()
+                                                        || grid.in_alt;
+                                                    clicked_cell_from_grid = render_terminal_grid(
+                                                        ui, pane.id, grid, p, selection, is_active,
+                                                        show_caret,
+                                                    );
+
+                                                    if let Some((clicked_row, clicked_col)) =
+                                                        clicked_cell_from_grid
+                                                    {
+                                                        runtime.active_terminal = Some(idx);
+                                                        clicked_on_pane = true;
+                                                        let grid = pane.session.parser.grid();
+                                                        if grid.cols > 0 {
+                                                            let target_row = clicked_row
+                                                                .min(grid.rows.saturating_sub(1));
+                                                            let row_end =
+                                                                row_render_end(grid, target_row)
+                                                                    .min(
+                                                                        grid.cols.saturating_sub(1),
+                                                                    );
+                                                            let target_col = clicked_col
+                                                                .min(row_end.saturating_add(1))
+                                                                .min(grid.cols.saturating_sub(1));
+
+                                                            let mut bytes = Vec::new();
+                                                            // Horizontal targeting only (do not send Up/Down,
+                                                            // which can trigger shell/TUI history navigation).
+                                                            if clicked_col >= row_end {
+                                                                // For readline-like prompts, this reliably lands at line end.
+                                                                bytes.push(0x05); // Ctrl+E
+                                                                if let Some(ed) = runtime
+                                                                    .line_editors
+                                                                    .get_mut(idx)
+                                                                {
+                                                                    ed.move_to_end();
+                                                                }
+                                                            } else if target_col > grid.cursor.col {
+                                                                let steps =
+                                                                    target_col - grid.cursor.col;
+                                                                bytes.reserve(steps * 3);
+                                                                for _ in 0..steps {
+                                                                    bytes.extend_from_slice(
+                                                                        b"\x1b[C",
+                                                                    );
+                                                                }
+                                                                if let Some(ed) = runtime
+                                                                    .line_editors
+                                                                    .get_mut(idx)
+                                                                {
+                                                                    ed.move_cursor_delta(
+                                                                        steps as isize,
+                                                                    );
+                                                                }
+                                                            } else if target_col < grid.cursor.col {
+                                                                let steps =
+                                                                    grid.cursor.col - target_col;
+                                                                bytes.reserve(steps * 3);
+                                                                for _ in 0..steps {
+                                                                    bytes.extend_from_slice(
+                                                                        b"\x1b[D",
+                                                                    );
+                                                                }
+                                                                if let Some(ed) = runtime
+                                                                    .line_editors
+                                                                    .get_mut(idx)
+                                                                {
+                                                                    ed.move_cursor_delta(
+                                                                        -(steps as isize),
+                                                                    );
+                                                                }
+                                                            }
+
+                                                            if !bytes.is_empty() {
+                                                                pane.backend.write_all(&bytes);
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                        },
+                                    );
+
+                                    if pane_response.clicked() {
+                                        runtime.active_terminal = Some(idx);
+                                        clicked_on_pane = true;
+                                        // If user clicked inside pane but not on rendered text content,
+                                        // treat it as "move caret to end of current input line".
+                                        if clicked_cell_from_grid.is_none() {
+                                            pane.backend.write_all(&[0x05]); // Ctrl+E
+                                        }
+                                        // Allow egui to forward `Event::Text` into the PTY.
+                                        // Without this, we only see some Key events (e.g. delete/backspace).
+                                    }
+                                    if pane_response.secondary_clicked() {
+                                        runtime.active_terminal = Some(idx);
+                                        clicked_on_pane = true;
+                                        // Allow egui to forward `Event::Text` into the PTY.
+                                    }
+                                    if near_br_corner || resize_br.hovered() || resize_br.dragged()
+                                    {
+                                        paint_br_resize_line(
+                                            ui.painter(),
+                                            br_grip_rect,
+                                            resize_br.hovered() || resize_br.dragged(),
+                                            p,
+                                        );
+                                    }
+
+                                    if show_layout_metrics {
+                                        let pos = pane.position.unwrap_or(Pos2::ZERO);
+                                        let dims = pane_neighbor_dimensions(
+                                            pos,
+                                            pane.desired_size,
+                                            left_group.iter().chain(right_group.iter()),
+                                            canvas_width,
+                                            content_height,
+                                        );
+                                        let gap_snap = gap_rect_snapshot_three_way(
+                                            left_group,
+                                            pane,
+                                            right_group,
+                                        );
+                                        let (used_h, used_v) =
+                                            collect_pair_gaps_from_rect_snapshot(&gap_snap, idx);
+                                        paint_terminal_neighbor_gap_guides(
+                                            ui.painter(),
+                                            content_origin,
+                                            &dims,
+                                            &used_h,
+                                            &used_v,
+                                        );
+                                        let grid = pane.session.parser.grid();
+                                        let pty_w = pane.desired_size.x;
+                                        let pty_h = (pane.desired_size.y - TERMINAL_GRID_CHROME_Y)
+                                            .max(120.0);
+                                        let (pad_x, pad_y) = terminal_cell_slack_px(
+                                            pty_w, pty_h, grid.cols, grid.rows,
+                                        );
+                                        let fill = Color32::from_rgba_unmultiplied(0, 0, 0, 200);
+                                        paint_pane_layout_metrics_overlay(
+                                            ui.painter(),
+                                            pane_rect,
+                                            pad_x,
+                                            pad_y,
+                                            p.text,
+                                            fill,
+                                        );
+                                    }
+                                }
+
+                                if scroll_bg.clicked() {
+                                    // Clear active terminal only when the click was truly outside all
+                                    // pane rectangles (border/title clicks can be ambiguous with the per-pane
+                                    // `clicked_on_pane` flag).
+                                    if let Some(pointer_pos) = scroll_bg.interact_pointer_pos() {
+                                        let local_pos = Pos2::new(
+                                            pointer_pos.x - content_origin.x,
+                                            pointer_pos.y - content_origin.y,
+                                        );
+                                        let clicked_on_terminal =
+                                            runtime.terminals.iter().any(|pane| {
+                                                let pos = pane.position.unwrap_or(Pos2::ZERO);
+                                                let rect = egui::Rect::from_min_size(
+                                                    pos,
+                                                    pane.desired_size,
+                                                );
+                                                rect.contains(local_pos)
+                                            });
+                                        if !clicked_on_terminal {
+                                            runtime.active_terminal = None;
+                                        }
+                                    } else if !clicked_on_pane {
                                         runtime.active_terminal = None;
                                     }
-                                } else if !clicked_on_pane {
-                                    runtime.active_terminal = None;
                                 }
                             }
 
                             if let Some(idx) = close_idx {
-                                let was_active = runtime.active_terminal == Some(idx);
-                                let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
-                                runtime.terminals.remove(idx);
-                                runtime.selections.remove(idx);
-                                if runtime
-                                    .equal_size_source_terminal_id
-                                    .is_some_and(|id| Some(id) == removed_id)
-                                {
-                                    runtime.equal_size_source_terminal_id =
-                                        runtime.terminals.first().map(|pane| pane.id);
+                                if let Some(runtime) = self.active_workspace_runtime_mut() {
+                                    let was_active = runtime.active_terminal == Some(idx);
+                                    let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
+                                    runtime.terminals.remove(idx);
+                                    runtime.selections.remove(idx);
+                                    if runtime
+                                        .equal_size_source_terminal_id
+                                        .is_some_and(|id| Some(id) == removed_id)
+                                    {
+                                        runtime.equal_size_source_terminal_id =
+                                            runtime.terminals.first().map(|pane| pane.id);
+                                    }
+                                    runtime.active_terminal = if runtime.terminals.is_empty() {
+                                        None
+                                    } else if was_active {
+                                        None
+                                    } else {
+                                        runtime.active_terminal.and_then(|a| {
+                                            if a > idx {
+                                                Some(a - 1)
+                                            } else {
+                                                Some(a)
+                                            }
+                                        })
+                                    };
                                 }
-                                runtime.active_terminal = if runtime.terminals.is_empty() {
-                                    None
-                                } else if was_active {
-                                    None
-                                } else {
-                                    runtime.active_terminal.and_then(|a| {
-                                        if a > idx {
-                                            Some(a - 1)
-                                        } else {
-                                            Some(a)
-                                        }
-                                    })
-                                };
+                                save_workspace_state(self);
                             }
                         });
                 });
         });
+
+        const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
+        let now = Instant::now();
+        if now >= self.workspace_autosave_deadline {
+            save_workspace_state(self);
+            self.workspace_autosave_deadline = now + WORKSPACE_AUTOSAVE_INTERVAL;
+        }
 
         self.draw_equal_size_picker(ctx, p);
         self.cleanup_stale_color_picker();
@@ -2404,11 +2583,19 @@ impl TermiteUi {
 
         if termite_only {
             let Some(pid) = get_current_pid().ok() else {
-                ui.label(RichText::new("Termite process unavailable").size(11.0).color(p.muted));
+                ui.label(
+                    RichText::new("Termite process unavailable")
+                        .size(11.0)
+                        .color(p.muted),
+                );
                 return;
             };
             let Some(proc_) = self.system.process(pid) else {
-                ui.label(RichText::new("Termite process unavailable").size(11.0).color(p.muted));
+                ui.label(
+                    RichText::new("Termite process unavailable")
+                        .size(11.0)
+                        .color(p.muted),
+                );
                 return;
             };
 
@@ -2481,7 +2668,26 @@ impl TermiteUi {
         }
     }
 
-    fn add_terminal(&mut self, spawn_pos: Option<Pos2>, anchor_terminal: Option<usize>) {
+    fn add_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        spawn_pos: Option<Pos2>,
+        anchor_terminal: Option<usize>,
+    ) -> bool {
+        let working_dir = self
+            .workspaces
+            .get(self.selected_workspace)
+            .map(|w| w.working_dir.as_str())
+            .unwrap_or("");
+        if let Some(block) = workspace_terminal_cwd_block(working_dir) {
+            self.workspace_terminal_spawn_notice =
+                Some(workspace_spawn_notice_from_block(working_dir, block));
+            self.workspace_terminal_spawn_notice_until =
+                Some(Instant::now() + Duration::from_secs(8));
+            ctx.request_repaint_after(Duration::from_secs(8));
+            return false;
+        }
+
         self.ensure_workspace_runtime_slots();
         let layout = self.active_panel_layout();
         let selected_workspace = self.selected_workspace;
@@ -2511,7 +2717,7 @@ impl TermiteUi {
 
         {
             let Some(runtime) = self.active_workspace_runtime_mut() else {
-                return;
+                return false;
             };
             let next_title_index =
                 next_available_terminal_number(&runtime.terminals, workspace_number);
@@ -2546,12 +2752,8 @@ impl TermiteUi {
                     layout,
                 );
                 let default_h = pane.desired_size.y;
-                let first_top = min_y_topmost_in_column(
-                    &runtime.terminals,
-                    viewport_w,
-                    col,
-                    layout,
-                );
+                let first_top =
+                    min_y_topmost_in_column(&runtime.terminals, viewport_w, col, layout);
                 let cap = match first_top {
                     Some(y) if y > STACK_GAP_Y => y - STACK_GAP_Y,
                     Some(_) => content_bounds,
@@ -2582,11 +2784,8 @@ impl TermiteUi {
             } else if let Some(anchor_idx) = fallback_anchor {
                 if let Some(anchor) = runtime.terminals.get(anchor_idx) {
                     let pos = anchor.position.unwrap_or(Pos2::ZERO);
-                    let col = pick_column_at_x(
-                        pos.x + anchor.desired_size.x * 0.5,
-                        viewport_w,
-                        layout,
-                    );
+                    let col =
+                        pick_column_at_x(pos.x + anchor.desired_size.x * 0.5, viewport_w, layout);
                     let preferred_y =
                         (pos.y + 24.0).min((area_for_placement.y - pane.desired_size.y).max(0.0));
                     find_non_overlapping_position_in_column(
@@ -2628,6 +2827,17 @@ impl TermiteUi {
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
         self.next_terminal_id = next_terminal_id + 1;
+        save_workspace_state(self);
+        true
+    }
+
+    fn tick_workspace_terminal_spawn_notice(&mut self) {
+        if let Some(until) = self.workspace_terminal_spawn_notice_until {
+            if Instant::now() >= until {
+                self.workspace_terminal_spawn_notice = None;
+                self.workspace_terminal_spawn_notice_until = None;
+            }
+        }
     }
 
     fn drain_terminals(&mut self) {
@@ -2640,20 +2850,18 @@ impl TermiteUi {
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
         self.ensure_workspace_runtime_slots();
-        let cwd_ok = workspace_dir_exists_for_terminals(&effective_workspace_working_dir_path(self));
         let Some(runtime) = self.active_workspace_runtime_mut() else {
             return;
         };
-        if !cwd_ok {
-            return;
-        }
         if runtime.selections.len() < runtime.terminals.len() {
             runtime.selections.resize(runtime.terminals.len(), None);
         } else if runtime.selections.len() > runtime.terminals.len() {
             runtime.selections.truncate(runtime.terminals.len());
         }
         if runtime.line_editors.len() < runtime.terminals.len() {
-            runtime.line_editors.resize_with(runtime.terminals.len(), LineEditor::new);
+            runtime
+                .line_editors
+                .resize_with(runtime.terminals.len(), LineEditor::new);
         } else if runtime.line_editors.len() > runtime.terminals.len() {
             runtime.line_editors.truncate(runtime.terminals.len());
         }
@@ -2677,7 +2885,9 @@ impl TermiteUi {
                     }
                     if !text.is_empty() {
                         runtime.line_editors[active_idx].push_text(&text);
-                        runtime.terminals[active_idx].backend.write_all(text.as_bytes());
+                        runtime.terminals[active_idx]
+                            .backend
+                            .write_all(text.as_bytes());
                     }
                 }
                 egui::Event::Paste(text) => {
@@ -2751,8 +2961,7 @@ impl TermiteUi {
                         if let Some(range) =
                             runtime.selections.get(active_idx).copied().unwrap_or(None)
                         {
-                            let grid =
-                                runtime.terminals[active_idx].session.parser.grid();
+                            let grid = runtime.terminals[active_idx].session.parser.grid();
                             let text = clipboard::selection_to_ansi_sgr_text(grid, range);
                             if let Err(_e) = clipboard::set_clipboard_text(&text) {}
                         }
@@ -2783,16 +2992,16 @@ impl TermiteUi {
                     // are tracked accurately; reset only when the line context is lost.
                     let ed = &mut runtime.line_editors[active_idx];
                     match key {
-                        egui::Key::ArrowLeft  => ed.move_left(),
+                        egui::Key::ArrowLeft => ed.move_left(),
                         egui::Key::ArrowRight => ed.move_right(),
-                        egui::Key::Home       => ed.move_to_start(),
-                        egui::Key::End        => ed.move_to_end(),
+                        egui::Key::Home => ed.move_to_start(),
+                        egui::Key::End => ed.move_to_end(),
                         egui::Key::Enter
                         | egui::Key::ArrowUp
                         | egui::Key::ArrowDown
                         | egui::Key::PageUp
                         | egui::Key::PageDown
-                        | egui::Key::Escape   => ed.reset(),
+                        | egui::Key::Escape => ed.reset(),
                         _ if ctrl && key == egui::Key::C => ed.reset(),
                         _ if ctrl && key == egui::Key::U => ed.reset(),
                         _ if ctrl && key == egui::Key::W => ed.reset(),
@@ -2801,9 +3010,7 @@ impl TermiteUi {
                         _ => {}
                     }
 
-                    if let Some(bytes) =
-                        key_to_ansi_bytes(key, shift, modifiers.ctrl)
-                    {
+                    if let Some(bytes) = key_to_ansi_bytes(key, shift, modifiers.ctrl) {
                         runtime.terminals[active_idx].backend.write_all(&bytes);
                     }
                 }
@@ -2812,18 +3019,25 @@ impl TermiteUi {
         }
 
         if shortcut_new_terminal {
-            self.add_terminal(None, None);
+            let _ = self.add_terminal(ctx, None, None);
         }
     }
 
-    fn launch_cli_tool(&mut self, target_terminal: Option<usize>, command: &str) {
+    fn launch_cli_tool(
+        &mut self,
+        ctx: &egui::Context,
+        target_terminal: Option<usize>,
+        command: &str,
+    ) {
         let pending_target = self.pending_context_terminal.take();
         self.ensure_workspace_runtime_slots();
         if self
             .active_workspace_runtime()
             .is_some_and(|runtime| runtime.terminals.is_empty())
         {
-            self.add_terminal(None, None);
+            if !self.add_terminal(ctx, None, None) {
+                return;
+            }
         }
 
         let Some(runtime) = self.active_workspace_runtime_mut() else {
@@ -2843,7 +3057,6 @@ impl TermiteUi {
             .backend
             .write_all(format!("{command}\n").as_bytes());
     }
-
 }
 
 fn is_cli_command_available(command: &str) -> bool {
@@ -2933,7 +3146,8 @@ fn spawn_terminal_pane(
         if let Ok(mut reader) = stream.try_clone() {
             // Attach payload is built in `daemon::attach_request_payload` (key, rows/cols, optional cwd).
             let cwd = (!cwd_resolved.is_empty()).then_some(cwd_resolved.as_str());
-            if let Some(payload) = crate::daemon::attach_request_payload(tmux_session, 24, 80, cwd) {
+            if let Some(payload) = crate::daemon::attach_request_payload(tmux_session, 24, 80, cwd)
+            {
                 if write_frame_tcp(&mut stream, FRAME_ATTACH, &payload).is_ok() {
                     if let Ok((ft, first_payload)) = read_frame_tcp(&mut reader) {
                         if ft == FRAME_OUTPUT {
@@ -2942,16 +3156,14 @@ fn spawn_terminal_pane(
                             let writer = Arc::new(Mutex::new(stream));
                             let tx_thread = tx;
 
-                            std::thread::spawn(move || {
-                                loop {
-                                    let Ok((ft, payload)) = read_frame_tcp(&mut reader) else {
-                                        break;
-                                    };
-                                    if ft == FRAME_OUTPUT {
-                                        let _ = tx_thread.send(payload);
-                                    } else if ft == FRAME_ATTACH_ERROR {
-                                        break;
-                                    }
+                            std::thread::spawn(move || loop {
+                                let Ok((ft, payload)) = read_frame_tcp(&mut reader) else {
+                                    break;
+                                };
+                                if ft == FRAME_OUTPUT {
+                                    let _ = tx_thread.send(payload);
+                                } else if ft == FRAME_ATTACH_ERROR {
+                                    break;
                                 }
                             });
 
@@ -3048,12 +3260,8 @@ fn pane_neighbor_dimensions<'a>(
     let x1 = pos.x + size.x;
     let y1 = pos.y + size.y;
 
-    let horiz_overlap = |oy0: f32, oy1: f32| -> bool {
-        (y1.min(oy1) - y0.max(oy0)).max(0.0) > 0.0
-    };
-    let vert_overlap = |ox0: f32, ox1: f32| -> bool {
-        (x1.min(ox1) - x0.max(ox0)).max(0.0) > 0.0
-    };
+    let horiz_overlap = |oy0: f32, oy1: f32| -> bool { (y1.min(oy1) - y0.max(oy0)).max(0.0) > 0.0 };
+    let vert_overlap = |ox0: f32, ox1: f32| -> bool { (x1.min(ox1) - x0.max(ox0)).max(0.0) > 0.0 };
 
     let mut best_left: Option<(f32, f32)> = None; // (neighbor_right_x, y_mid)
     let mut best_right: Option<(f32, f32)> = None; // (neighbor_left_x, y_mid)
@@ -3194,7 +3402,8 @@ fn pane_neighbor_dimensions<'a>(
 
 fn gap_matches_used(px: f32, used: &[f32]) -> bool {
     let p = px.round();
-    used.iter().any(|&u| (p - u.round()).abs() <= USED_GAP_MATCH_EPS)
+    used.iter()
+        .any(|&u| (p - u.round()).abs() <= USED_GAP_MATCH_EPS)
 }
 
 fn gap_rect_snapshot_three_way(
@@ -3205,14 +3414,10 @@ fn gap_rect_snapshot_three_way(
     let mut gap_snap: Vec<Option<(f32, f32, f32, f32)>> =
         Vec::with_capacity(left_group.len() + 1 + right_group.len());
     for p in left_group.iter() {
-        gap_snap.push(p.position.map(|op| {
-            (
-                op.x,
-                op.y,
-                op.x + p.desired_size.x,
-                op.y + p.desired_size.y,
-            )
-        }));
+        gap_snap.push(
+            p.position
+                .map(|op| (op.x, op.y, op.x + p.desired_size.x, op.y + p.desired_size.y)),
+        );
     }
     gap_snap.push(mid.position.map(|op| {
         (
@@ -3223,14 +3428,10 @@ fn gap_rect_snapshot_three_way(
         )
     }));
     for p in right_group.iter() {
-        gap_snap.push(p.position.map(|op| {
-            (
-                op.x,
-                op.y,
-                op.x + p.desired_size.x,
-                op.y + p.desired_size.y,
-            )
-        }));
+        gap_snap.push(
+            p.position
+                .map(|op| (op.x, op.y, op.x + p.desired_size.x, op.y + p.desired_size.y)),
+        );
     }
     gap_snap
 }
@@ -3398,8 +3599,7 @@ fn snap_resize_rect_to_used_neighbor_gaps<'a>(
             }
         }
         if snap_top {
-            if let Some(u) =
-                closest_used_gap_target(dims.top.px, &used_all, USED_GAP_SNAP_DISTANCE)
+            if let Some(u) = closest_used_gap_target(dims.top.px, &used_all, USED_GAP_SNAP_DISTANCE)
             {
                 let yb = dims.top.a.y;
                 *new_y = (yb + u).clamp(0.0, (init_bottom - TERMINAL_MIN_HEIGHT).max(0.0));
@@ -3511,11 +3711,7 @@ fn paint_gap_dimension_guide(
         Color32::from_rgba_unmultiplied(95, 65, 125, 228)
     };
     painter.rect_filled(bubble_rect, 4.0, fill);
-    painter.galley(
-        bubble_rect.min + Vec2::splat(pad),
-        galley,
-        text_color,
-    );
+    painter.galley(bubble_rect.min + Vec2::splat(pad), galley, text_color);
 }
 
 fn paint_terminal_neighbor_gap_guides(
@@ -3527,12 +3723,7 @@ fn paint_terminal_neighbor_gap_guides(
 ) {
     let used_all = merged_used_gap_targets(used_h, used_v);
     const MAX_SPAN: f32 = 900.0;
-    for dim in [
-        dims.left,
-        dims.right,
-        dims.top,
-        dims.bottom,
-    ] {
+    for dim in [dims.left, dims.right, dims.top, dims.bottom] {
         if dim.px > MAX_SPAN {
             continue;
         }
@@ -3541,7 +3732,12 @@ fn paint_terminal_neighbor_gap_guides(
 }
 
 /// Leftover pixels after fitting an integer cell grid at [`CELL_W`] × [`CELL_H`].
-fn terminal_cell_slack_px(pty_w: f32, pty_h: f32, grid_cols: usize, grid_rows: usize) -> (f32, f32) {
+fn terminal_cell_slack_px(
+    pty_w: f32,
+    pty_h: f32,
+    grid_cols: usize,
+    grid_rows: usize,
+) -> (f32, f32) {
     let pad_x = pty_w - grid_cols as f32 * CELL_W;
     let pad_y = pty_h - grid_rows as f32 * CELL_H;
     (pad_x.max(0.0), pad_y.max(0.0))
@@ -3713,8 +3909,7 @@ fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
     // Styling that makes an otherwise-blank space visually non-trivial
     // (reverse swaps fg/bg, underline/strikethrough draw strokes). Trimming such
     // cells hides TUI cursors that render as `\e[7m \e[27m` on a default bg.
-    let visible_space_attrs =
-        CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
+    let visible_space_attrs = CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
 
     let mut end = grid.cols;
     while end > 0 {
@@ -3782,8 +3977,8 @@ fn render_terminal_grid(
             }
 
             let mut fmt = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
-            let is_selected = selection
-                .map_or(false, |sel| sel.contains(row, col, grid.rows, grid.cols));
+            let is_selected =
+                selection.map_or(false, |sel| sel.contains(row, col, grid.rows, grid.cols));
             if is_selected {
                 // Invert the displayed fg/bg to highlight selection.
                 let normal_fg = fmt.color;
@@ -3914,7 +4109,8 @@ fn render_terminal_grid(
                     });
                 }
             } else if response.dragged() {
-                if let (Some(pointer), Some(range)) = (response.interact_pointer_pos(), selection.as_mut())
+                if let (Some(pointer), Some(range)) =
+                    (response.interact_pointer_pos(), selection.as_mut())
                 {
                     let (row, col) = pointer_to_cell(pointer);
                     range.end_row = row;
@@ -4086,12 +4282,15 @@ fn key_to_ansi_bytes(key: egui::Key, shift: bool, ctrl: bool) -> Option<Vec<u8>>
 
         // Printable punctuation is delivered via `egui::Event::Text`.
         // Keep `Event::Key` focused on control/navigation keys to avoid double insertion.
-
         _ => None,
     }
 }
 
-fn selection_delete_bytes(grid: &TerminalGrid, mut range: SelectionRange, key: egui::Key) -> Vec<u8> {
+fn selection_delete_bytes(
+    grid: &TerminalGrid,
+    mut range: SelectionRange,
+    key: egui::Key,
+) -> Vec<u8> {
     if !range.active || grid.rows == 0 || grid.cols == 0 {
         return key_to_ansi_bytes(key, false, false).unwrap_or_default();
     }
@@ -4154,7 +4353,6 @@ fn selection_delete_bytes(grid: &TerminalGrid, mut range: SelectionRange, key: e
 
     key_to_ansi_bytes(key, false, false).unwrap_or_default()
 }
-
 
 fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
     let mut changed = false;
@@ -4325,14 +4523,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
         ui.add_space(slack);
         // Close on outside click only so DragValue / text fields inside the menu stay usable.
         let _ = egui::containers::menu::MenuButton::from_button(egui::Button::new(
-            RichText::new("⚙")
-                .size(16.0)
-                .family(FontFamily::Monospace),
+            RichText::new("⚙").size(16.0).family(FontFamily::Monospace),
         ))
         .config(
-            egui::containers::menu::MenuConfig::new().close_behavior(
-                egui::containers::PopupCloseBehavior::CloseOnClickOutside,
-            ),
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::containers::PopupCloseBehavior::CloseOnClickOutside),
         )
         .ui(ui, |ui| {
             settings_menu(ui, app, &mut changed);
@@ -4549,146 +4744,6 @@ fn workspace_tab_context_menu(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AlertSeverity {
-    Warning,
-    Error,
-}
-
-fn alert_strip_colors(severity: AlertSeverity, theme: UiTheme) -> (Color32, Color32, Color32) {
-    match (severity, theme) {
-        (AlertSeverity::Warning, UiTheme::Dark) => (
-            Color32::from_rgb(52, 45, 28),
-            Color32::from_rgb(200, 160, 80),
-            Color32::from_rgb(255, 224, 170),
-        ),
-        (AlertSeverity::Warning, UiTheme::Light) => (
-            Color32::from_rgb(255, 248, 220),
-            Color32::from_rgb(210, 170, 90),
-            Color32::from_rgb(90, 70, 30),
-        ),
-        (AlertSeverity::Error, UiTheme::Dark) => (
-            Color32::from_rgb(52, 28, 28),
-            Color32::from_rgb(200, 90, 90),
-            Color32::from_rgb(255, 190, 190),
-        ),
-        (AlertSeverity::Error, UiTheme::Light) => (
-            Color32::from_rgb(255, 235, 235),
-            Color32::from_rgb(200, 100, 100),
-            Color32::from_rgb(90, 35, 35),
-        ),
-    }
-}
-
-/// Max width for wrapped alert copy so the strip stays compact and can be centered under the path.
-const PATH_ALERT_LABEL_MAX_W: f32 = 280.0;
-
-/// Reusable inline alert (banner) for validation and notices.
-fn alert_message_strip(ui: &mut egui::Ui, severity: AlertSeverity, message: &str, theme: UiTheme) {
-    let (fill, stroke, text) = alert_strip_colors(severity, theme);
-    egui::Frame::default()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(4.0)
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.set_max_width(PATH_ALERT_LABEL_MAX_W);
-            ui.add(
-                egui::Label::new(RichText::new(message).size(11.0).color(text)).wrap(),
-            );
-        });
-}
-
-/// Same as [`alert_message_strip`], with a trailing control inside the same frame (e.g. “Create folder”).
-fn alert_message_strip_with_trailing_action<F: FnOnce(&mut egui::Ui)>(
-    ui: &mut egui::Ui,
-    severity: AlertSeverity,
-    message: &str,
-    theme: UiTheme,
-    trailing: F,
-) {
-    let (fill, stroke, text) = alert_strip_colors(severity, theme);
-    egui::Frame::default()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(4.0)
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_max_width(PATH_ALERT_LABEL_MAX_W);
-                    ui.add(
-                        egui::Label::new(RichText::new(message).size(11.0).color(text)).wrap(),
-                    );
-                });
-                ui.add_space(12.0);
-                trailing(ui);
-            });
-        });
-}
-
-/// When the working-directory path should surface guidance (missing, not a folder, unreadable).
-fn working_directory_path_alert(path_str: &str) -> Option<(AlertSeverity, String)> {
-    let trimmed = path_str.trim();
-    if trimmed.is_empty() {
-        return Some((
-            AlertSeverity::Warning,
-            "No folder path set. Use Browse… or type a directory path.".to_string(),
-        ));
-    }
-    let path = PathBuf::from(trimmed);
-
-    if path.is_dir() {
-        return None;
-    }
-
-    if path.exists() {
-        return Some((
-            AlertSeverity::Error,
-            "This path is not a folder (for example it is a file). Correct the path or choose Browse…."
-                .to_string(),
-        ));
-    }
-
-    // Path does not exist (or is an unreachable/broken symlink).
-    let missing_msg = "This folder does not exist yet. Create folder instead".to_string();
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => Some((
-            AlertSeverity::Error,
-            "The parent folder does not exist. Fix the path first.".to_string(),
-        )),
-        _ => Some((AlertSeverity::Warning, missing_msg)),
-    }
-}
-
-/// Same path string the header bar uses for alerts (includes in-progress edit text).
-fn effective_workspace_working_dir_path(app: &TermiteUi) -> String {
-    let selected_idx = app
-        .selected_workspace
-        .min(app.workspaces.len().saturating_sub(1));
-    let displayed_dir = app
-        .workspaces
-        .get(selected_idx)
-        .map(|w| w.working_dir.clone())
-        .unwrap_or_else(default_working_dir);
-    if app.editing_working_dir {
-        let t = app.working_dir_input.trim();
-        if t.is_empty() {
-            displayed_dir
-        } else {
-            t.to_string()
-        }
-    } else {
-        displayed_dir
-    }
-}
-
-/// Whether the effective workspace path is an existing directory (PTY cwd is valid).
-fn workspace_dir_exists_for_terminals(path_str: &str) -> bool {
-    let t = path_str.trim();
-    !t.is_empty() && Path::new(t).is_dir()
-}
-
 /// `create_dir_all` is expected to succeed (parent exists and is a directory).
 fn can_create_missing_workspace_dir(path: &Path) -> bool {
     if path.as_os_str().is_empty() || path.exists() {
@@ -4701,21 +4756,140 @@ fn can_create_missing_workspace_dir(path: &Path) -> bool {
     }
 }
 
-/// Rough width for centering slack (`horizontal_centered` does not shrink-wrap this strip).
-fn estimate_path_alert_strip_width(message: &str, with_create_button: bool) -> f32 {
-    const MONO11_EW: f32 = 6.35;
-    const CREATE_BTN_W: f32 = 118.0;
-    const TEXT_BTN_GAP: f32 = 12.0;
-    // Frame inner margin (10+10) + stroke; small cushion for font metrics.
-    const FRAME_PAD_X: f32 = 28.0;
-    let n = message.chars().count() as f32;
-    let text_w = (n * MONO11_EW).min(PATH_ALERT_LABEL_MAX_W).max(72.0);
-    let body = if with_create_button {
-        text_w + TEXT_BTN_GAP + CREATE_BTN_W
-    } else {
-        text_w
+/// Expand a leading `~` for filesystem checks and completion (matches common shell paths).
+fn expand_tilde_in_working_dir_input(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t == "~" {
+        return std::env::var("HOME").unwrap_or_default();
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        if let Ok(h) = std::env::var("HOME") {
+            let h = h.trim_end_matches('/');
+            return format!("{h}/{rest}");
+        }
+    }
+    t.to_string()
+}
+
+/// Resolve `~`, join relative paths to the process cwd, for spawn and validation (matches user intent).
+fn resolve_workspace_path_for_spawn(raw: &str) -> PathBuf {
+    let expanded = expand_tilde_in_working_dir_input(raw);
+    let t = expanded.trim();
+    if t.is_empty() {
+        return PathBuf::new();
+    }
+    let mut path = PathBuf::from(t);
+    if path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            path = cwd.join(path);
+        }
+    }
+    path
+}
+
+/// `None` when the workspace string can be used as a terminal cwd.
+fn workspace_terminal_cwd_block(raw: &str) -> Option<WorkspaceTerminalCwdBlock> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(WorkspaceTerminalCwdBlock::Empty);
+    }
+    let path = resolve_workspace_path_for_spawn(raw);
+    if path.as_os_str().is_empty() {
+        return Some(WorkspaceTerminalCwdBlock::Empty);
+    }
+    if path.is_dir() {
+        return None;
+    }
+    if path.exists() {
+        return Some(WorkspaceTerminalCwdBlock::NotADir);
+    }
+    Some(WorkspaceTerminalCwdBlock::Missing)
+}
+
+fn workspace_terminal_spawn_block_message(block: WorkspaceTerminalCwdBlock) -> &'static str {
+    match block {
+        WorkspaceTerminalCwdBlock::Empty => "Set a workspace folder path first.",
+        WorkspaceTerminalCwdBlock::NotADir => "Workspace path is not a folder.",
+        WorkspaceTerminalCwdBlock::Missing => {
+            "Workspace folder does not exist. Create it or pick another folder."
+        }
+    }
+}
+
+fn workspace_spawn_notice_from_block(
+    raw: &str,
+    block: WorkspaceTerminalCwdBlock,
+) -> WorkspaceSpawnNotice {
+    let message = workspace_terminal_spawn_block_message(block).to_string();
+    let create_target = match block {
+        WorkspaceTerminalCwdBlock::Missing => {
+            let resolved = resolve_workspace_path_for_spawn(raw);
+            can_create_missing_workspace_dir(&resolved).then_some(resolved)
+        }
+        _ => None,
     };
-    (body + FRAME_PAD_X).min(560.0)
+    WorkspaceSpawnNotice {
+        message,
+        create_target,
+    }
+}
+
+/// Directory entries under the deepest usable prefix of the typed path, filtered by the last path segment.
+fn workspace_dir_completion_candidates(raw_input: &str, max_entries: usize) -> Vec<String> {
+    let expanded = expand_tilde_in_working_dir_input(raw_input);
+    let t = expanded.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let mut path = PathBuf::from(t);
+    if path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            path = cwd.join(path);
+        } else {
+            return Vec::new();
+        }
+    }
+
+    let (scan_dir, filter): (PathBuf, &str) = if path.is_dir() {
+        (path, "")
+    } else {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        if parent.as_os_str().is_empty() || !parent.is_dir() {
+            return Vec::new();
+        }
+        let filter = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        (parent.to_path_buf(), filter)
+    };
+
+    let Ok(rd) = fs::read_dir(&scan_dir) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        if out.len() >= max_entries {
+            break;
+        }
+        let name = entry.file_name();
+        let candidate = scan_dir.join(&name);
+        // `DirEntry::file_type()` does not follow symlinks; `Path::is_dir()` does, so we only list
+        // real directories (never plain files, including symlink → file).
+        if !candidate.is_dir() {
+            continue;
+        }
+        let n_lossy = name.to_string_lossy();
+        if !filter.is_empty() && !n_lossy.starts_with(filter) {
+            continue;
+        }
+        out.push(candidate.to_string_lossy().into_owned());
+    }
+    out.sort();
+    out
 }
 
 fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
@@ -4739,20 +4913,9 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                 .get(selected_idx)
                 .map(|w| w.working_dir.clone())
                 .unwrap_or_else(default_working_dir);
-            let path_for_alert: String = if app.editing_working_dir {
-                let t = app.working_dir_input.trim();
-                if t.is_empty() {
-                    displayed_dir.clone()
-                } else {
-                    t.to_string()
-                }
-            } else {
-                displayed_dir.clone()
-            };
-            let path_alert = working_directory_path_alert(&path_for_alert);
-            let path_pb = PathBuf::from(&path_for_alert);
 
             ui.vertical(|ui| {
+                let mut working_dir_edit_response: Option<egui::Response> = None;
                 ui.horizontal(|ui| {
                     let row_h = ui.spacing().interact_size.y.max(20.0);
                     let path_field_stroke = Stroke::new(1.0, p.path_bar_border);
@@ -4790,42 +4953,39 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                         }
                     }
                     ui.add_space(6.0);
-                    let path_slot_width = ui.available_width();
-                    if app.editing_working_dir {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut app.working_dir_input)
-                                .frame(true)
-                                .background_color(path_field_fill)
-                                .horizontal_align(egui::Align::Min)
-                                .vertical_align(egui::Align::Center)
-                                .desired_width(path_slot_width.max(120.0))
-                                .min_size(egui::vec2(path_slot_width.max(120.0), row_h))
-                                .font(egui::TextStyle::Monospace),
-                        );
-                        if app.working_dir_editor_focus_next_frame {
-                            response.request_focus();
-                            app.working_dir_editor_focus_next_frame = false;
-                        }
-                        if response.changed() {
-                            let candidate = app.working_dir_input.trim();
-                            if working_dir_path_ok_to_store(Path::new(candidate)) {
-                                if let Some(w) = app.workspaces.get_mut(selected_idx) {
-                                    if w.working_dir.as_str() != candidate {
-                                        w.working_dir = candidate.to_string();
-                                        save_workspace_state(app);
+                    // Path field + completion list share this column so suggestions align with the
+                    // TextEdit (same x as typed text), not with the full bar under "Browse…".
+                    ui.vertical(|ui| {
+                        let path_slot_width = ui.available_width();
+                        if app.editing_working_dir {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut app.working_dir_input)
+                                    .frame(true)
+                                    .background_color(path_field_fill)
+                                    .horizontal_align(egui::Align::Min)
+                                    .vertical_align(egui::Align::Center)
+                                    .desired_width(path_slot_width.max(120.0))
+                                    .min_size(egui::vec2(path_slot_width.max(120.0), row_h))
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            working_dir_edit_response = Some(response.clone());
+                            if app.working_dir_editor_focus_next_frame {
+                                response.request_focus();
+                                app.working_dir_editor_focus_next_frame = false;
+                            }
+                            if response.changed() {
+                                let candidate = app.working_dir_input.trim();
+                                if working_dir_path_ok_to_store(Path::new(candidate)) {
+                                    if let Some(w) = app.workspaces.get_mut(selected_idx) {
+                                        if w.working_dir.as_str() != candidate {
+                                            w.working_dir = candidate.to_string();
+                                            save_workspace_state(app);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                        if esc_pressed || enter_pressed || response.clicked_elsewhere() {
-                            app.editing_working_dir = false;
-                            app.working_dir_editor_focus_next_frame = false;
-                            app.working_dir_input.clear();
-                        }
-                    } else {
-                        let slot_w = path_slot_width.max(0.0);
+                        } else {
+                            let slot_w = path_slot_width.max(0.0);
                         // `Button` always paints its text centered in the atom rect; use a framed label
                         // so the path stays left-aligned when not editing (same as the TextEdit).
                         let path_response = ui
@@ -4870,7 +5030,7 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                         if path_response
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .on_hover_text(
-                                "Click to edit. Saves unless the path is an existing file; missing folders are created when you open a terminal.",
+                                "Click to edit. Saves unless the path is an existing file. New terminals are blocked until this path is an existing folder; use the banner actions or path suggestions when offered.",
                             )
                             .clicked()
                         {
@@ -4882,55 +5042,112 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
                                 .map(|w| w.working_dir.clone())
                                 .unwrap_or_else(default_working_dir);
                         }
-                    }
-                });
-
-                if let Some((severity, message)) = path_alert {
-                    ui.add_space(6.0);
-                    let full_w = ui.available_width();
-                    let show_create = severity == AlertSeverity::Warning
-                        && can_create_missing_workspace_dir(&path_pb);
-                    let est_w = estimate_path_alert_strip_width(&message, show_create).min(full_w);
-                    let row_h = ui.spacing().interact_size.y.max(20.0);
-                    ui.horizontal(|ui| {
-                        // Three siblings (slack, strip, slack): default item_spacing would add two
-                        // horizontal gaps and make the row wider than `full_w`, so the placer squeezes
-                        // the trailing slack and the strip sits off-center to the left.
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let slack = ((full_w - est_w) * 0.5).max(0.0);
-                        ui.allocate_space(egui::vec2(slack, row_h));
-                        if show_create {
-                            alert_message_strip_with_trailing_action(
-                                ui,
-                                severity,
-                                &message,
-                                app.ui_theme,
-                                |ui| {
-                                    if ui
-                                        .small_button("Create folder")
-                                        .on_hover_text(
-                                            "Create this folder and all missing parents",
-                                        )
-                                        .clicked()
-                                    {
-                                        let _ = fs::create_dir_all(&path_pb);
-                                        if path_pb.is_dir() {
-                                            if let Some(w) = app.workspaces.get_mut(selected_idx)
-                                            {
-                                                w.working_dir =
-                                                    path_pb.to_string_lossy().into_owned();
-                                                save_workspace_state(app);
-                                            }
-                                        }
-                                    }
-                                },
-                            );
-                        } else {
-                            alert_message_strip(ui, severity, &message, app.ui_theme);
                         }
-                        ui.allocate_space(egui::vec2(slack, row_h));
+
+                        if app.editing_working_dir {
+                            if let Some(base_resp) = working_dir_edit_response.clone() {
+                                let suggestions = workspace_dir_completion_candidates(
+                                    &app.working_dir_input,
+                                    60,
+                                );
+                                let expanded =
+                                    expand_tilde_in_working_dir_input(&app.working_dir_input);
+                                let pb_for_create = PathBuf::from(expanded.trim());
+                                let show_create_row =
+                                    can_create_missing_workspace_dir(&pb_for_create);
+
+                                let mut dismiss = base_resp;
+                                if !suggestions.is_empty() || show_create_row {
+                                    ui.add_space(4.0);
+                                    let frame_out = egui::Frame::default()
+                                        .fill(p.term_bg)
+                                        .stroke(Stroke::new(1.0, p.path_bar_border))
+                                        .corner_radius(3.0)
+                                        // Match TextEdit frame inset so list text lines up with field text.
+                                        .inner_margin(Margin::symmetric(4, 4))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(ui.available_width());
+                                            egui::ScrollArea::vertical()
+                                                .max_height(180.0)
+                                                .id_salt(ui.id().with("cwd_path_complete_scroll"))
+                                                .auto_shrink([true, true])
+                                                .show(ui, |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                                    for s in &suggestions {
+                                                        if ui
+                                                            .add(egui::Button::selectable(
+                                                                false,
+                                                                RichText::new(s)
+                                                                    .size(11.0)
+                                                                    .family(FontFamily::Monospace)
+                                                                    .color(p.text),
+                                                            )
+                                                            .frame(false))
+                                                            .clicked()
+                                                        {
+                                                            app.working_dir_input = s.clone();
+                                                            let candidate = app.working_dir_input.trim();
+                                                            if working_dir_path_ok_to_store(
+                                                                Path::new(candidate),
+                                                            ) {
+                                                                if let Some(w) = app
+                                                                    .workspaces
+                                                                    .get_mut(selected_idx)
+                                                                {
+                                                                    if w.working_dir.as_str()
+                                                                        != candidate
+                                                                    {
+                                                                        w.working_dir =
+                                                                            candidate.to_string();
+                                                                        save_workspace_state(app);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    if show_create_row {
+                                                        ui.add_space(4.0);
+                                                        ui.separator();
+                                                        if ui
+                                                            .small_button("Create this folder…")
+                                                            .on_hover_text(
+                                                                "Create this folder and all missing parents",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            let _ = fs::create_dir_all(&pb_for_create);
+                                                            if pb_for_create.is_dir() {
+                                                                if let Some(w) = app
+                                                                    .workspaces
+                                                                    .get_mut(selected_idx)
+                                                                {
+                                                                    w.working_dir = pb_for_create
+                                                                        .to_string_lossy()
+                                                                        .into_owned();
+                                                                    save_workspace_state(app);
+                                                                }
+                                                                app.working_dir_input.clear();
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                        });
+                                    dismiss = dismiss.union(frame_out.response);
+                                }
+
+                                let enter_pressed =
+                                    ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let esc_pressed =
+                                    ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if esc_pressed || enter_pressed || dismiss.clicked_elsewhere() {
+                                    app.editing_working_dir = false;
+                                    app.working_dir_editor_focus_next_frame = false;
+                                    app.working_dir_input.clear();
+                                }
+                            }
+                        }
                     });
-                }
+                });
             });
         });
 }
@@ -4944,7 +5161,8 @@ fn workspace_state_path() -> PathBuf {
     PathBuf::from(".termite-ui-workspaces.json")
 }
 
-fn save_workspace_state(app: &TermiteUi) {
+fn save_workspace_state(app: &mut TermiteUi) {
+    app.ensure_workspace_runtime_slots();
     let state = WorkspaceState {
         ui_theme: app.ui_theme,
         ui_style: app.ui_style,
@@ -5001,19 +5219,70 @@ fn save_workspace_state(app: &TermiteUi) {
 
     let path = workspace_state_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(
+                error = %e,
+                dir = %parent.display(),
+                "failed to create workspace state directory"
+            );
+            return;
+        }
     }
 
-    if let Ok(json) = serde_json::to_string_pretty(&state) {
-        let _ = fs::write(path, json);
+    let json = match serde_json::to_string_pretty(&state) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize workspace state");
+            return;
+        }
+    };
+
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp, &json) {
+        tracing::warn!(
+            error = %e,
+            path = %tmp.display(),
+            "failed to write workspace state temp file"
+        );
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        tracing::warn!(
+            error = %e,
+            from = %tmp.display(),
+            to = %path.display(),
+            "failed to finalize workspace state file"
+        );
     }
 }
 
 fn load_workspace_state() -> Option<WorkspaceState> {
     let path = workspace_state_path();
-    let json = fs::read_to_string(path).ok()?;
-    let state: WorkspaceState = serde_json::from_str(&json).ok()?;
+    let json = match fs::read_to_string(&path) {
+        Ok(j) => j,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to read workspace state file"
+            );
+            return None;
+        }
+    };
+    let state: WorkspaceState = match serde_json::from_str(&json) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to parse workspace state JSON"
+            );
+            return None;
+        }
+    };
     if state.workspaces.is_empty() {
+        tracing::warn!("workspace state contained no workspaces; ignoring");
         return None;
     }
     Some(state)
@@ -5227,9 +5496,7 @@ impl TermiteUi {
             .active_terminal
             .and_then(|idx| runtime.terminals.get(idx).map(|pane| pane.id))
             .or_else(|| runtime.terminals.first().map(|pane| pane.id));
-        let current = runtime
-            .equal_size_source_terminal_id
-            .or(fallback);
+        let current = runtime.equal_size_source_terminal_id.or(fallback);
         self.equal_size_picker_selection = current;
         self.equal_size_picker_open = current.is_some();
         if let Some(id) = current {
@@ -5519,7 +5786,8 @@ fn find_spawn_column_no_overlap(
             let y_candidates = if k == 0 {
                 [Some(start_y), None]
             } else {
-                let down = (start_y + delta <= max_y + 0.01).then_some((start_y + delta).clamp(0.0, max_y));
+                let down = (start_y + delta <= max_y + 0.01)
+                    .then_some((start_y + delta).clamp(0.0, max_y));
                 let up = (start_y >= delta).then_some((start_y - delta).clamp(0.0, max_y));
                 [down, up]
             };
@@ -5571,7 +5839,8 @@ fn find_spawn_column_no_overlap(
     // this column (growing workspace height as needed).
     let bottom = max_y_bottom_in_column(terminals, lw, column, layout).unwrap_or(0.0);
     let y = (bottom + STACK_GAP_Y).max(0.0);
-    let left = intrusion_left_right_aligned(terminals, stripe_left, stripe_right, y, h, GRID_SPACING);
+    let left =
+        intrusion_left_right_aligned(terminals, stripe_left, stripe_right, y, h, GRID_SPACING);
     let w = (stripe_right - left).max(min_spawn_w).min(slot_w);
     (Pos2::new(left, y), Vec2::new(w, h))
 }
@@ -5587,8 +5856,7 @@ fn reflow_panes_to_column_starts(
     }
     let (_, _, n_cols) = column_slot_geometry(available_width, layout);
     let n_cols = n_cols.max(1);
-    let slot = column_stripe_width(available_width, layout)
-        .clamp(1.0, available_width.max(1.0));
+    let slot = column_stripe_width(available_width, layout).clamp(1.0, available_width.max(1.0));
     let max_x = (available_width - slot).max(0.0);
 
     let mut idxs: Vec<usize> = (0..terminals.len()).collect();
@@ -5597,9 +5865,7 @@ fn reflow_panes_to_column_starts(
         let pb = terminals[b].position.unwrap_or_default();
         let ca = pick_column_at_x(pa.x + slot * 0.25, available_width, layout);
         let cb = pick_column_at_x(pb.x + slot * 0.25, available_width, layout);
-        ca.cmp(&cb)
-            .then(pa.y.total_cmp(&pb.y))
-            .then(a.cmp(&b))
+        ca.cmp(&cb).then(pa.y.total_cmp(&pb.y)).then(a.cmp(&b))
     });
 
     let mut floor_y = vec![0.0_f32; n_cols];
@@ -5639,8 +5905,8 @@ fn reflow_panes_uniform_equal(
     let (_, _, n_cols) = column_slot_geometry(available_width, layout);
     let cols = n_cols.max(1);
     let rows = (n + cols - 1) / cols;
-    let grid_cell_w = column_stripe_width(available_width, layout)
-        .clamp(1.0, available_width.max(1.0));
+    let grid_cell_w =
+        column_stripe_width(available_width, layout).clamp(1.0, available_width.max(1.0));
     let gap_y = STACK_GAP_Y;
     let gap_total = (rows.saturating_sub(1)) as f32 * gap_y;
     let grid_cell_h = ((body_height - gap_total) / rows as f32).max(TERMINAL_MIN_HEIGHT);
@@ -5745,8 +6011,7 @@ fn pick_spawn_column_preferring_empty_slot(
     let preferred = pick_column_at_x(cursor_x, area_width, layout);
     let preferred_overlapped =
         column_slot_has_pane_overlap(terminals, area_width, preferred, layout);
-    let preferred_has_native =
-        column_has_native_pane(terminals, area_width, preferred, layout);
+    let preferred_has_native = column_has_native_pane(terminals, area_width, preferred, layout);
     if !preferred_overlapped || preferred_has_native {
         return preferred;
     }
@@ -5937,7 +6202,7 @@ fn default_working_dir() -> String {
 }
 
 /// Reject only paths that already exist and are not directories (e.g. files).
-/// Missing paths are allowed so the user can type a new folder; see [`ensure_working_dir_for_spawn`].
+/// Missing paths are allowed so the user can type a new folder before creating it explicitly.
 fn working_dir_path_ok_to_store(path: &Path) -> bool {
     if path.as_os_str().is_empty() {
         return false;
@@ -5948,17 +6213,14 @@ fn working_dir_path_ok_to_store(path: &Path) -> bool {
     }
 }
 
-/// Returns a directory suitable for `spawn_pty` cwd: creates missing directories when possible.
+/// Returns a directory suitable for `spawn_pty` cwd when the workspace path is an existing folder.
+/// Does not create missing directories (use the path editor's create action).
 fn ensure_working_dir_for_spawn(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return default_working_dir();
     }
-    let path = PathBuf::from(trimmed);
-    if path.is_dir() {
-        return path.to_string_lossy().into_owned();
-    }
-    let _ = fs::create_dir_all(&path);
+    let path = resolve_workspace_path_for_spawn(raw);
     if path.is_dir() {
         path.to_string_lossy().into_owned()
     } else {

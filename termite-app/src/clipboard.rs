@@ -1,7 +1,7 @@
 use arboard::Clipboard;
+use std::process::{Command, Stdio};
 use termite_render::SelectionRange;
 use termite_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
-use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SgrProps {
@@ -108,7 +108,11 @@ pub fn selection_to_ansi_sgr_text(grid: &TerminalGrid, range: SelectionRange) ->
 
     for row in sr..=er {
         let from_col = if row == sr { sc } else { 0 };
-        let to_col = if row == er { ec } else { grid.cols.saturating_sub(1) };
+        let to_col = if row == er {
+            ec
+        } else {
+            grid.cols.saturating_sub(1)
+        };
 
         for col in from_col..=to_col {
             let cell = grid.cell(row, col);
@@ -220,4 +224,3 @@ pub fn get_clipboard_text() -> Result<String, anyhow::Error> {
         anyhow::bail!("clipboard read failed (arboard unavailable and no pbpaste fallback)");
     }
 }
-
