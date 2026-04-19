@@ -697,6 +697,16 @@ struct WorkspaceSpawnNotice {
     create_target: Option<PathBuf>,
 }
 
+struct TabDragState {
+    source_idx: usize,
+    /// Pointer x minus tab left-edge x at the moment drag started.
+    grab_offset_x: f32,
+    /// Current left-edge x of the ghost tab (follows the pointer).
+    ghost_x: f32,
+    /// Index into the "others" array (tabs excluding source) where the tab would be inserted.
+    insert_before: usize,
+}
+
 struct TermiteUi {
     ui_theme: UiTheme,
     ui_style: UiStyle,
@@ -743,6 +753,8 @@ struct TermiteUi {
     equal_size_template_blink_started_at: Option<Instant>,
     /// Flush workspace JSON periodically so abrupt quits still persist open terminals.
     workspace_autosave_deadline: Instant,
+    /// Active tab drag state; `None` when no drag is in progress.
+    tab_drag: Option<TabDragState>,
 }
 
 #[derive(Default)]
@@ -885,6 +897,7 @@ impl Default for TermiteUi {
                 equal_size_template_blink_terminal_id: None,
                 equal_size_template_blink_started_at: None,
                 workspace_autosave_deadline: Instant::now(),
+                tab_drag: None,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1017,6 +1030,7 @@ impl Default for TermiteUi {
             equal_size_template_blink_terminal_id: None,
             equal_size_template_blink_started_at: None,
             workspace_autosave_deadline: Instant::now(),
+            tab_drag: None,
         }
     }
 }
@@ -4357,171 +4371,379 @@ fn selection_delete_bytes(
 fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
     let mut changed = false;
     let mut close_idx: Option<usize> = None;
+
+    let n_tabs = app.workspaces.len();
+    let tab_h = 28.0_f32;
+    let inner_x = 6.0_f32;
+    let close_w = 14.0_f32;
+
+    // Estimate each tab's display width from title character count.
+    // Monospace 12pt ≈ 7.2 logical px/char; the ">_  " prefix adds 4 chars.
+    let tab_widths: Vec<f32> = (0..n_tabs)
+        .map(|i| {
+            let char_count = app.workspaces[i].title.chars().count() + 4;
+            let label_w = (char_count as f32 * 7.2_f32).max(88.0);
+            let badge_extra = if app.workspaces[i].badge.is_some() { 18.0 } else { 0.0 };
+            (inner_x * 2.0 + label_w + badge_extra + 4.0 + close_w + 2.0).ceil()
+        })
+        .collect();
+    let total_tab_w: f32 = tab_widths.iter().sum();
+
+    // Determine where each tab wants to be in the "after-drop" layout so that
+    // non-dragged tabs can smoothly slide to make room.
+    let src_idx = app.tab_drag.as_ref().map(|d| d.source_idx);
+    let ins_before = app.tab_drag.as_ref().map(|d| d.insert_before).unwrap_or(n_tabs);
+
+    let target_xs: Vec<f32> = {
+        let src = src_idx.unwrap_or(usize::MAX);
+        let others: Vec<usize> = (0..n_tabs).filter(|&i| i != src).collect();
+        let ib = ins_before.min(others.len());
+        let mut order = others;
+        if src < n_tabs {
+            order.insert(ib, src);
+        }
+        let mut xs = vec![0.0_f32; n_tabs];
+        let mut x = 0.0_f32;
+        for &i in &order {
+            xs[i] = x;
+            x += tab_widths[i];
+        }
+        xs
+    };
+
+    // Smoothly interpolate each tab toward its target x.
+    let current_xs: Vec<f32> = (0..n_tabs)
+        .map(|i| {
+            ui.ctx().animate_value_with_time(
+                egui::Id::new("ttab_x").with(i),
+                target_xs[i],
+                0.15,
+            )
+        })
+        .collect();
+
     ui.horizontal(|ui| {
-        ui.horizontal(|ui| {
-            for idx in 0..app.workspaces.len() {
-                let active = idx == app.selected_workspace;
-                let fill = app.workspace_tab_fill_color(idx, active, p);
-                let title = app.workspaces[idx].title.clone();
-                let badge = app.workspaces[idx].badge;
-                let text_color = if active { p.tab_label_active } else { p.muted };
+        // Reserve the full tab strip as one block so the + / ⚙ buttons stay to the right.
+        let (strip, _) =
+            ui.allocate_exact_size(Vec2::new(total_tab_w, tab_h), Sense::hover());
+        let rx = strip.min.x;
+        let ry = strip.min.y;
 
-                let _tab_frame = egui::Frame::default()
-                    .fill(fill)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .inner_margin(Margin::symmetric(6, 3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let tab_btn = egui::Button::new(
-                                RichText::new(format!(">_  {}", title))
-                                    .size(12.0)
-                                    .family(FontFamily::Monospace)
-                                    .color(text_color),
-                            )
-                            .frame(false)
-                            .min_size(Vec2::new(88.0, 20.0));
-                            let is_editing = app.editing_workspace_idx == Some(idx);
-                            if is_editing {
-                                ui.label(
-                                    RichText::new(">_")
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(text_color),
-                                );
-                                ui.add_space(4.0);
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut app.editing_workspace_input)
-                                        .desired_width(110.0)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                                response.request_focus();
-                                let pressed_enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                let pressed_escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                                if response.lost_focus() || pressed_enter {
-                                    let trimmed = app.editing_workspace_input.trim();
-                                    if !trimmed.is_empty() {
-                                        app.workspaces[idx].title = trimmed.to_string();
-                                        app.next_workspace_index =
-                                            compute_next_workspace_index(&app.workspaces);
-                                        changed = true;
-                                    }
-                                    app.editing_workspace_idx = None;
-                                    app.editing_workspace_input.clear();
-                                } else if pressed_escape {
-                                    app.editing_workspace_idx = None;
-                                    app.editing_workspace_input.clear();
-                                }
+        let painter = ui.painter().clone();
+
+        for idx in 0..n_tabs {
+            let active = idx == app.selected_workspace;
+            let fill = app.workspace_tab_fill_color(idx, active, p);
+            let title = app.workspaces[idx].title.clone();
+            let badge = app.workspaces[idx].badge;
+            let tc = if active { p.tab_label_active } else { p.muted };
+            let is_editing = app.editing_workspace_idx == Some(idx);
+            let is_drag_src = src_idx == Some(idx);
+
+            let tx = rx + current_xs[idx];
+            let tw = tab_widths[idx];
+            let tab_rect =
+                egui::Rect::from_min_size(Pos2::new(tx, ry), Vec2::new(tw, tab_h));
+            let close_rect = egui::Rect::from_min_size(
+                Pos2::new(tx + tw - inner_x - close_w, ry + (tab_h - 14.0) * 0.5),
+                Vec2::new(close_w, 14.0),
+            );
+            let label_rect = egui::Rect::from_min_max(
+                tab_rect.min,
+                Pos2::new(close_rect.min.x - 2.0, tab_rect.max.y),
+            );
+
+            if is_drag_src {
+                // Render the ghost at the cursor position.
+                let gx = app.tab_drag.as_ref().map(|d| d.ghost_x).unwrap_or(tx);
+                let ghost =
+                    egui::Rect::from_min_size(Pos2::new(gx, ry), Vec2::new(tw, tab_h));
+                let ghost_fill =
+                    Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 215);
+                painter.rect(ghost, 3.0, ghost_fill, Stroke::new(1.5, p.border), egui::StrokeKind::Inside);
+                painter.text(
+                    Pos2::new(gx + inner_x + 2.0, ry + tab_h * 0.5),
+                    Align2::LEFT_CENTER,
+                    format!(">_  {}", title),
+                    FontId::monospace(12.0),
+                    Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 215),
+                );
+                // Dashed placeholder where the tab originated.
+                painter.rect_stroke(
+                    tab_rect,
+                    2.0,
+                    Stroke::new(
+                        1.0,
+                        Color32::from_rgba_unmultiplied(160, 160, 160, 55),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+
+                // Receive drag-delta / drag-released via the same interaction ID.
+                let drag_resp = ui.interact(
+                    tab_rect,
+                    egui::Id::new("ttab_label").with(idx),
+                    Sense::drag(),
+                );
+                if drag_resp.dragged() {
+                    if let Some(ref mut d) = app.tab_drag {
+                        d.ghost_x = (d.ghost_x + drag_resp.drag_delta().x)
+                            .max(rx - tw * 0.5)
+                            .min(rx + total_tab_w - tw * 0.5);
+                        let ghost_center = d.ghost_x + tw * 0.5;
+                        let mut ib = 0;
+                        let mut ax = rx;
+                        for j in 0..n_tabs {
+                            if j == idx {
+                                continue;
+                            }
+                            if ghost_center > ax + tab_widths[j] * 0.5 {
+                                ib += 1;
+                            }
+                            ax += tab_widths[j];
+                        }
+                        d.insert_before = ib;
+                    }
+                    ui.ctx().request_repaint();
+                }
+                if drag_resp.drag_stopped() {
+                    if let Some(d) = app.tab_drag.take() {
+                        let from = d.source_idx;
+                        let to = d.insert_before.min(n_tabs.saturating_sub(1));
+                        if from != to {
+                            let tab = app.workspaces.remove(from);
+                            app.workspaces.insert(to, tab);
+                            let rt = app.workspace_runtime.remove(from);
+                            app.workspace_runtime.insert(to, rt);
+                            let sel = app.selected_workspace;
+                            app.selected_workspace = if sel == from {
+                                to
+                            } else if from < to && sel > from && sel <= to {
+                                sel - 1
+                            } else if from > to && sel >= to && sel < from {
+                                sel + 1
                             } else {
-                                let tab_btn_resp = ui.add(tab_btn);
-                                egui::Popup::context_menu(&tab_btn_resp)
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .show(|ui| {
-                                        workspace_tab_context_menu(ui, app, idx, &mut changed, p);
-                                    });
-                                if tab_btn_resp.clicked() {
-                                    app.selected_workspace = idx;
-                                    egui::Popup::close_all(ui.ctx());
-                                    changed = true;
-                                }
-                            }
-
-                            if let Some(count) = badge {
-                                ui.label(
-                                    RichText::new(count.to_string())
-                                        .size(11.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(p.muted),
-                                );
-                            }
-
-                            let close_btn = egui::Button::new(
-                                RichText::new("x")
-                                    .size(11.0)
-                                    .family(FontFamily::Monospace)
-                                    .color(p.tab_close),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE)
-                            .min_size(Vec2::new(12.0, 20.0));
-                            let close_resp = ui.add(close_btn).on_hover_text("Close workspace");
-                            if close_resp.hovered() || close_resp.is_pointer_button_down_on() {
-                                let close_bg = if close_resp.is_pointer_button_down_on() {
-                                    p.tab_close_active_bg
+                                sel
+                            };
+                            if let Some(ei) = app.editing_workspace_idx {
+                                app.editing_workspace_idx = Some(if ei == from {
+                                    to
+                                } else if from < to && ei > from && ei <= to {
+                                    ei - 1
+                                } else if from > to && ei >= to && ei < from {
+                                    ei + 1
                                 } else {
-                                    p.tab_close_hover_bg
-                                };
-                                let close_fg = if close_resp.is_pointer_button_down_on() {
-                                    Color32::WHITE
-                                } else {
-                                    p.tab_close_hover_text
-                                };
-                                let painter = ui.painter();
-                                painter.rect_filled(close_resp.rect.expand(2.0), 3.0, close_bg);
-                                painter.text(
-                                    close_resp.rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "x",
-                                    egui::FontId::monospace(11.0),
-                                    close_fg,
-                                );
+                                    ei
+                                });
                             }
-                            if close_resp.clicked() {
-                                close_idx = Some(idx);
-                            }
-                        });
-                    });
+                            changed = true;
+                        }
+                    }
+                }
+                continue;
             }
 
-            let plus_btn = egui::Button::new(
-                RichText::new("+")
-                    .size(14.0)
-                    .family(FontFamily::Monospace)
-                    .color(p.muted),
-            )
-            .fill(p.tab_inactive_bg)
-            .stroke(Stroke::new(1.0, p.border))
-            .min_size(Vec2::new(26.0, 28.0))
-            .corner_radius(3.0);
-            if ui.add(plus_btn).on_hover_text("New workspace").clicked() {
-                let title = format!("Workspace {}", app.next_workspace_index);
-                let inherit_dir = app
-                    .workspaces
-                    .get(app.selected_workspace)
-                    .map(|w| w.working_dir.clone())
-                    .unwrap_or_else(default_working_dir);
-                let inherit_layout = app
-                    .workspaces
-                    .get(app.selected_workspace)
-                    .map(|w| w.panel_layout)
-                    .unwrap_or_default();
-                app.next_workspace_index += 1;
-                app.workspaces.push(WorkspaceTab {
-                    title,
-                    badge: None,
-                    color_rgba: None,
-                    working_dir: inherit_dir,
-                    panel_layout: inherit_layout,
-                    sync_terminals_to_columns: app
-                        .workspaces
-                        .get(app.selected_workspace)
-                        .map(|w| w.sync_terminals_to_columns)
-                        .unwrap_or(false),
-                    uniform_equal_terminals: app
-                        .workspaces
-                        .get(app.selected_workspace)
-                        .map(|w| w.uniform_equal_terminals)
-                        .unwrap_or(false),
+            // --- Normal (non-dragged) tab ---
+
+            // Background + border.
+            painter.rect(tab_rect, 2.0, fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+
+            if is_editing {
+                // Inline rename editor.
+                let icon_color = tc;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tab_rect), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(inner_x);
+                        ui.label(
+                            RichText::new(">_")
+                                .size(12.0)
+                                .family(FontFamily::Monospace)
+                                .color(icon_color),
+                        );
+                        ui.add_space(3.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut app.editing_workspace_input)
+                                .desired_width(tw - inner_x * 2.0 - 30.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        resp.request_focus();
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if resp.lost_focus() || enter {
+                            let t = app.editing_workspace_input.trim().to_string();
+                            if !t.is_empty() {
+                                app.workspaces[idx].title = t;
+                                app.next_workspace_index =
+                                    compute_next_workspace_index(&app.workspaces);
+                                changed = true;
+                            }
+                            app.editing_workspace_idx = None;
+                            app.editing_workspace_input.clear();
+                        } else if esc {
+                            app.editing_workspace_idx = None;
+                            app.editing_workspace_input.clear();
+                        }
+                    });
                 });
-                app.workspace_runtime.push(WorkspaceRuntime::default());
-                app.selected_workspace = app.workspaces.len() - 1;
+                continue;
+            }
+
+            // Label text.
+            painter.text(
+                Pos2::new(tx + inner_x + 2.0, ry + tab_h * 0.5),
+                Align2::LEFT_CENTER,
+                format!(">_  {}", title),
+                FontId::monospace(12.0),
+                tc,
+            );
+
+            // Badge (optional counter).
+            if let Some(count) = badge {
+                painter.text(
+                    Pos2::new(close_rect.min.x - 18.0, ry + tab_h * 0.5),
+                    Align2::LEFT_CENTER,
+                    count.to_string(),
+                    FontId::monospace(11.0),
+                    p.muted,
+                );
+            }
+
+            // Close button with hover highlight.
+            let close_resp = ui.interact(
+                close_rect,
+                egui::Id::new("ttab_close").with(idx),
+                Sense::click(),
+            );
+            if close_resp.hovered() || close_resp.is_pointer_button_down_on() {
+                let bg = if close_resp.is_pointer_button_down_on() {
+                    p.tab_close_active_bg
+                } else {
+                    p.tab_close_hover_bg
+                };
+                let fg = if close_resp.is_pointer_button_down_on() {
+                    Color32::WHITE
+                } else {
+                    p.tab_close_hover_text
+                };
+                painter.rect_filled(close_resp.rect.expand(2.0), 3.0, bg);
+                painter.text(
+                    close_resp.rect.center(),
+                    Align2::CENTER_CENTER,
+                    "x",
+                    FontId::monospace(11.0),
+                    fg,
+                );
+            } else {
+                painter.text(
+                    close_resp.rect.center(),
+                    Align2::CENTER_CENTER,
+                    "x",
+                    FontId::monospace(11.0),
+                    p.tab_close,
+                );
+            }
+            if close_resp.clicked() {
+                close_idx = Some(idx);
+            }
+
+            // Label area: click to select, right-click for context menu, drag to reorder.
+            let label_resp = ui.interact(
+                label_rect,
+                egui::Id::new("ttab_label").with(idx),
+                Sense::click_and_drag(),
+            );
+            egui::Popup::context_menu(&label_resp)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    workspace_tab_context_menu(ui, app, idx, &mut changed, p);
+                });
+            if label_resp.clicked() {
+                app.selected_workspace = idx;
+                egui::Popup::close_all(ui.ctx());
                 changed = true;
             }
-        });
+            if label_resp.drag_started() && n_tabs > 1 && app.tab_drag.is_none() {
+                let ptr_x =
+                    ui.input(|i| i.pointer.hover_pos().map(|pos| pos.x).unwrap_or(tx));
+                app.tab_drag = Some(TabDragState {
+                    source_idx: idx,
+                    grab_offset_x: ptr_x - tx,
+                    ghost_x: tx,
+                    insert_before: idx, // initial = "no change"
+                });
+            }
+        }
 
+        // Animated drop indicator line between tabs.
+        if let Some(ref d) = app.tab_drag {
+            let src = d.source_idx;
+            let others: Vec<usize> = (0..n_tabs).filter(|&i| i != src).collect();
+            let ib_c = d.insert_before.min(others.len());
+            let ind_x = rx + others[..ib_c].iter().map(|&i| tab_widths[i]).sum::<f32>();
+            let anim_x = ui.ctx().animate_value_with_time(
+                egui::Id::new("ttab_drop_x"),
+                ind_x,
+                0.10,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(anim_x, ry + 2.0),
+                    Pos2::new(anim_x, ry + tab_h - 2.0),
+                ],
+                Stroke::new(2.5, p.tab_active_bg),
+            );
+        }
+
+        // "+" new workspace button.
+        let plus_btn = egui::Button::new(
+            RichText::new("+")
+                .size(14.0)
+                .family(FontFamily::Monospace)
+                .color(p.muted),
+        )
+        .fill(p.tab_inactive_bg)
+        .stroke(Stroke::new(1.0, p.border))
+        .min_size(Vec2::new(26.0, 28.0))
+        .corner_radius(3.0);
+        if ui.add(plus_btn).on_hover_text("New workspace").clicked() {
+            let title = format!("Workspace {}", app.next_workspace_index);
+            let inherit_dir = app
+                .workspaces
+                .get(app.selected_workspace)
+                .map(|w| w.working_dir.clone())
+                .unwrap_or_else(default_working_dir);
+            let inherit_layout = app
+                .workspaces
+                .get(app.selected_workspace)
+                .map(|w| w.panel_layout)
+                .unwrap_or_default();
+            app.next_workspace_index += 1;
+            app.workspaces.push(WorkspaceTab {
+                title,
+                badge: None,
+                color_rgba: None,
+                working_dir: inherit_dir,
+                panel_layout: inherit_layout,
+                sync_terminals_to_columns: app
+                    .workspaces
+                    .get(app.selected_workspace)
+                    .map(|w| w.sync_terminals_to_columns)
+                    .unwrap_or(false),
+                uniform_equal_terminals: app
+                    .workspaces
+                    .get(app.selected_workspace)
+                    .map(|w| w.uniform_equal_terminals)
+                    .unwrap_or(false),
+            });
+            app.workspace_runtime.push(WorkspaceRuntime::default());
+            app.selected_workspace = app.workspaces.len() - 1;
+            changed = true;
+        }
+
+        // ⚙ settings button (right-aligned).
         let settings_btn_w = 34.0_f32;
         let slack = (ui.available_width() - settings_btn_w).max(0.0);
         ui.add_space(slack);
-        // Close on outside click only so DragValue / text fields inside the menu stay usable.
         let _ = egui::containers::menu::MenuButton::from_button(egui::Button::new(
             RichText::new("⚙").size(16.0).family(FontFamily::Monospace),
         ))
@@ -4534,7 +4756,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
         });
     });
 
+    // Handle close workspace (done outside the closure to avoid borrow conflicts).
     if let Some(idx) = close_idx {
+        if app.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
+            app.tab_drag = None;
+        }
         app.workspaces.remove(idx);
         if idx < app.workspace_runtime.len() {
             app.workspace_runtime.remove(idx);
@@ -4542,9 +4768,9 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
         if app.editing_workspace_idx == Some(idx) {
             app.editing_workspace_idx = None;
             app.editing_workspace_input.clear();
-        } else if let Some(edit_idx) = app.editing_workspace_idx {
-            if edit_idx > idx {
-                app.editing_workspace_idx = Some(edit_idx - 1);
+        } else if let Some(ei) = app.editing_workspace_idx {
+            if ei > idx {
+                app.editing_workspace_idx = Some(ei - 1);
             }
         }
         if app.workspaces.is_empty() {
