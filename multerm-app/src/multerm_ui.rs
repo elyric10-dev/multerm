@@ -5633,22 +5633,22 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 egui::StrokeKind::Inside,
             );
             if active {
-                let indicator_color = lighten_toward_white(fill, 0.45, 250);
-                let glow_color = lighten_toward_white(fill, 0.62, 145);
+                let indicator_color = lighten_toward_white(fill, 0.52, 255);
+                let glow_color = lighten_toward_white(fill, 0.72, 205);
                 let y = tab_rect.max.y - 1.5;
                 painter.line_segment(
                     [
                         Pos2::new(tab_rect.min.x + 1.5, y),
                         Pos2::new(tab_rect.max.x - 1.5, y),
                     ],
-                    Stroke::new(2.2, indicator_color),
+                    Stroke::new(3.4, indicator_color),
                 );
                 painter.line_segment(
                     [
-                        Pos2::new(tab_rect.min.x + 3.0, y - 1.0),
-                        Pos2::new(tab_rect.max.x - 3.0, y - 1.0),
+                        Pos2::new(tab_rect.min.x + 2.5, y - 1.2),
+                        Pos2::new(tab_rect.max.x - 2.5, y - 1.2),
                     ],
-                    Stroke::new(1.0, glow_color),
+                    Stroke::new(2.0, glow_color),
                 );
             }
 
