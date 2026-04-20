@@ -2,11 +2,12 @@ use crossbeam_channel::unbounded;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke,
-    TextEdit, Vec2,
+    TextEdit, Vec2, ViewportBuilder, ViewportClass, ViewportId,
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Write},
     net::TcpStream,
@@ -938,6 +939,8 @@ struct MultermUi {
     tab_drag: Option<TabDragState>,
     /// When the focused terminal changes, scrollback find UI closes (see `update`).
     prev_terminal_focus_key: Option<(usize, Option<usize>)>,
+    /// Terminals popped out into their own native fullscreen window (double-click pane title).
+    fullscreen_terminal_ids: HashSet<u64>,
 }
 
 struct WorkspaceRuntime {
@@ -1098,6 +1101,7 @@ impl Default for MultermUi {
                 workspace_autosave_deadline: Instant::now(),
                 tab_drag: None,
                 prev_terminal_focus_key: None,
+                fullscreen_terminal_ids: HashSet::new(),
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1232,6 +1236,7 @@ impl Default for MultermUi {
             workspace_autosave_deadline: Instant::now(),
             tab_drag: None,
             prev_terminal_focus_key: None,
+            fullscreen_terminal_ids: HashSet::new(),
         }
     }
 }
@@ -1731,6 +1736,8 @@ impl eframe::App for MultermUi {
                                 self.equal_size_template_blink_started_at;
                             let equal_size_template_blink_now = Instant::now();
 
+                            let fullscreen_ids_snapshot = self.fullscreen_terminal_ids.clone();
+                            const FULLSCREEN_HEADER_HOVER: &str = "Double-click to fullscreen mode";
                             let Some(runtime) = self.active_workspace_runtime_mut() else {
                                 return;
                             };
@@ -1760,6 +1767,8 @@ impl eframe::App for MultermUi {
 
                             let mut close_idx: Option<usize> = None;
                             let mut clicked_on_pane = false;
+                            let fullscreen_title_open = std::cell::Cell::new(None::<u64>);
+                            let fullscreen_title_close = std::cell::Cell::new(None::<u64>);
                             {
                                 let content_height = content_h;
                                 // Equal grid must not use full `content_h`: `workspace_content_height` adds
@@ -1871,7 +1880,8 @@ impl eframe::App for MultermUi {
                                             ui.id().with(("pane_drag", pane.id)),
                                             Sense::click_and_drag(),
                                         )
-                                        .on_hover_cursor(CursorIcon::Grab);
+                                        .on_hover_cursor(CursorIcon::Grab)
+                                        .on_hover_text(FULLSCREEN_HEADER_HOVER);
                                     if drag_response.dragged() {
                                         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                                     }
@@ -2479,7 +2489,35 @@ impl eframe::App for MultermUi {
                                         }
                                     }
 
-                                    let pane_response = ui.allocate_rect(pane_rect, Sense::click());
+                                    let drag_header_double_fullscreen = drag_response.double_clicked();
+
+                                    // Keep the pane-wide click target *below* the header chrome. Otherwise it
+                                    // sits above the header widgets in the interaction stack and swallows
+                                    // double-clicks meant for fullscreen.
+                                    const FRAME_INNER_TOP: f32 = 6.0;
+                                    const HEADER_ROW_MIN: f32 = 24.0;
+                                    const FIND_ROW_EST: f32 = 34.0;
+                                    const SEP_BELOW_HEADER_EST: f32 = 10.0;
+                                    let find_row_extra = if is_active
+                                        && runtime
+                                            .scrollback_searches
+                                            .get(idx)
+                                            .is_some_and(|s| s.open)
+                                    {
+                                        FIND_ROW_EST
+                                    } else {
+                                        0.0
+                                    };
+                                    let pane_header_chrome_y = FRAME_INNER_TOP
+                                        + HEADER_ROW_MIN
+                                        + find_row_extra
+                                        + SEP_BELOW_HEADER_EST;
+                                    let pane_body_rect = egui::Rect::from_min_max(
+                                        pane_rect.min + Vec2::new(0.0, pane_header_chrome_y),
+                                        pane_rect.max,
+                                    );
+                                    let pane_response =
+                                        ui.allocate_rect(pane_body_rect, Sense::click());
                                     let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
                                     ui.scope_builder(
                                         egui::UiBuilder::new().max_rect(pane_rect),
@@ -2490,26 +2528,69 @@ impl eframe::App for MultermUi {
                                                 .inner_margin(Margin::same(6))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(&pane.title)
-                                                                    .family(FontFamily::Monospace)
-                                                                    .size(12.0)
-                                                                    .color(p.text),
-                                                            )
-                                                            .selectable(false)
-                                                            .sense(Sense::hover()),
+                                                        const HEADER_ROW_H: f32 = 24.0;
+                                                        let row_h = HEADER_ROW_H
+                                                            .max(ui.spacing().interact_size.y);
+                                                        let row_w = ui.available_width();
+                                                        let row_rect = egui::Rect::from_min_size(
+                                                            ui.cursor().min,
+                                                            Vec2::new(row_w, row_h),
                                                         );
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
+                                                        // Background interact first (below); title + close
+                                                        // painted after (above). Hover-only label lets
+                                                        // double-clicks fall through to this layer.
+                                                        let header_fs = ui
+                                                            .interact(
+                                                                row_rect,
+                                                                ui.id().with(("pane_header_fs", pane.id)),
+                                                                Sense::click(),
+                                                            )
+                                                            .on_hover_text(FULLSCREEN_HEADER_HOVER);
+                                                        ui.scope_builder(
+                                                            egui::UiBuilder::new().max_rect(row_rect),
                                                             |ui| {
-                                                                if ui.small_button("x").clicked() {
-                                                                    close_idx = Some(idx);
-                                                                }
+                                                                ui.horizontal(|ui| {
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            RichText::new(&pane.title)
+                                                                                .family(
+                                                                                    FontFamily::Monospace,
+                                                                                )
+                                                                                .size(12.0)
+                                                                                .color(p.text),
+                                                                        )
+                                                                        .selectable(false)
+                                                                        .sense(Sense::hover()),
+                                                                    );
+                                                                    ui.with_layout(
+                                                                        egui::Layout::right_to_left(
+                                                                            egui::Align::Center,
+                                                                        ),
+                                                                        |ui| {
+                                                                            if ui.small_button("x")
+                                                                                .clicked()
+                                                                            {
+                                                                                close_idx = Some(idx);
+                                                                            }
+                                                                        },
+                                                                    );
+                                                                });
                                                             },
                                                         );
+                                                        ui.advance_cursor_after_rect(row_rect);
+                                                        if header_fs.double_clicked()
+                                                            || drag_header_double_fullscreen
+                                                        {
+                                                            if fullscreen_ids_snapshot
+                                                                .contains(&pane.id)
+                                                            {
+                                                                fullscreen_title_close
+                                                                    .set(Some(pane.id));
+                                                            } else {
+                                                                fullscreen_title_open
+                                                                    .set(Some(pane.id));
+                                                            }
+                                                        }
                                                     });
                                                     if is_active
                                                         && runtime
@@ -2601,50 +2682,75 @@ impl eframe::App for MultermUi {
                                                         pane.desired_size.x,
                                                         terminal_height,
                                                     );
-                                                    resize_terminal_for_size(pane, terminal_size);
-                                                    let selection = runtime
-                                                        .selections
-                                                        .get_mut(idx)
-                                                        .expect("selection slot should exist");
-                                                    let grid = pane.session.parser.grid();
-                                                    let search_highlight = if is_active
-                                                        && runtime
-                                                            .scrollback_searches
-                                                            .get(idx)
-                                                            .is_some_and(|s| s.open)
-                                                    {
-                                                        let ranges = scrollback_compute_match_ranges(
-                                                            grid,
-                                                            &runtime.scrollback_searches[idx].query,
-                                                        );
-                                                        if ranges.is_empty() {
-                                                            None
-                                                        } else {
-                                                            let i = runtime.scrollback_searches[idx]
-                                                                .current_match
-                                                                % ranges.len();
-                                                            Some(ranges[i])
-                                                        }
+                                                    let popped_out =
+                                                        fullscreen_ids_snapshot.contains(&pane.id);
+                                                    if popped_out {
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.add_space(terminal_height * 0.3);
+                                                            ui.label(
+                                                                RichText::new(
+                                                                    "This terminal is shown in a fullscreen window.\n\
+                                                                     Double-click the title above to dock it here again.",
+                                                                )
+                                                                .size(13.0)
+                                                                .color(p.muted),
+                                                            );
+                                                        });
+                                                        clicked_cell_from_grid = None;
                                                     } else {
-                                                        None
-                                                    };
-                                                    let show_caret = pane
-                                                        .session
-                                                        .parser
-                                                        .cursor_visible()
-                                                        || pane.session.parser.app_cursor_keys()
-                                                        || grid.in_alt;
-                                                    clicked_cell_from_grid = render_terminal_grid(
-                                                        ui,
-                                                        pane.id,
-                                                        grid,
-                                                        p,
-                                                        selection,
-                                                        is_active,
-                                                        show_caret,
-                                                        search_highlight,
-                                                        &mut pane.last_autoscroll_caret_v,
-                                                    );
+                                                        resize_terminal_for_size(
+                                                            pane,
+                                                            terminal_size,
+                                                        );
+                                                        let selection = runtime
+                                                            .selections
+                                                            .get_mut(idx)
+                                                            .expect("selection slot should exist");
+                                                        let grid = pane.session.parser.grid();
+                                                        let search_highlight = if is_active
+                                                            && runtime
+                                                                .scrollback_searches
+                                                                .get(idx)
+                                                                .is_some_and(|s| s.open)
+                                                        {
+                                                            let ranges =
+                                                                scrollback_compute_match_ranges(
+                                                                    grid,
+                                                                    &runtime.scrollback_searches
+                                                                        [idx]
+                                                                        .query,
+                                                                );
+                                                            if ranges.is_empty() {
+                                                                None
+                                                            } else {
+                                                                let i = runtime.scrollback_searches
+                                                                    [idx]
+                                                                    .current_match
+                                                                    % ranges.len();
+                                                                Some(ranges[i])
+                                                            }
+                                                        } else {
+                                                            None
+                                                        };
+                                                        let show_caret = pane
+                                                            .session
+                                                            .parser
+                                                            .cursor_visible()
+                                                            || pane.session.parser.app_cursor_keys()
+                                                            || grid.in_alt;
+                                                        clicked_cell_from_grid =
+                                                            render_terminal_grid(
+                                                                ui,
+                                                                pane.id,
+                                                                grid,
+                                                                p,
+                                                                selection,
+                                                                is_active,
+                                                                show_caret,
+                                                                search_highlight,
+                                                                &mut pane.last_autoscroll_caret_v,
+                                                            );
+                                                    }
 
                                                     if let Some((clicked_vrow, clicked_col)) =
                                                         clicked_cell_from_grid
@@ -2818,6 +2924,13 @@ impl eframe::App for MultermUi {
                                 }
                             }
 
+                            if let Some(pid) = fullscreen_title_close.get() {
+                                self.fullscreen_terminal_ids.remove(&pid);
+                            }
+                            if let Some(pid) = fullscreen_title_open.get() {
+                                self.fullscreen_terminal_ids.insert(pid);
+                            }
+
                             if let Some(idx) = close_idx {
                                 if let Some(runtime) = self.active_workspace_runtime_mut() {
                                     let was_active = runtime.active_terminal == Some(idx);
@@ -2845,12 +2958,78 @@ impl eframe::App for MultermUi {
                                             }
                                         })
                                     };
+                                    if let Some(id) = removed_id {
+                                        self.fullscreen_terminal_ids.remove(&id);
+                                    }
                                 }
                                 save_workspace_state(self);
                             }
                         });
                 });
         });
+
+        let p_zoom = self.ui_theme.palette().with_style(self.ui_style);
+        for &pane_id in self.fullscreen_terminal_ids.clone().iter() {
+            let Some((ws, idx, title)) = self.terminal_location_by_pane_id(pane_id) else {
+                self.fullscreen_terminal_ids.remove(&pane_id);
+                continue;
+            };
+            let vp_id = ViewportId::from_hash_of(("multerm_terminal_zoom", pane_id));
+            let window_title = format!("{title} — Multerm");
+            let title_embed = title.clone();
+            let builder = ViewportBuilder::default()
+                .with_title(window_title)
+                .with_fullscreen(true);
+            ctx.show_viewport_immediate(vp_id, builder, |ctx, class| {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    self.fullscreen_terminal_ids.remove(&pane_id);
+                    return;
+                }
+                self.route_workspace_terminal_keyboard(ctx, ws, idx);
+                let mut dock_fullscreen = false;
+                match class {
+                    ViewportClass::Embedded => {
+                        egui::Window::new(format!("Multerm — {}", title_embed))
+                            .id(egui::Id::new(("multerm_zoom_embed", pane_id)))
+                            .default_rect(ctx.content_rect())
+                            .collapsible(false)
+                            .resizable(false)
+                            .show(ctx, |ui| {
+                                self.paint_fullscreen_zoom_terminal(
+                                    ui,
+                                    ws,
+                                    idx,
+                                    p_zoom,
+                                    pane_id,
+                                    &mut dock_fullscreen,
+                                );
+                            });
+                    }
+                    _ => {
+                        egui::CentralPanel::default()
+                            .frame(
+                                egui::Frame::default()
+                                    .fill(p_zoom.term_bg)
+                                    .inner_margin(Margin::same(0)),
+                            )
+                            .show(ctx, |ui| {
+                                self.paint_fullscreen_zoom_terminal(
+                                    ui,
+                                    ws,
+                                    idx,
+                                    p_zoom,
+                                    pane_id,
+                                    &mut dock_fullscreen,
+                                );
+                            });
+                    }
+                }
+                if dock_fullscreen {
+                    self.fullscreen_terminal_ids.remove(&pane_id);
+                }
+            });
+        }
 
         const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
         let now = Instant::now();
@@ -3185,9 +3364,34 @@ impl MultermUi {
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
         self.ensure_workspace_runtime_slots();
-        let Some(runtime) = self.active_workspace_runtime_mut() else {
+        let ws = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        let Some(runtime) = self.workspace_runtime.get(ws) else {
             return;
         };
+        let Some(active_idx) = runtime.active_terminal else {
+            return;
+        };
+        if active_idx >= runtime.terminals.len() {
+            return;
+        }
+        self.route_workspace_terminal_keyboard(ctx, ws, active_idx);
+    }
+
+    fn route_workspace_terminal_keyboard(
+        &mut self,
+        ctx: &egui::Context,
+        workspace_idx: usize,
+        active_idx: usize,
+    ) {
+        self.ensure_workspace_runtime_slots();
+        let Some(runtime) = self.workspace_runtime.get_mut(workspace_idx) else {
+            return;
+        };
+        if active_idx >= runtime.terminals.len() {
+            return;
+        }
         if runtime.selections.len() < runtime.terminals.len() {
             runtime.selections.resize(runtime.terminals.len(), None);
         } else if runtime.selections.len() > runtime.terminals.len() {
@@ -3206,12 +3410,6 @@ impl MultermUi {
                 .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
         } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
             runtime.scrollback_searches.truncate(runtime.terminals.len());
-        }
-        let Some(active_idx) = runtime.active_terminal else {
-            return;
-        };
-        if active_idx >= runtime.terminals.len() {
-            return;
         }
 
         let pane_id = runtime.terminals[active_idx].id;
@@ -3519,6 +3717,175 @@ impl MultermUi {
 
         if shortcut_new_terminal {
             let _ = self.add_terminal(ctx, None, None);
+        }
+    }
+
+    fn terminal_location_by_pane_id(&self, pane_id: u64) -> Option<(usize, usize, String)> {
+        for (ws, runtime) in self.workspace_runtime.iter().enumerate() {
+            for (idx, pane) in runtime.terminals.iter().enumerate() {
+                if pane.id == pane_id {
+                    return Some((ws, idx, pane.title.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Fills the zoom viewport with a single terminal grid (native fullscreen window).
+    fn paint_fullscreen_zoom_terminal(
+        &mut self,
+        ui: &mut egui::Ui,
+        workspace_idx: usize,
+        pane_idx: usize,
+        p: UiPalette,
+        pane_id: u64,
+        dock_fullscreen: &mut bool,
+    ) {
+        self.ensure_workspace_runtime_slots();
+        let Some(runtime) = self.workspace_runtime.get_mut(workspace_idx) else {
+            return;
+        };
+        if pane_idx >= runtime.terminals.len() {
+            return;
+        }
+        if runtime.selections.len() < runtime.terminals.len() {
+            runtime.selections.resize(runtime.terminals.len(), None);
+        } else if runtime.selections.len() > runtime.terminals.len() {
+            runtime.selections.truncate(runtime.terminals.len());
+        }
+        if runtime.line_editors.len() < runtime.terminals.len() {
+            runtime
+                .line_editors
+                .resize_with(runtime.terminals.len(), LineEditor::new);
+        } else if runtime.line_editors.len() > runtime.terminals.len() {
+            runtime.line_editors.truncate(runtime.terminals.len());
+        }
+        if runtime.scrollback_searches.len() < runtime.terminals.len() {
+            runtime
+                .scrollback_searches
+                .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
+        } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
+            runtime.scrollback_searches.truncate(runtime.terminals.len());
+        }
+
+        let selected_ws = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        if workspace_idx == selected_ws {
+            runtime.active_terminal = Some(pane_idx);
+        }
+
+        const TOOLBAR_H: f32 = 32.0;
+        egui::Frame::NONE
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), TOOLBAR_H),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Skip").clicked() {
+                            *dock_fullscreen = true;
+                        }
+                    },
+                );
+            });
+
+        let content_rect = ui.available_rect_before_wrap();
+        let terminal_size = content_rect.size();
+
+        let search_highlight = if runtime
+            .scrollback_searches
+            .get(pane_idx)
+            .is_some_and(|s| s.open)
+        {
+            let st = &runtime.scrollback_searches[pane_idx];
+            let grid = runtime.terminals[pane_idx].session.parser.grid();
+            let ranges = scrollback_compute_match_ranges(grid, &st.query);
+            if ranges.is_empty() {
+                None
+            } else {
+                let i = st.current_match % ranges.len();
+                Some(ranges[i])
+            }
+        } else {
+            None
+        };
+
+        let clicked_cell_from_grid = {
+            let pane = &mut runtime.terminals[pane_idx];
+            resize_terminal_for_size(pane, terminal_size);
+            let grid = pane.session.parser.grid();
+            let show_caret = pane.session.parser.cursor_visible()
+                || pane.session.parser.app_cursor_keys()
+                || grid.in_alt;
+            let selection = &mut runtime.selections[pane_idx];
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                render_terminal_grid(
+                    ui,
+                    pane.id,
+                    grid,
+                    p,
+                    selection,
+                    true,
+                    show_caret,
+                    search_highlight,
+                    &mut pane.last_autoscroll_caret_v,
+                )
+            })
+            .inner
+        };
+
+        let pane_response =
+            ui.interact(content_rect, ui.id().with(("fs_term_click", pane_id)), Sense::click());
+
+        if let Some((clicked_vrow, clicked_col)) = clicked_cell_from_grid {
+            let pane = &mut runtime.terminals[pane_idx];
+            let grid = pane.session.parser.grid();
+            let sb = grid.scrollback_len();
+            if clicked_vrow >= sb && grid.cols > 0 {
+                let clicked_row = clicked_vrow - sb;
+                let target_row = clicked_row.min(grid.rows.saturating_sub(1));
+                let row_end =
+                    row_render_end(grid, target_row).min(grid.cols.saturating_sub(1));
+                let target_col = clicked_col
+                    .min(row_end.saturating_add(1))
+                    .min(grid.cols.saturating_sub(1));
+
+                let mut bytes = Vec::new();
+                if clicked_col >= row_end {
+                    bytes.push(0x05);
+                    if let Some(ed) = runtime.line_editors.get_mut(pane_idx) {
+                        ed.move_to_end();
+                    }
+                } else if target_col > grid.cursor.col {
+                    let steps = target_col - grid.cursor.col;
+                    bytes.reserve(steps * 3);
+                    for _ in 0..steps {
+                        bytes.extend_from_slice(b"\x1b[C");
+                    }
+                    if let Some(ed) = runtime.line_editors.get_mut(pane_idx) {
+                        ed.move_cursor_delta(steps as isize);
+                    }
+                } else if target_col < grid.cursor.col {
+                    let steps = grid.cursor.col - target_col;
+                    bytes.reserve(steps * 3);
+                    for _ in 0..steps {
+                        bytes.extend_from_slice(b"\x1b[D");
+                    }
+                    if let Some(ed) = runtime.line_editors.get_mut(pane_idx) {
+                        ed.move_cursor_delta(-(steps as isize));
+                    }
+                }
+
+                if !bytes.is_empty() {
+                    pane.backend.write_all(&bytes);
+                }
+            }
+        }
+
+        if pane_response.clicked() && clicked_cell_from_grid.is_none() {
+            let pane = &mut runtime.terminals[pane_idx];
+            pane.backend.write_all(&[0x05]);
         }
     }
 
