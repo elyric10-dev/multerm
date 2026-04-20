@@ -1,7 +1,7 @@
 use arboard::Clipboard;
 use std::process::{Command, Stdio};
-use termite_render::SelectionRange;
-use termite_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
+use multerm_render::SelectionRange;
+use multerm_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SgrProps {
@@ -10,7 +10,7 @@ struct SgrProps {
     attrs: CellAttrs,
 }
 
-fn cell_props(cell: &termite_vt::Cell) -> SgrProps {
+fn cell_props(cell: &multerm_vt::Cell) -> SgrProps {
     SgrProps {
         fg: cell.fg,
         bg: cell.bg,

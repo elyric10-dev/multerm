@@ -1,11 +1,11 @@
-use termite_vt::cell::Color;
+use multerm_vt::cell::Color;
 
 /// Default terminal foreground colour (#d4d4d8).
 pub const DEFAULT_FG: [f32; 4] = [0.831, 0.831, 0.847, 1.0];
 /// Default terminal background colour (opaque black).
 pub const DEFAULT_BG: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
-/// Convert a `termite_vt::Color` to linear RGBA.
+/// Convert a `multerm_vt::Color` to linear RGBA.
 pub fn color_to_linear(c: Color, is_fg: bool) -> [f32; 4] {
     match c {
         Color::Default => {

@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "termite-app",
-    "termite-core",
-    "termite-vt",
-    "termite-render",
-    "termite-input",
-    "termite-ui",
+    "multerm-app",
+    "multerm-core",
+    "multerm-vt",
+    "multerm-render",
+    "multerm-input",
+    "multerm-ui",
 ]
 resolver = "2"
 
@@ -52,8 +52,8 @@ serde_json   = "1"
 sysinfo      = "0.38"
 
 # Internal crates
-termite-vt     = { path = "termite-vt" }
-termite-core   = { path = "termite-core" }
-termite-render = { path = "termite-render" }
-termite-input  = { path = "termite-input" }
-termite-ui     = { path = "termite-ui" }
+multerm-vt     = { path = "multerm-vt" }
+multerm-core   = { path = "multerm-core" }
+multerm-render = { path = "multerm-render" }
+multerm-input  = { path = "multerm-input" }
+multerm-ui     = { path = "multerm-ui" }

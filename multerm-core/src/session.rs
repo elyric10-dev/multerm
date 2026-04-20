@@ -1,5 +1,5 @@
 use crossbeam_channel::Receiver;
-use termite_vt::TerminalParser;
+use multerm_vt::TerminalParser;
 
 use crate::ids::PaneId;
 

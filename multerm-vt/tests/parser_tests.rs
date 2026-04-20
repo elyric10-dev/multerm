@@ -1,4 +1,4 @@
-use termite_vt::{cell::{CellAttrs, Color}, TerminalParser};
+use multerm_vt::{cell::{CellAttrs, Color}, TerminalParser};
 
 fn parser(rows: usize, cols: usize) -> TerminalParser {
     TerminalParser::new(rows, cols)

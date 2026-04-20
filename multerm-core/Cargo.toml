@@ -1,10 +1,10 @@
 [package]
-name    = "termite-core"
+name    = "multerm-core"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-termite-vt        = { workspace = true }
+multerm-vt        = { workspace = true }
 portable-pty      = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot       = { workspace = true }

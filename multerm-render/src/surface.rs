@@ -34,7 +34,7 @@ impl GpuContext {
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label:             Some("termite"),
+                label: Some("multerm"),
                 required_features: wgpu::Features::empty(),
                 required_limits:   wgpu::Limits::default(),
                 memory_hints:      wgpu::MemoryHints::default(),

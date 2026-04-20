@@ -1,22 +1,22 @@
 [package]
-name    = "termite-app"
+name    = "multerm-app"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "termite"
+name = "multerm"
 path = "src/main.rs"
 
 [[bin]]
-name = "termite-ui"
-path = "src/termite_ui.rs"
+name = "multerm-ui"
+path = "src/multerm_ui.rs"
 
 [dependencies]
-termite-vt     = { workspace = true }
-termite-core   = { workspace = true }
-termite-render = { workspace = true }
-termite-input  = { workspace = true }
-termite-ui     = { workspace = true }
+multerm-vt     = { workspace = true }
+multerm-core   = { workspace = true }
+multerm-render = { workspace = true }
+multerm-input  = { workspace = true }
+multerm-ui     = { workspace = true }
 eframe         = { workspace = true }
 winit          = { workspace = true }
 crossbeam-channel = { workspace = true }

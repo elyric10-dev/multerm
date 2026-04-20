@@ -1989,6 +1989,90 @@ dependencies = [
 ]
 
 [[package]]
+name = "multerm-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "crossbeam-channel",
+ "eframe",
+ "multerm-core",
+ "multerm-input",
+ "multerm-render",
+ "multerm-ui",
+ "multerm-vt",
+ "parking_lot",
+ "pollster 0.3.0",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
+
+[[package]]
+name = "multerm-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.11.1",
+ "crossbeam-channel",
+ "multerm-vt",
+ "parking_lot",
+ "portable-pty",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "multerm-input"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "multerm-core",
+ "winit",
+]
+
+[[package]]
+name = "multerm-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cosmic-text",
+ "etagere",
+ "glam",
+ "multerm-vt",
+ "pollster 0.3.0",
+ "thiserror 2.0.18",
+ "tracing",
+ "wgpu 23.0.1",
+ "winit",
+]
+
+[[package]]
+name = "multerm-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "multerm-core",
+ "multerm-render",
+]
+
+[[package]]
+name = "multerm-vt"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "unicode-width 0.2.2",
+ "vte",
+]
+
+[[package]]
 name = "naga"
 version = "23.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3378,90 +3462,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5d9cf598a6d7ce700a4e6a9199da127e6819a61e64b68609683cc9a01b5683a"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "termite-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "crossbeam-channel",
- "eframe",
- "parking_lot",
- "pollster 0.3.0",
- "rfd",
- "serde",
- "serde_json",
- "sysinfo",
- "termite-core",
- "termite-input",
- "termite-render",
- "termite-ui",
- "termite-vt",
- "tracing",
- "tracing-subscriber",
- "winit",
-]
-
-[[package]]
-name = "termite-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags 2.11.1",
- "crossbeam-channel",
- "parking_lot",
- "portable-pty",
- "termite-vt",
- "thiserror 2.0.18",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "termite-input"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "termite-core",
- "winit",
-]
-
-[[package]]
-name = "termite-render"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cosmic-text",
- "etagere",
- "glam",
- "pollster 0.3.0",
- "termite-vt",
- "thiserror 2.0.18",
- "tracing",
- "wgpu 23.0.1",
- "winit",
-]
-
-[[package]]
-name = "termite-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "glam",
- "termite-core",
- "termite-render",
-]
-
-[[package]]
-name = "termite-vt"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.1",
- "unicode-width 0.2.2",
- "vte",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@ use std::mem;
 
 use anyhow::Context;
 use bytemuck::cast_slice;
-use termite_vt::{
+use multerm_vt::{
     cell::WideKind,
     TerminalGrid,
 };
@@ -315,7 +315,7 @@ impl Compositor {
                     let py = origin_y + row as f32 * cell_h;
                     let gw = if cell.wide == WideKind::Leading { cell_w * 2.0 } else { cell_w };
 
-                    let reverse = cell.attrs.contains(termite_vt::CellAttrs::REVERSE);
+                    let reverse = cell.attrs.contains(multerm_vt::CellAttrs::REVERSE);
                     let normal_fg = if reverse {
                         // Reverse: glyph foreground comes from the cell background.
                         color_to_linear(cell.bg, false)
@@ -346,8 +346,8 @@ impl Compositor {
                     if cell.ch != ' ' {
                         let key = GlyphKey {
                             ch:           cell.ch,
-                            bold:         cell.attrs.contains(termite_vt::CellAttrs::BOLD),
-                            italic:       cell.attrs.contains(termite_vt::CellAttrs::ITALIC),
+                            bold:         cell.attrs.contains(multerm_vt::CellAttrs::BOLD),
+                            italic:       cell.attrs.contains(multerm_vt::CellAttrs::ITALIC),
                             raster_scale: raster_scale_key,
                         };
 
@@ -389,7 +389,7 @@ impl Compositor {
         let frame  = gpu.surface.get_current_texture().context("get_current_texture")?;
         let view   = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("termite_frame") }
+            &wgpu::CommandEncoderDescriptor { label: Some("multerm_frame") }
         );
 
         {

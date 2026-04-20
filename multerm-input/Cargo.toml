@@ -1,9 +1,9 @@
 [package]
-name    = "termite-input"
+name    = "multerm-input"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-termite-core = { workspace = true }
+multerm-core = { workspace = true }
 winit        = { workspace = true }
 anyhow       = { workspace = true }

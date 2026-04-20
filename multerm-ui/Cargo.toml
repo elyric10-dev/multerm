@@ -1,10 +1,10 @@
 [package]
-name    = "termite-ui"
+name    = "multerm-ui"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-termite-render = { workspace = true }
-termite-core   = { workspace = true }
+multerm-render = { workspace = true }
+multerm-core   = { workspace = true }
 glam           = { workspace = true }
 anyhow         = { workspace = true }

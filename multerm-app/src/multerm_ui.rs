@@ -19,11 +19,11 @@ use sysinfo::{
     get_current_pid, CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate,
     RefreshKind, System,
 };
-use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
-use termite_render::color::ansi_indexed_to_rgb;
-use termite_render::SelectionRange;
-use termite_vt::cell::{Cell, CellAttrs, Color, WideKind};
-use termite_vt::TerminalGrid;
+use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
+use multerm_render::color::ansi_indexed_to_rgb;
+use multerm_render::SelectionRange;
+use multerm_vt::cell::{Cell, CellAttrs, Color, WideKind};
+use multerm_vt::TerminalGrid;
 
 mod clipboard;
 mod daemon;
@@ -238,7 +238,7 @@ impl Default for ScrollbackSearchPaneState {
 }
 
 fn scrollback_search_text_id(pane_id: u64) -> egui::Id {
-    egui::Id::new(("termite_scrollback_search", pane_id))
+    egui::Id::new(("multerm_scrollback_search", pane_id))
 }
 
 #[inline]
@@ -581,7 +581,7 @@ const CORNER_GRIP_OUTSET: f32 = 2.0;
 const BR_CURSOR_HOVER_RADIUS: f32 = 14.0;
 
 /// Local-space `(left, right, top, bottom)` of the spawn-preview dashed frame, matching
-/// [`TermiteUi::paint_spawn_flash`]. `area_w` is the visible workspace width used for column
+/// [`MultermUi::paint_spawn_flash`]. `area_w` is the visible workspace width used for column
 /// stripes (not the horizontal scroll canvas). `area_h` is full workspace content height.
 fn spawn_flash_stripe_local_edges(
     until: Option<Instant>,
@@ -768,18 +768,18 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 860.0])
             .with_min_inner_size([1100.0, 700.0])
-            .with_title("TermITE"),
+            .with_title("Multerm"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "TermITE",
+        "Multerm",
         options,
-        Box::new(|_cc| Ok(Box::<TermiteUi>::default())),
+        Box::new(|_cc| Ok(Box::<MultermUi>::default())),
     )
 }
 
-// Session daemon protocol frame types (mirrors `termite-app/src/daemon.rs`).
+// Session daemon protocol frame types (mirrors `multerm-app/src/daemon.rs`).
 const FRAME_ATTACH: u8 = 1;
 const FRAME_ATTACH_ERROR: u8 = 2;
 const FRAME_OUTPUT: u8 = 3;
@@ -888,7 +888,7 @@ struct TabDragState {
     insert_before: usize,
 }
 
-struct TermiteUi {
+struct MultermUi {
     ui_theme: UiTheme,
     ui_style: UiStyle,
     selected_workspace: usize,
@@ -925,9 +925,9 @@ struct TermiteUi {
     system: System,
     system_last_sample: Instant,
     /// Open usage panels, ordered from oldest click to newest click.
-    /// `true` => termite panel, `false` => system panel.
+    /// `true` => multerm panel, `false` => system panel.
     usage_panel_open_order: Vec<bool>,
-    show_termite_only_status: bool,
+    show_multerm_only_status: bool,
     equal_size_picker_open: bool,
     equal_size_picker_selection: Option<u64>,
     equal_size_template_blink_terminal_id: Option<u64>,
@@ -999,7 +999,7 @@ struct WorkspaceState {
     #[serde(default)]
     usage_panel_open_order: Vec<bool>,
     #[serde(default)]
-    show_termite_only_status: bool,
+    show_multerm_only_status: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1024,7 +1024,7 @@ struct WorkspaceTabState {
     equal_size_source_terminal_id: Option<u64>,
 }
 
-impl Default for TermiteUi {
+impl Default for MultermUi {
     fn default() -> Self {
         if let Some(state) = load_workspace_state() {
             let ui_theme = state.ui_theme;
@@ -1090,7 +1090,7 @@ impl Default for TermiteUi {
                 } else {
                     state.usage_panel_open_order
                 },
-                show_termite_only_status: state.show_termite_only_status,
+                show_multerm_only_status: state.show_multerm_only_status,
                 equal_size_picker_open: false,
                 equal_size_picker_selection: None,
                 equal_size_template_blink_terminal_id: None,
@@ -1224,7 +1224,7 @@ impl Default for TermiteUi {
             system: system_status_probe_new(),
             system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
             usage_panel_open_order: Vec::new(),
-            show_termite_only_status: false,
+            show_multerm_only_status: false,
             equal_size_picker_open: false,
             equal_size_picker_selection: None,
             equal_size_template_blink_terminal_id: None,
@@ -1248,7 +1248,7 @@ fn format_gib(n: u64) -> String {
     format!("{:.1} GiB", n as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
-fn paint_workspace_terminal_spawn_notice_bar(ui: &mut egui::Ui, app: &mut TermiteUi) {
+fn paint_workspace_terminal_spawn_notice_bar(ui: &mut egui::Ui, app: &mut MultermUi) {
     let (message, create_target) = match &app.workspace_terminal_spawn_notice {
         Some(n) => (n.message.clone(), n.create_target.clone()),
         None => return,
@@ -1370,7 +1370,7 @@ fn usage_meter_row(
 
 fn new_terminal_context_menu(
     ui: &mut egui::Ui,
-    app: &mut TermiteUi,
+    app: &mut MultermUi,
     target_terminal: Option<usize>,
 ) {
     let mut changed = false;
@@ -1483,7 +1483,7 @@ fn new_terminal_context_menu(
     }
 }
 
-impl eframe::App for TermiteUi {
+impl eframe::App for MultermUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep refreshing so PTY output appears live without explicit wakeups.
         self.sync_all_workspace_runtime_buffers();
@@ -1541,7 +1541,7 @@ impl eframe::App for TermiteUi {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let term_resp = ui
                             .add(
-                                egui::Label::new(RichText::new("Termite").size(11.0).color(p.text))
+                                egui::Label::new(RichText::new("Multerm").size(11.0).color(p.text))
                                     .sense(Sense::click()),
                             )
                             .on_hover_cursor(CursorIcon::PointingHand);
@@ -1664,7 +1664,7 @@ impl eframe::App for TermiteUi {
                     let content_w = workspace_content_width(&runtime_ref.terminals, viewport.x);
 
                     egui::ScrollArea::both()
-                        .id_salt(("termite_ws_scroll", self.selected_workspace))
+                        .id_salt(("multerm_ws_scroll", self.selected_workspace))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_min_size(Vec2::new(content_w, content_h));
@@ -2868,7 +2868,7 @@ impl eframe::App for TermiteUi {
     }
 }
 
-impl TermiteUi {
+impl MultermUi {
     fn trigger_equal_size_template_blink(&mut self, terminal_id: u64) {
         self.equal_size_template_blink_terminal_id = Some(terminal_id);
         self.equal_size_template_blink_started_at = Some(Instant::now());
@@ -2888,24 +2888,24 @@ impl TermiteUi {
         );
     }
 
-    fn toggle_usage_panel(&mut self, termite_only: bool) {
+    fn toggle_usage_panel(&mut self, multerm_only: bool) {
         if let Some(existing_idx) = self
             .usage_panel_open_order
             .iter()
-            .position(|scope| *scope == termite_only)
+            .position(|scope| *scope == multerm_only)
         {
             self.usage_panel_open_order.remove(existing_idx);
             return;
         }
-        self.show_termite_only_status = termite_only;
-        self.usage_panel_open_order.push(termite_only);
+        self.show_multerm_only_status = multerm_only;
+        self.usage_panel_open_order.push(multerm_only);
     }
 
-    fn draw_usage_hover_panel(&mut self, ui: &mut egui::Ui, p: UiPalette, termite_only: bool) {
+    fn draw_usage_hover_panel(&mut self, ui: &mut egui::Ui, p: UiPalette, multerm_only: bool) {
         ui.set_min_width(300.0);
         ui.label(
-            RichText::new(if termite_only {
-                "Termite process usage"
+            RichText::new(if multerm_only {
+                "Multerm process usage"
             } else {
                 "System usage"
             })
@@ -2915,10 +2915,10 @@ impl TermiteUi {
         );
         ui.add_space(4.0);
 
-        if termite_only {
+        if multerm_only {
             let Some(pid) = get_current_pid().ok() else {
                 ui.label(
-                    RichText::new("Termite process unavailable")
+                    RichText::new("Multerm process unavailable")
                         .size(11.0)
                         .color(p.muted),
                 );
@@ -2926,7 +2926,7 @@ impl TermiteUi {
             };
             let Some(proc_) = self.system.process(pid) else {
                 ui.label(
-                    RichText::new("Termite process unavailable")
+                    RichText::new("Multerm process unavailable")
                         .size(11.0)
                         .color(p.muted),
                 );
@@ -3598,7 +3598,7 @@ fn write_frame_tcp(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> st
 }
 
 fn connect_daemon() -> Option<TcpStream> {
-    if std::env::var("TERMITE_DAEMON_DISABLED").ok().as_deref() == Some("1") {
+    if std::env::var("MULTERM_DAEMON_DISABLED").ok().as_deref() == Some("1") {
         return None;
     }
 
@@ -3710,7 +3710,7 @@ fn spawn_terminal_pane(
 }
 
 fn tmux_session_name(workspace_idx: usize, terminal_id: u64) -> String {
-    format!("termite-w{}-t{}", workspace_idx + 1, terminal_id)
+    format!("multerm-w{}-t{}", workspace_idx + 1, terminal_id)
 }
 
 fn resize_terminal_for_size(pane: &mut TerminalPane, size: Vec2) {
@@ -4966,7 +4966,7 @@ fn selection_delete_bytes(
     key_to_ansi_bytes(key, false, false).unwrap_or_default()
 }
 
-fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
+fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     let mut changed = false;
     let mut close_idx: Option<usize> = None;
 
@@ -5386,7 +5386,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
     }
 }
 
-fn settings_menu(ui: &mut egui::Ui, app: &mut TermiteUi, changed: &mut bool) {
+fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
     ui.label("Appearance");
     ui.horizontal(|ui| {
         *changed |= ui
@@ -5408,7 +5408,7 @@ fn settings_menu(ui: &mut egui::Ui, app: &mut TermiteUi, changed: &mut bool) {
 
 fn workspace_tab_context_menu(
     ui: &mut egui::Ui,
-    app: &mut TermiteUi,
+    app: &mut MultermUi,
     idx: usize,
     changed: &mut bool,
     p: UiPalette,
@@ -5713,7 +5713,7 @@ fn workspace_dir_completion_candidates(raw_input: &str, max_entries: usize) -> V
     out
 }
 
-fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
+fn directory_path_bar(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     let full_width = ui.available_width();
     let bar_stroke = if app.ui_theme == UiTheme::Light {
         Stroke::NONE
@@ -5976,13 +5976,13 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut TermiteUi, p: UiPalette) {
 fn workspace_state_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home)
-            .join(".termite")
-            .join("termite-ui-workspaces.json");
+            .join(".multerm")
+            .join("multerm-ui-workspaces.json");
     }
-    PathBuf::from(".termite-ui-workspaces.json")
+    PathBuf::from(".multerm-ui-workspaces.json")
 }
 
-fn save_workspace_state(app: &mut TermiteUi) {
+fn save_workspace_state(app: &mut MultermUi) {
     app.ensure_workspace_runtime_slots();
     let state = WorkspaceState {
         ui_theme: app.ui_theme,
@@ -6035,7 +6035,7 @@ fn save_workspace_state(app: &mut TermiteUi) {
         color_history: app.color_history.clone(),
         usage_panel_pinned_scope: app.usage_panel_open_order.last().copied(),
         usage_panel_open_order: app.usage_panel_open_order.clone(),
-        show_termite_only_status: app.show_termite_only_status,
+        show_multerm_only_status: app.show_multerm_only_status,
     };
 
     let path = workspace_state_path();
@@ -6160,7 +6160,7 @@ impl WorkspaceTab {
     }
 }
 
-impl TermiteUi {
+impl MultermUi {
     fn push_color_history(&mut self, color: Color32) {
         let rgba = [color.r(), color.g(), color.b(), color.a()];
         self.color_history.retain(|item| *item != rgba);

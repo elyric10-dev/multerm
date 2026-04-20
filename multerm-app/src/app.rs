@@ -9,10 +9,10 @@ use std::{
 };
 
 use crossbeam_channel::unbounded;
-use termite_core::{pty::spawn_pty, session::TerminalSession, PaneId};
-use termite_input::key_to_bytes;
-use termite_render::{Compositor, CursorState, GlyphAtlas, GpuContext, SelectionRange};
-use termite_ui::pane_layout::Rect;
+use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId};
+use multerm_input::key_to_bytes;
+use multerm_render::{Compositor, CursorState, GlyphAtlas, GpuContext, SelectionRange};
+use multerm_ui::pane_layout::Rect;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -34,7 +34,7 @@ const SPLIT_MAX_RATIO: f32 = 0.8;
 const SNAPSHOT_CAPACITY: usize = 50;
 
 struct PaneHistory {
-    snapshots: VecDeque<termite_vt::TerminalGrid>,
+    snapshots: VecDeque<multerm_vt::TerminalGrid>,
     /// How many steps back we are from live. 0 = live view.
     steps_back: usize,
 }
@@ -46,7 +46,7 @@ impl PaneHistory {
 
     /// Push a snapshot of the current grid (called before each PTY data batch).
     /// Ignored while the user is browsing history so indices stay stable.
-    fn push(&mut self, grid: termite_vt::TerminalGrid) {
+    fn push(&mut self, grid: multerm_vt::TerminalGrid) {
         if self.steps_back > 0 {
             return;
         }
@@ -84,7 +84,7 @@ impl PaneHistory {
     }
 
     /// Returns the snapshot grid to display, or `None` when live.
-    fn current_snapshot(&self) -> Option<&termite_vt::TerminalGrid> {
+    fn current_snapshot(&self) -> Option<&multerm_vt::TerminalGrid> {
         if self.steps_back == 0 {
             return None;
         }
@@ -105,7 +105,7 @@ struct PaneRuntime {
 }
 
 enum PaneBackend {
-    LocalPty { pty: termite_core::PtyHandle },
+    LocalPty { pty: multerm_core::PtyHandle },
     DaemonPty { writer: TcpStream },
 }
 
@@ -116,7 +116,7 @@ impl PaneBackend {
                 let _ = pty.write_all(data);
             }
             PaneBackend::DaemonPty { writer } => {
-                let _ = TermiteApp::write_frame_tcp(writer, FRAME_INPUT, data);
+                let _ = MultermApp::write_frame_tcp(writer, FRAME_INPUT, data);
             }
         }
     }
@@ -128,7 +128,7 @@ impl PaneBackend {
             }
             PaneBackend::DaemonPty { writer } => {
                 let payload = [rows.to_le_bytes(), cols.to_le_bytes()].concat();
-                let _ = TermiteApp::write_frame_tcp(writer, FRAME_RESIZE, &payload);
+                let _ = MultermApp::write_frame_tcp(writer, FRAME_RESIZE, &payload);
             }
         }
     }
@@ -146,7 +146,7 @@ struct SelectionDrag {
     start: (usize, usize),
 }
 
-pub struct TermiteApp {
+pub struct MultermApp {
     // Event loop proxy for waking from PTY thread
     proxy: EventLoopProxy<UserEvent>,
 
@@ -171,7 +171,7 @@ pub struct TermiteApp {
     mods: ModifiersState,
 }
 
-impl TermiteApp {
+impl MultermApp {
     pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         Self {
             proxy,
@@ -195,14 +195,14 @@ impl TermiteApp {
     #[allow(dead_code)]
     fn tmux_startup_command_for_pane(pane_index: usize) -> Option<String> {
         // Opt out if desired.
-        if std::env::var("TERMITE_TMUX_DISABLED").ok().as_deref() == Some("1") {
+        if std::env::var("MULTERM_TMUX_DISABLED").ok().as_deref() == Some("1") {
             return None;
         }
 
         // Session naming needs to be stable across app restarts so you can reattach.
-        // Users can override the prefix if they run multiple termite instances.
+        // Users can override the prefix if they run multiple multerm instances.
         let prefix =
-            std::env::var("TERMITE_TMUX_SESSION_PREFIX").unwrap_or_else(|_| "termite".into());
+            std::env::var("MULTERM_TMUX_SESSION_PREFIX").unwrap_or_else(|_| "multerm".into());
 
         // Sanitize to avoid weird tmux targeting behavior.
         let sanitize = |s: &str| {
@@ -228,8 +228,8 @@ fi
 
 # tmux isn't installed. Optionally try a best-effort install (macOS: Homebrew).
 # This is opt-in to avoid surprising users / doing network installs silently.
-if [ "${{TERMITE_TMUX_AUTO_INSTALL:-0}}" = "1" ] && command -v brew >/dev/null 2>&1; then
-  echo "[termite] tmux not found; installing via brew..."
+if [ "${{MULTERM_TMUX_AUTO_INSTALL:-0}}" = "1" ] && command -v brew >/dev/null 2>&1; then
+  echo "[multerm] tmux not found; installing via brew..."
   brew install tmux >/dev/null 2>&1 || brew install tmux || true
 fi
 
@@ -238,7 +238,7 @@ if command -v tmux >/dev/null 2>&1; then
   exec tmux attach -t '{session}'
 fi
 
-echo "[termite] tmux is not installed; falling back to a normal shell."
+echo "[multerm] tmux is not installed; falling back to a normal shell."
 exec "${{SHELL:-/bin/zsh}}" -i
 "#,
             session = session_name_q
@@ -263,8 +263,8 @@ exec "${{SHELL:-/bin/zsh}}" -i
     }
 
     fn daemon_session_key_for_pane(pane_index: usize) -> String {
-        let prefix = std::env::var("TERMITE_DAEMON_SESSION_PREFIX")
-            .unwrap_or_else(|_| "termite".into());
+        let prefix = std::env::var("MULTERM_DAEMON_SESSION_PREFIX")
+            .unwrap_or_else(|_| "multerm".into());
 
         // Sanitize to tmux-like charset so it is safe for the daemon.
         let sanitize = |s: &str| {
@@ -304,8 +304,8 @@ exec "${{SHELL:-/bin/zsh}}" -i
     }
 
     fn connect_daemon(&self) -> anyhow::Result<TcpStream> {
-        if std::env::var("TERMITE_DAEMON_DISABLED").ok().as_deref() == Some("1") {
-            anyhow::bail!("termite daemon disabled");
+        if std::env::var("MULTERM_DAEMON_DISABLED").ok().as_deref() == Some("1") {
+            anyhow::bail!("multerm daemon disabled");
         }
 
         // First, try the port file if it exists.
@@ -335,7 +335,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        anyhow::bail!("could not connect to termite session daemon");
+        anyhow::bail!("could not connect to multerm session daemon");
     }
 
     fn spawn_pane(&self, rows: usize, cols: usize, pane_index: usize) -> PaneRuntime {
@@ -508,7 +508,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
         col = col.min(grid.cols.saturating_sub(1));
 
         // Normalize wide glyph clicks: map the trailing half back to the leading cell.
-        if grid.cell(row, col).wide == termite_vt::WideKind::Trailing && col > 0 {
+        if grid.cell(row, col).wide == multerm_vt::WideKind::Trailing && col > 0 {
             col -= 1;
         }
 
@@ -536,11 +536,11 @@ exec "${{SHELL:-/bin/zsh}}" -i
     }
 }
 
-impl ApplicationHandler<UserEvent> for TermiteApp {
+impl ApplicationHandler<UserEvent> for MultermApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // ── Create window ─────────────────────────────────────────────────────
         let attrs = Window::default_attributes()
-            .with_title("TermITE")
+            .with_title("Multerm")
             .with_inner_size(LogicalSize::new(WINDOW_W, WINDOW_H));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
@@ -574,7 +574,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
         self.selection_drag = None;
         self.active_pane = 0;
 
-        tracing::info!("TermITE started — {}×{} cells", cols, rows);
+        tracing::info!("Multerm started — {}×{} cells", cols, rows);
     }
 
     fn window_event(
@@ -717,7 +717,7 @@ impl ApplicationHandler<UserEvent> for TermiteApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
 }
 
-impl TermiteApp {
+impl MultermApp {
     fn active_selection(&self) -> Option<SelectionRange> {
         self.selections
             .get(self.active_pane)
@@ -929,7 +929,7 @@ impl TermiteApp {
         };
 
         let scale = window.scale_factor() as f32;
-        let pane_grids: Vec<([f32; 4], &termite_vt::TerminalGrid)> = {
+        let pane_grids: Vec<([f32; 4], &multerm_vt::TerminalGrid)> = {
             let mut grids = Vec::with_capacity(self.panes.len());
             for (i, (pane, rect)) in self.panes.iter().zip(pane_rects.iter()).enumerate() {
                 let grid = self.histories.get(i)

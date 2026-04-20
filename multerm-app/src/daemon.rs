@@ -8,7 +8,7 @@ use std::{
 };
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use termite_core::{pty::spawn_pty, PtyHandle};
+use multerm_core::{pty::spawn_pty, PtyHandle};
 
 const FRAME_ATTACH: u8 = 1;
 const FRAME_ATTACH_ERROR: u8 = 2;
@@ -86,12 +86,12 @@ fn daemon_base_dir() -> anyhow::Result<PathBuf> {
         let base = std::env::var("LOCALAPPDATA")
             .or_else(|_| std::env::var("APPDATA"))
             .unwrap_or_else(|_| ".".into());
-        Ok(PathBuf::from(base).join("termite"))
+        Ok(PathBuf::from(base).join("multerm"))
     }
     #[cfg(not(windows))]
     {
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Ok(PathBuf::from(base).join(".termite"))
+        Ok(PathBuf::from(base).join(".multerm"))
     }
 }
 
@@ -191,7 +191,7 @@ pub fn attach_request_payload(
 }
 
 fn history_max_bytes() -> usize {
-    std::env::var("TERMITE_DAEMON_HISTORY_BYTES")
+    std::env::var("MULTERM_DAEMON_HISTORY_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8 * 1024 * 1024)
@@ -212,7 +212,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     fs::write(&port_file, port.to_string())?;
 
-    tracing::info!("termite session daemon listening on 127.0.0.1:{port}");
+    tracing::info!("multerm session daemon listening on 127.0.0.1:{port}");
 
     let (cmd_tx, cmd_rx) = unbounded::<DaemonCmd>();
     let accept_cmd_tx = cmd_tx.clone();

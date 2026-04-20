@@ -1,5 +1,5 @@
 [package]
-name    = "termite-vt"
+name    = "multerm-vt"
 version.workspace = true
 edition.workspace = true
 

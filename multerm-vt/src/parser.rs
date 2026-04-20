@@ -70,12 +70,12 @@ impl VtePerformer {
         }
     }
 
-    // ── Debug helper (writes to /tmp/termite_vt.log) ─────────────────────────
+    // ── Debug helper (writes to /tmp/multerm_vt.log) ─────────────────────────
 
     fn vt_log(&self, msg: &str) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true).append(true)
-            .open("/tmp/termite_vt.log")
+            .open("/tmp/multerm_vt.log")
         {
             let _ = writeln!(f, "p{} t={} rows={} cursor=({},{}) scroll=({},{}) | {}",
                 self.id,
