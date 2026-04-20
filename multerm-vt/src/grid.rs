@@ -15,20 +15,20 @@ pub struct Cursor {
 /// The 2-D terminal screen buffer.
 #[derive(Clone, Debug)]
 pub struct TerminalGrid {
-    pub rows:       usize,
-    pub cols:       usize,
+    pub rows: usize,
+    pub cols: usize,
     /// Row-major, size = rows * cols.
-    pub cells:      Vec<Cell>,
-    pub cursor:     Cursor,
+    pub cells: Vec<Cell>,
+    pub cursor: Cursor,
     /// Per-row dirty flag; reset by the renderer after each frame.
-    pub dirty:      Vec<bool>,
+    pub dirty: Vec<bool>,
     /// Top of scrolling region (0-based, inclusive).
     pub scroll_top: usize,
     /// Bottom of scrolling region (0-based, inclusive).
     pub scroll_bot: usize,
     /// Saved primary screen when inside alternate screen; `None` when on primary.
-    alternate:      Option<Box<TerminalGrid>>,
-    pub in_alt:     bool,
+    alternate: Option<Box<TerminalGrid>>,
+    pub in_alt: bool,
     /// Primary-buffer lines that scrolled off the top (oldest at front). Not used on the
     /// alternate screen. Each row has length `cols`.
     pub scrollback: VecDeque<Vec<Cell>>,
@@ -40,13 +40,13 @@ impl TerminalGrid {
         Self {
             rows,
             cols,
-            cells:      vec![Cell::default(); total],
-            cursor:     Cursor::default(),
-            dirty:      vec![true; rows.max(1)],
+            cells: vec![Cell::default(); total],
+            cursor: Cursor::default(),
+            dirty: vec![true; rows.max(1)],
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
-            alternate:  None,
-            in_alt:     false,
+            alternate: None,
+            in_alt: false,
             scrollback: VecDeque::new(),
         }
     }
@@ -77,10 +77,10 @@ impl TerminalGrid {
                 new_cells[r * new_cols + c] = self.cells[r * self.cols + c].clone();
             }
         }
-        self.rows   = new_rows;
-        self.cols   = new_cols;
-        self.cells  = new_cells;
-        self.dirty  = vec![true; new_rows];
+        self.rows = new_rows;
+        self.cols = new_cols;
+        self.cells = new_cells;
+        self.dirty = vec![true; new_rows];
         self.cursor.row = self.cursor.row.min(new_rows - 1);
         self.cursor.col = self.cursor.col.min(new_cols - 1);
         self.scroll_top = 0;
@@ -117,7 +117,8 @@ impl TerminalGrid {
         if vrow >= self.total_rows() || self.cols == 0 {
             return 0;
         }
-        let visible_space_attrs = CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
+        let visible_space_attrs =
+            CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
         let mut end = self.cols;
         while end > 0 {
             let cell = self.virtual_cell(vrow, end - 1);
@@ -223,7 +224,7 @@ impl TerminalGrid {
         let fresh = Box::new(TerminalGrid::new(rows, cols));
         let primary = std::mem::replace(self, *fresh);
         self.alternate = Some(Box::new(primary));
-        self.in_alt    = true;
+        self.in_alt = true;
     }
 
     pub fn leave_alternate(&mut self) {

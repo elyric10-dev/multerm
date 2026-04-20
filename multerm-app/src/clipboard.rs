@@ -1,7 +1,7 @@
 use arboard::Clipboard;
-use std::process::{Command, Stdio};
 use multerm_render::SelectionRange;
 use multerm_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SgrProps {

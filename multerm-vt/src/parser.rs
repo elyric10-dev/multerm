@@ -14,20 +14,20 @@ struct VtePerformer {
     id: u32,
 
     // Current SGR state
-    fg:    Color,
-    bg:    Color,
+    fg: Color,
+    bg: Color,
     attrs: CellAttrs,
 
     // Saved cursor + SGR
-    saved_row:   usize,
-    saved_col:   usize,
-    saved_fg:    Color,
-    saved_bg:    Color,
+    saved_row: usize,
+    saved_col: usize,
+    saved_fg: Color,
+    saved_bg: Color,
     saved_attrs: CellAttrs,
 
     // Modes
     pub app_cursor_keys: bool,
-    pub cursor_visible:  bool,
+    pub cursor_visible: bool,
 
     // Auto-wrap pending flag: set when last printed char reached last column.
     pending_wrap: bool,
@@ -46,19 +46,19 @@ impl VtePerformer {
             tab_stops[i] = true;
         }
         Self {
-            grid:            TerminalGrid::new(rows, cols),
+            grid: TerminalGrid::new(rows, cols),
             id,
-            fg:              Color::Default,
-            bg:              Color::Default,
-            attrs:           CellAttrs::empty(),
-            saved_row:       0,
-            saved_col:       0,
-            saved_fg:        Color::Default,
-            saved_bg:        Color::Default,
-            saved_attrs:     CellAttrs::empty(),
+            fg: Color::Default,
+            bg: Color::Default,
+            attrs: CellAttrs::empty(),
+            saved_row: 0,
+            saved_col: 0,
+            saved_fg: Color::Default,
+            saved_bg: Color::Default,
+            saved_attrs: CellAttrs::empty(),
             app_cursor_keys: false,
-            cursor_visible:  true,
-            pending_wrap:    false,
+            cursor_visible: true,
+            pending_wrap: false,
             tab_stops,
         }
     }
@@ -74,19 +74,25 @@ impl VtePerformer {
 
     fn vt_log(&self, msg: &str) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open("/tmp/multerm_vt.log")
         {
-            let _ = writeln!(f, "p{} t={} rows={} cursor=({},{}) scroll=({},{}) | {}",
+            let _ = writeln!(
+                f,
+                "p{} t={} rows={} cursor=({},{}) scroll=({},{}) | {}",
                 self.id,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
                 self.grid.rows,
-                self.grid.cursor.row, self.grid.cursor.col,
-                self.grid.scroll_top, self.grid.scroll_bot,
-                msg);
+                self.grid.cursor.row,
+                self.grid.cursor.col,
+                self.grid.scroll_top,
+                self.grid.scroll_bot,
+                msg
+            );
         }
     }
 
@@ -143,15 +149,15 @@ impl VtePerformer {
         let mut i = 0usize;
         while i < flat.len() {
             match flat[i] {
-                0  => self.reset_sgr(),
-                1  => self.attrs.insert(CellAttrs::BOLD),
-                2  => self.attrs.insert(CellAttrs::DIM),
-                3  => self.attrs.insert(CellAttrs::ITALIC),
-                4  => self.attrs.insert(CellAttrs::UNDERLINE),
+                0 => self.reset_sgr(),
+                1 => self.attrs.insert(CellAttrs::BOLD),
+                2 => self.attrs.insert(CellAttrs::DIM),
+                3 => self.attrs.insert(CellAttrs::ITALIC),
+                4 => self.attrs.insert(CellAttrs::UNDERLINE),
                 5 | 6 => self.attrs.insert(CellAttrs::BLINK),
-                7  => self.attrs.insert(CellAttrs::REVERSE),
-                8  => self.attrs.insert(CellAttrs::INVISIBLE),
-                9  => self.attrs.insert(CellAttrs::STRIKETHROUGH),
+                7 => self.attrs.insert(CellAttrs::REVERSE),
+                8 => self.attrs.insert(CellAttrs::INVISIBLE),
+                9 => self.attrs.insert(CellAttrs::STRIKETHROUGH),
                 22 => self.attrs.remove(CellAttrs::BOLD | CellAttrs::DIM),
                 23 => self.attrs.remove(CellAttrs::ITALIC),
                 24 => self.attrs.remove(CellAttrs::UNDERLINE),
@@ -166,7 +172,8 @@ impl VtePerformer {
                         self.fg = Color::Indexed(flat[i + 2] as u8);
                         i += 2;
                     } else if i + 4 < flat.len() && flat[i + 1] == 2 {
-                        self.fg = Color::Rgb(flat[i+2] as u8, flat[i+3] as u8, flat[i+4] as u8);
+                        self.fg =
+                            Color::Rgb(flat[i + 2] as u8, flat[i + 3] as u8, flat[i + 4] as u8);
                         i += 4;
                     }
                 }
@@ -178,7 +185,8 @@ impl VtePerformer {
                         self.bg = Color::Indexed(flat[i + 2] as u8);
                         i += 2;
                     } else if i + 4 < flat.len() && flat[i + 1] == 2 {
-                        self.bg = Color::Rgb(flat[i+2] as u8, flat[i+3] as u8, flat[i+4] as u8);
+                        self.bg =
+                            Color::Rgb(flat[i + 2] as u8, flat[i + 3] as u8, flat[i + 4] as u8);
                         i += 4;
                     }
                 }
@@ -194,8 +202,8 @@ impl VtePerformer {
     }
 
     fn reset_sgr(&mut self) {
-        self.fg    = Color::Default;
-        self.bg    = Color::Default;
+        self.fg = Color::Default;
+        self.bg = Color::Default;
         self.attrs = CellAttrs::empty();
     }
 
@@ -239,7 +247,7 @@ impl VtePerformer {
     }
 
     fn erase_in_line(&mut self, n: u16) {
-        let cols  = self.grid.cols;
+        let cols = self.grid.cols;
         let (row, col) = (self.grid.cursor.row, self.grid.cursor.col);
         match n {
             0 => self.grid.clear_line_range(row, col, cols),
@@ -272,22 +280,26 @@ impl Perform for VtePerformer {
 
         {
             let cell = self.grid.cell_mut(row, col);
-            cell.ch    = c;
-            cell.fg    = self.fg;
-            cell.bg    = self.bg;
+            cell.ch = c;
+            cell.fg = self.fg;
+            cell.bg = self.bg;
             cell.attrs = self.attrs;
-            cell.wide  = if is_wide { WideKind::Leading } else { WideKind::None };
+            cell.wide = if is_wide {
+                WideKind::Leading
+            } else {
+                WideKind::None
+            };
         }
 
         if is_wide {
             // Fill trailing cell
             if col + 1 < self.grid.cols {
                 let trail = self.grid.cell_mut(row, col + 1);
-                trail.ch    = ' ';
-                trail.fg    = self.fg;
-                trail.bg    = self.bg;
+                trail.ch = ' ';
+                trail.fg = self.fg;
+                trail.bg = self.bg;
                 trail.attrs = self.attrs;
-                trail.wide  = WideKind::Trailing;
+                trail.wide = WideKind::Trailing;
             }
             let next_col = col + 2;
             if next_col >= self.grid.cols {
@@ -377,7 +389,10 @@ impl Perform for VtePerformer {
                 let mut params_iter = params.iter();
                 let row = params_iter.next().map(|s| s[0]).unwrap_or(1).max(1) as usize;
                 let col = params_iter.next().map(|s| s[0]).unwrap_or(1).max(1) as usize;
-                self.vt_log(&format!("CUP ({},{}) → grid rows={}", row, col, self.grid.rows));
+                self.vt_log(&format!(
+                    "CUP ({},{}) → grid rows={}",
+                    row, col, self.grid.rows
+                ));
                 self.grid.cursor.row = (row - 1).min(self.grid.rows - 1);
                 self.grid.cursor.col = (col - 1).min(self.grid.cols - 1);
             }
@@ -401,7 +416,7 @@ impl Perform for VtePerformer {
             (false, 'P') => {
                 let row = self.grid.cursor.row;
                 let col = self.grid.cursor.col;
-                let n   = (p0_1 as usize).min(self.grid.cols - col);
+                let n = (p0_1 as usize).min(self.grid.cols - col);
                 let cols = self.grid.cols;
                 for c in col..(cols - n) {
                     self.grid.cells[row * cols + c] = self.grid.cells[row * cols + c + n].clone();
@@ -440,16 +455,22 @@ impl Perform for VtePerformer {
                 let set = c == 'h';
                 for sub in params.iter() {
                     match sub[0] {
-                        1    => self.app_cursor_keys = set,
-                        7    => {} // auto-wrap (always on for us)
-                        25   => self.cursor_visible = set,
+                        1 => self.app_cursor_keys = set,
+                        7 => {} // auto-wrap (always on for us)
+                        25 => self.cursor_visible = set,
                         1049 => {
-                            if set { self.grid.enter_alternate(); }
-                            else   { self.grid.leave_alternate(); }
+                            if set {
+                                self.grid.enter_alternate();
+                            } else {
+                                self.grid.leave_alternate();
+                            }
                         }
                         47 | 1047 => {
-                            if set { self.grid.enter_alternate(); }
-                            else   { self.grid.leave_alternate(); }
+                            if set {
+                                self.grid.enter_alternate();
+                            } else {
+                                self.grid.leave_alternate();
+                            }
                         }
                         _ => {}
                     }
@@ -464,22 +485,24 @@ impl Perform for VtePerformer {
             // ANSI cursor save (same semantics as ESC 7 / DECSC)
             (false, 's') => {
                 self.vt_log("CSI s  (ANSI save)");
-                self.saved_row   = self.grid.cursor.row;
-                self.saved_col   = self.grid.cursor.col;
-                self.saved_fg    = self.fg;
-                self.saved_bg    = self.bg;
+                self.saved_row = self.grid.cursor.row;
+                self.saved_col = self.grid.cursor.col;
+                self.saved_fg = self.fg;
+                self.saved_bg = self.bg;
                 self.saved_attrs = self.attrs;
             }
             // ANSI cursor restore (same semantics as ESC 8 / DECRC)
             (false, 'u') => {
-                self.vt_log(&format!("CSI u  (ANSI restore) → saved=({},{})",
-                    self.saved_row, self.saved_col));
+                self.vt_log(&format!(
+                    "CSI u  (ANSI restore) → saved=({},{})",
+                    self.saved_row, self.saved_col
+                ));
                 self.grid.cursor.row = self.saved_row.min(self.grid.rows - 1);
                 self.grid.cursor.col = self.saved_col.min(self.grid.cols - 1);
-                self.fg              = self.saved_fg;
-                self.bg              = self.saved_bg;
-                self.attrs           = self.saved_attrs;
-                self.pending_wrap    = false;
+                self.fg = self.saved_fg;
+                self.bg = self.saved_bg;
+                self.attrs = self.saved_attrs;
+                self.pending_wrap = false;
             }
             // Set Scrolling Region (DECSTBM)
             (false, 'r') => {
@@ -506,22 +529,24 @@ impl Perform for VtePerformer {
             // Save cursor (DECSC)
             (None, b'7') => {
                 self.vt_log("ESC 7  (DEC save)");
-                self.saved_row   = self.grid.cursor.row;
-                self.saved_col   = self.grid.cursor.col;
-                self.saved_fg    = self.fg;
-                self.saved_bg    = self.bg;
+                self.saved_row = self.grid.cursor.row;
+                self.saved_col = self.grid.cursor.col;
+                self.saved_fg = self.fg;
+                self.saved_bg = self.bg;
                 self.saved_attrs = self.attrs;
             }
             // Restore cursor (DECRC)
             (None, b'8') => {
-                self.vt_log(&format!("ESC 8  (DEC restore) → saved=({},{})",
-                    self.saved_row, self.saved_col));
+                self.vt_log(&format!(
+                    "ESC 8  (DEC restore) → saved=({},{})",
+                    self.saved_row, self.saved_col
+                ));
                 self.grid.cursor.row = self.saved_row.min(self.grid.rows - 1);
                 self.grid.cursor.col = self.saved_col.min(self.grid.cols - 1);
-                self.fg              = self.saved_fg;
-                self.bg              = self.saved_bg;
-                self.attrs           = self.saved_attrs;
-                self.pending_wrap    = false;
+                self.fg = self.saved_fg;
+                self.bg = self.saved_bg;
+                self.attrs = self.saved_attrs;
+                self.pending_wrap = false;
             }
             // RIS — reset
             (None, b'c') => {
@@ -529,8 +554,8 @@ impl Perform for VtePerformer {
                 self.grid.cursor = Default::default();
                 self.reset_sgr();
                 self.app_cursor_keys = false;
-                self.cursor_visible  = true;
-                self.pending_wrap    = false;
+                self.cursor_visible = true;
+                self.pending_wrap = false;
                 let cols = self.grid.cols;
                 self.resize_tab_stops(cols);
             }
@@ -549,14 +574,14 @@ impl Perform for VtePerformer {
 
 /// Wraps `vte::Parser` and `VtePerformer`; processes raw PTY bytes into a `TerminalGrid`.
 pub struct TerminalParser {
-    parser:    Parser,
+    parser: Parser,
     performer: VtePerformer,
 }
 
 impl TerminalParser {
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
-            parser:    Parser::new(),
+            parser: Parser::new(),
             performer: VtePerformer::new(rows, cols),
         }
     }
@@ -567,7 +592,6 @@ impl TerminalParser {
             self.parser.advance(&mut self.performer, byte);
         }
     }
-
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.performer.grid.resize(rows, cols);

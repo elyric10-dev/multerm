@@ -1,4 +1,7 @@
-use multerm_vt::{cell::{CellAttrs, Color}, TerminalParser};
+use multerm_vt::{
+    cell::{CellAttrs, Color},
+    TerminalParser,
+};
 
 fn parser(rows: usize, cols: usize) -> TerminalParser {
     TerminalParser::new(rows, cols)
@@ -65,9 +68,9 @@ fn test_cursor_position() {
 fn test_cursor_up_down() {
     let mut p = parser(24, 80);
     feed(&mut p, "\x1b[10;1H"); // row 9
-    feed(&mut p, "\x1b[3A");    // up 3 → row 6
+    feed(&mut p, "\x1b[3A"); // up 3 → row 6
     assert_eq!(p.grid().cursor.row, 6);
-    feed(&mut p, "\x1b[2B");    // down 2 → row 8
+    feed(&mut p, "\x1b[2B"); // down 2 → row 8
     assert_eq!(p.grid().cursor.row, 8);
 }
 
@@ -75,9 +78,9 @@ fn test_cursor_up_down() {
 fn test_cursor_forward_back() {
     let mut p = parser(24, 80);
     feed(&mut p, "\x1b[1;1H");
-    feed(&mut p, "\x1b[5C");  // forward 5 → col 5
+    feed(&mut p, "\x1b[5C"); // forward 5 → col 5
     assert_eq!(p.grid().cursor.col, 5);
-    feed(&mut p, "\x1b[2D");  // back 2 → col 3
+    feed(&mut p, "\x1b[2D"); // back 2 → col 3
     assert_eq!(p.grid().cursor.col, 3);
 }
 

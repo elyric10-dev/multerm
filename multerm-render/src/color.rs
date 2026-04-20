@@ -9,7 +9,11 @@ pub const DEFAULT_BG: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 pub fn color_to_linear(c: Color, is_fg: bool) -> [f32; 4] {
     match c {
         Color::Default => {
-            if is_fg { DEFAULT_FG } else { DEFAULT_BG }
+            if is_fg {
+                DEFAULT_FG
+            } else {
+                DEFAULT_BG
+            }
         }
         Color::Indexed(i) => {
             let [r, g, b] = ansi_indexed_to_rgb(i);
@@ -23,21 +27,21 @@ pub fn color_to_linear(c: Color, is_fg: bool) -> [f32; 4] {
 pub fn ansi_indexed_to_rgb(i: u8) -> [u8; 3] {
     // Classic 16 ANSI colors
     static ANSI16: [[u8; 3]; 16] = [
-        [0,   0,   0  ], // 0 Black
-        [170, 0,   0  ], // 1 Red
-        [0,   170, 0  ], // 2 Green
-        [170, 170, 0  ], // 3 Yellow
-        [0,   0,   170], // 4 Blue
-        [170, 0,   170], // 5 Magenta
-        [0,   170, 170], // 6 Cyan
+        [0, 0, 0],       // 0 Black
+        [170, 0, 0],     // 1 Red
+        [0, 170, 0],     // 2 Green
+        [170, 170, 0],   // 3 Yellow
+        [0, 0, 170],     // 4 Blue
+        [170, 0, 170],   // 5 Magenta
+        [0, 170, 170],   // 6 Cyan
         [170, 170, 170], // 7 White
-        [85,  85,  85 ], // 8 Bright Black (dark grey)
-        [255, 85,  85 ], // 9 Bright Red
-        [85,  255, 85 ], // 10 Bright Green
-        [255, 255, 85 ], // 11 Bright Yellow
-        [85,  85,  255], // 12 Bright Blue
-        [255, 85,  255], // 13 Bright Magenta
-        [85,  255, 255], // 14 Bright Cyan
+        [85, 85, 85],    // 8 Bright Black (dark grey)
+        [255, 85, 85],   // 9 Bright Red
+        [85, 255, 85],   // 10 Bright Green
+        [255, 255, 85],  // 11 Bright Yellow
+        [85, 85, 255],   // 12 Bright Blue
+        [255, 85, 255],  // 13 Bright Magenta
+        [85, 255, 255],  // 14 Bright Cyan
         [255, 255, 255], // 15 Bright White
     ];
 
@@ -47,11 +51,11 @@ pub fn ansi_indexed_to_rgb(i: u8) -> [u8; 3] {
 
     // 6×6×6 colour cube: indices 16–231
     if i < 232 {
-        let n   = i - 16;
-        let b   = n % 6;
-        let g   = (n / 6) % 6;
-        let r   = n / 36;
-        let f   = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
+        let n = i - 16;
+        let b = n % 6;
+        let g = (n / 6) % 6;
+        let r = n / 36;
+        let f = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
         return [f(r), f(g), f(b)];
     }
 

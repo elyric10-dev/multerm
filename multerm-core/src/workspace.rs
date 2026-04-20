@@ -4,15 +4,23 @@ use crate::ids::{PaneId, TabId, WorkspaceId};
 #[derive(Clone, Debug)]
 pub enum PaneLayout {
     Single(PaneId),
-    HSplit { ratio: f32, top: Box<PaneLayout>, bottom: Box<PaneLayout> },
-    VSplit { ratio: f32, left: Box<PaneLayout>, right: Box<PaneLayout> },
+    HSplit {
+        ratio: f32,
+        top: Box<PaneLayout>,
+        bottom: Box<PaneLayout>,
+    },
+    VSplit {
+        ratio: f32,
+        left: Box<PaneLayout>,
+        right: Box<PaneLayout>,
+    },
 }
 
 /// A single tab containing a pane layout.
 #[derive(Debug)]
 pub struct Tab {
-    pub id:     TabId,
-    pub title:  String,
+    pub id: TabId,
+    pub title: String,
     pub layout: PaneLayout,
 }
 
@@ -20,8 +28,8 @@ impl Tab {
     pub fn new_single(title: impl Into<String>) -> (Self, PaneId) {
         let pane_id = PaneId::new();
         let tab = Self {
-            id:     TabId::new(),
-            title:  title.into(),
+            id: TabId::new(),
+            title: title.into(),
             layout: PaneLayout::Single(pane_id),
         };
         (tab, pane_id)
@@ -31,16 +39,16 @@ impl Tab {
 /// The top-level workspace containing tabs.
 #[derive(Debug)]
 pub struct Workspace {
-    pub id:          WorkspaceId,
-    pub tabs:        Vec<Tab>,
-    pub active_tab:  usize,
+    pub id: WorkspaceId,
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
 }
 
 impl Workspace {
     pub fn new() -> Self {
         Self {
-            id:         WorkspaceId::new(),
-            tabs:       Vec::new(),
+            id: WorkspaceId::new(),
+            tabs: Vec::new(),
             active_tab: 0,
         }
     }

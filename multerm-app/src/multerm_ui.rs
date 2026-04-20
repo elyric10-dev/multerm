@@ -4,6 +4,11 @@ use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke,
     TextEdit, Vec2, ViewportBuilder, ViewportClass, ViewportId,
 };
+use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
+use multerm_render::color::ansi_indexed_to_rgb;
+use multerm_render::SelectionRange;
+use multerm_vt::cell::{Cell, CellAttrs, Color, WideKind};
+use multerm_vt::TerminalGrid;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,11 +25,6 @@ use sysinfo::{
     get_current_pid, CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate,
     RefreshKind, System,
 };
-use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
-use multerm_render::color::ansi_indexed_to_rgb;
-use multerm_render::SelectionRange;
-use multerm_vt::cell::{Cell, CellAttrs, Color, WideKind};
-use multerm_vt::TerminalGrid;
 
 mod clipboard;
 mod daemon;
@@ -49,6 +49,7 @@ enum UiStyle {
 const MAX_PANEL_GRID_ROWS: u8 = 8;
 
 const LINE_EDITOR_MAX_HISTORY: usize = 100;
+const CLOSED_WORKSPACE_HISTORY_MAX: usize = 32;
 
 /// A single snapshot of the line buffer: text content + cursor position.
 #[derive(Clone)]
@@ -941,6 +942,8 @@ struct MultermUi {
     prev_terminal_focus_key: Option<(usize, Option<usize>)>,
     /// Terminals popped out into their own native fullscreen window (double-click pane title).
     fullscreen_terminal_ids: HashSet<u64>,
+    closed_workspace_undo_stack: Vec<ClosedWorkspaceRecord>,
+    closed_workspace_redo_stack: Vec<ClosedWorkspaceRecord>,
 }
 
 struct WorkspaceRuntime {
@@ -1027,6 +1030,12 @@ struct WorkspaceTabState {
     equal_size_source_terminal_id: Option<u64>,
 }
 
+#[derive(Clone)]
+struct ClosedWorkspaceRecord {
+    index: usize,
+    tab: WorkspaceTabState,
+}
+
 impl Default for MultermUi {
     fn default() -> Self {
         if let Some(state) = load_workspace_state() {
@@ -1102,6 +1111,8 @@ impl Default for MultermUi {
                 tab_drag: None,
                 prev_terminal_focus_key: None,
                 fullscreen_terminal_ids: HashSet::new(),
+                closed_workspace_undo_stack: Vec::new(),
+                closed_workspace_redo_stack: Vec::new(),
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1237,6 +1248,8 @@ impl Default for MultermUi {
             tab_drag: None,
             prev_terminal_focus_key: None,
             fullscreen_terminal_ids: HashSet::new(),
+            closed_workspace_undo_stack: Vec::new(),
+            closed_workspace_redo_stack: Vec::new(),
         }
     }
 }
@@ -1528,7 +1541,6 @@ impl eframe::App for MultermUi {
             )
             .show(ctx, |ui| {
                 header_tabs(ui, self, p);
-                ui.add_space(5.0);
                 directory_path_bar(ui, self, p);
             });
 
@@ -3337,7 +3349,9 @@ impl MultermUi {
             runtime.terminals.push(pane);
             runtime.selections.push(None);
             runtime.line_editors.push(LineEditor::new());
-            runtime.scrollback_searches.push(ScrollbackSearchPaneState::default());
+            runtime
+                .scrollback_searches
+                .push(ScrollbackSearchPaneState::default());
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
         self.next_terminal_id = next_terminal_id + 1;
@@ -3409,7 +3423,9 @@ impl MultermUi {
                 .scrollback_searches
                 .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
         } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
-            runtime.scrollback_searches.truncate(runtime.terminals.len());
+            runtime
+                .scrollback_searches
+                .truncate(runtime.terminals.len());
         }
 
         let pane_id = runtime.terminals[active_idx].id;
@@ -3518,8 +3534,7 @@ impl MultermUi {
                     let ctrl = modifiers.ctrl;
                     let shift = modifiers.shift;
 
-                    let is_open_find =
-                        key == egui::Key::F && (cmd || ctrl) && !shift;
+                    let is_open_find = key == egui::Key::F && (cmd || ctrl) && !shift;
                     if is_open_find {
                         runtime.scrollback_searches[active_idx].open = true;
                         runtime.scrollback_search_focus_pane.set(Some(pane_id));
@@ -3550,7 +3565,10 @@ impl MultermUi {
                     }
 
                     // ── Undo / redo typed text ────────────────────────────────
-                    if search_focused && ((cmd && !shift && key == egui::Key::Z) || (cmd && shift && key == egui::Key::Z)) {
+                    if search_focused
+                        && ((cmd && !shift && key == egui::Key::Z)
+                            || (cmd && shift && key == egui::Key::Z))
+                    {
                         continue;
                     }
                     if cmd && !shift && key == egui::Key::Z {
@@ -3601,9 +3619,7 @@ impl MultermUi {
                         continue;
                     }
                     if is_copy_rich {
-                        if let Some(range) = runtime.selections[active_idx]
-                            .filter(|r| r.active)
-                        {
+                        if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
                             let grid = runtime.terminals[active_idx].session.parser.grid();
                             let text = clipboard::selection_to_ansi_sgr_text(grid, range);
                             let _ = clipboard::set_clipboard_text(&text);
@@ -3647,7 +3663,9 @@ impl MultermUi {
                                     ed.push_paste(&clean);
                                 }
                                 let mut buf = delete_bytes;
-                                buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(&clean));
+                                buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(
+                                    &clean,
+                                ));
                                 let _ = runtime.terminals[active_idx].backend.write_all(&buf);
                             }
                         } else {
@@ -3765,7 +3783,9 @@ impl MultermUi {
                 .scrollback_searches
                 .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
         } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
-            runtime.scrollback_searches.truncate(runtime.terminals.len());
+            runtime
+                .scrollback_searches
+                .truncate(runtime.terminals.len());
         }
 
         let selected_ws = self
@@ -3835,8 +3855,11 @@ impl MultermUi {
             .inner
         };
 
-        let pane_response =
-            ui.interact(content_rect, ui.id().with(("fs_term_click", pane_id)), Sense::click());
+        let pane_response = ui.interact(
+            content_rect,
+            ui.id().with(("fs_term_click", pane_id)),
+            Sense::click(),
+        );
 
         if let Some((clicked_vrow, clicked_col)) = clicked_cell_from_grid {
             let pane = &mut runtime.terminals[pane_idx];
@@ -3845,8 +3868,7 @@ impl MultermUi {
             if clicked_vrow >= sb && grid.cols > 0 {
                 let clicked_row = clicked_vrow - sb;
                 let target_row = clicked_row.min(grid.rows.saturating_sub(1));
-                let row_end =
-                    row_render_end(grid, target_row).min(grid.cols.saturating_sub(1));
+                let row_end = row_render_end(grid, target_row).min(grid.cols.saturating_sub(1));
                 let target_col = clicked_col
                     .min(row_end.saturating_add(1))
                     .min(grid.cols.saturating_sub(1));
@@ -4904,13 +4926,13 @@ fn render_terminal_grid(
                 continue;
             }
 
-            let base_fmt_start = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
+            let base_fmt_start =
+                cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
             let mut fmt = base_fmt_start.clone();
-            let is_selected = selection.map_or(false, |sel| {
-                sel.contains(vrow, col, total_rows, grid.cols)
-            });
-            let in_search = search_highlight
-                .is_some_and(|r| r.contains(vrow, col, total_rows, grid.cols));
+            let is_selected =
+                selection.map_or(false, |sel| sel.contains(vrow, col, total_rows, grid.cols));
+            let in_search =
+                search_highlight.is_some_and(|r| r.contains(vrow, col, total_rows, grid.cols));
             if is_selected {
                 // Invert the displayed fg/bg to highlight selection.
                 let normal_fg = fmt.color;
@@ -4968,11 +4990,10 @@ fn render_terminal_grid(
                     continue;
                 }
                 let fmt2_base = cell_text_format(c2, font_id.clone(), p.term_bg, p.vt_default_fg);
-                let is_sel2 = selection.map_or(false, |sel| {
-                    sel.contains(vrow, next, total_rows, grid.cols)
-                });
-                let in_srch2 = search_highlight
-                    .is_some_and(|r| r.contains(vrow, next, total_rows, grid.cols));
+                let is_sel2 =
+                    selection.map_or(false, |sel| sel.contains(vrow, next, total_rows, grid.cols));
+                let in_srch2 =
+                    search_highlight.is_some_and(|r| r.contains(vrow, next, total_rows, grid.cols));
                 if is_selected != is_sel2
                     || in_search != in_srch2
                     || !formats_match(&base_fmt_start, &fmt2_base)
@@ -5076,8 +5097,9 @@ fn render_terminal_grid(
                 let caret_row_v = cursor_row_v.min(total_rows.saturating_sub(1));
                 let caret_col = cursor_col.min(grid.cols.saturating_sub(1));
                 let caret_x = response.rect.min.x + caret_col as f32 * glyph_w;
-                let caret_y =
-                    response.rect.min.y + caret_row_v as f32 * row_h + TERMINAL_CELL_OVERLAY_Y_NUDGE;
+                let caret_y = response.rect.min.y
+                    + caret_row_v as f32 * row_h
+                    + TERMINAL_CELL_OVERLAY_Y_NUDGE;
                 let caret_rect = egui::Rect::from_min_size(
                     Pos2::new(caret_x, caret_y),
                     Vec2::new(glyph_w.clamp(6.0, 12.0), row_h.max(10.0)),
@@ -5090,9 +5112,7 @@ fn render_terminal_grid(
                     egui::StrokeKind::Outside,
                 );
                 let caret_key = (caret_row_v, caret_col);
-                if search_highlight.is_none()
-                    && (*caret_autoscroll != Some(caret_key))
-                {
+                if search_highlight.is_none() && (*caret_autoscroll != Some(caret_key)) {
                     ui.scroll_to_rect(caret_rect, Some(egui::Align::Center));
                     *caret_autoscroll = Some(caret_key);
                 }
@@ -5348,7 +5368,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
         .map(|i| {
             let char_count = app.workspaces[i].title.chars().count() + 4;
             let label_w = (char_count as f32 * 7.2_f32).max(88.0);
-            let badge_extra = if app.workspaces[i].badge.is_some() { 18.0 } else { 0.0 };
+            let badge_extra = if app.workspaces[i].badge.is_some() {
+                18.0
+            } else {
+                0.0
+            };
             (inner_x * 2.0 + label_w + badge_extra + 4.0 + close_w + 2.0).ceil()
         })
         .collect();
@@ -5357,7 +5381,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     // Determine where each tab wants to be in the "after-drop" layout so that
     // non-dragged tabs can smoothly slide to make room.
     let src_idx = app.tab_drag.as_ref().map(|d| d.source_idx);
-    let ins_before = app.tab_drag.as_ref().map(|d| d.insert_before).unwrap_or(n_tabs);
+    let ins_before = app
+        .tab_drag
+        .as_ref()
+        .map(|d| d.insert_before)
+        .unwrap_or(n_tabs);
 
     let target_xs: Vec<f32> = {
         let src = src_idx.unwrap_or(usize::MAX);
@@ -5379,18 +5407,14 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     // Smoothly interpolate each tab toward its target x.
     let current_xs: Vec<f32> = (0..n_tabs)
         .map(|i| {
-            ui.ctx().animate_value_with_time(
-                egui::Id::new("ttab_x").with(i),
-                target_xs[i],
-                0.15,
-            )
+            ui.ctx()
+                .animate_value_with_time(egui::Id::new("ttab_x").with(i), target_xs[i], 0.15)
         })
         .collect();
 
     ui.horizontal(|ui| {
         // Reserve the full tab strip as one block so the + / ⚙ buttons stay to the right.
-        let (strip, _) =
-            ui.allocate_exact_size(Vec2::new(total_tab_w, tab_h), Sense::hover());
+        let (strip, _) = ui.allocate_exact_size(Vec2::new(total_tab_w, tab_h), Sense::hover());
         let rx = strip.min.x;
         let ry = strip.min.y;
 
@@ -5407,8 +5431,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 
             let tx = rx + current_xs[idx];
             let tw = tab_widths[idx];
-            let tab_rect =
-                egui::Rect::from_min_size(Pos2::new(tx, ry), Vec2::new(tw, tab_h));
+            let tab_rect = egui::Rect::from_min_size(Pos2::new(tx, ry), Vec2::new(tw, tab_h));
             let close_rect = egui::Rect::from_min_size(
                 Pos2::new(tx + tw - inner_x - close_w, ry + (tab_h - 14.0) * 0.5),
                 Vec2::new(close_w, 14.0),
@@ -5421,11 +5444,15 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             if is_drag_src {
                 // Render the ghost at the cursor position.
                 let gx = app.tab_drag.as_ref().map(|d| d.ghost_x).unwrap_or(tx);
-                let ghost =
-                    egui::Rect::from_min_size(Pos2::new(gx, ry), Vec2::new(tw, tab_h));
-                let ghost_fill =
-                    Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 215);
-                painter.rect(ghost, 3.0, ghost_fill, Stroke::new(1.5, p.border), egui::StrokeKind::Inside);
+                let ghost = egui::Rect::from_min_size(Pos2::new(gx, ry), Vec2::new(tw, tab_h));
+                let ghost_fill = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 215);
+                painter.rect(
+                    ghost,
+                    3.0,
+                    ghost_fill,
+                    Stroke::new(1.5, p.border),
+                    egui::StrokeKind::Inside,
+                );
                 painter.text(
                     Pos2::new(gx + inner_x + 2.0, ry + tab_h * 0.5),
                     Align2::LEFT_CENTER,
@@ -5437,10 +5464,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 painter.rect_stroke(
                     tab_rect,
                     2.0,
-                    Stroke::new(
-                        1.0,
-                        Color32::from_rgba_unmultiplied(160, 160, 160, 55),
-                    ),
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 160, 160, 55)),
                     egui::StrokeKind::Inside,
                 );
 
@@ -5511,7 +5535,13 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             // --- Normal (non-dragged) tab ---
 
             // Background + border.
-            painter.rect(tab_rect, 2.0, fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.rect(
+                tab_rect,
+                2.0,
+                fill,
+                Stroke::new(1.0, p.border),
+                egui::StrokeKind::Inside,
+            );
 
             if is_editing {
                 // Inline rename editor.
@@ -5642,11 +5672,9 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             let others: Vec<usize> = (0..n_tabs).filter(|&i| i != src).collect();
             let ib_c = d.insert_before.min(others.len());
             let ind_x = rx + others[..ib_c].iter().map(|&i| tab_widths[i]).sum::<f32>();
-            let anim_x = ui.ctx().animate_value_with_time(
-                egui::Id::new("ttab_drop_x"),
-                ind_x,
-                0.10,
-            );
+            let anim_x =
+                ui.ctx()
+                    .animate_value_with_time(egui::Id::new("ttab_drop_x"), ind_x, 0.10);
             painter.line_segment(
                 [
                     Pos2::new(anim_x, ry + 2.0),
@@ -5702,12 +5730,51 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             changed = true;
         }
 
-        // ⚙ settings button (right-aligned).
-        let settings_btn_w = 34.0_f32;
-        let slack = (ui.available_width() - settings_btn_w).max(0.0);
+        // Keep undo/redo/settings grouped at the right side of the header.
+        let right_cluster_w = 34.0_f32 + 28.0_f32 + 28.0_f32 + 8.0_f32;
+        let slack = (ui.available_width() - right_cluster_w).max(0.0);
         ui.add_space(slack);
+        let undo_close_btn = ui
+            .add_enabled(
+                !app.closed_workspace_undo_stack.is_empty(),
+                egui::Button::new(
+                    RichText::new("↶")
+                        .size(14.0)
+                        .family(FontFamily::Monospace)
+                        .color(p.muted),
+                )
+                .fill(p.tab_inactive_bg)
+                .stroke(Stroke::new(1.0, p.border))
+                .min_size(Vec2::new(28.0, 28.0))
+                .corner_radius(3.0),
+            )
+            .on_hover_text("Restore the most recently closed workspace (including its terminals)");
+        if undo_close_btn.clicked() {
+            changed |= app.undo_close_workspace();
+        }
+
+        let redo_close_btn = ui
+            .add_enabled(
+                !app.closed_workspace_redo_stack.is_empty(),
+                egui::Button::new(
+                    RichText::new("↷")
+                        .size(14.0)
+                        .family(FontFamily::Monospace)
+                        .color(p.muted),
+                )
+                .fill(p.tab_inactive_bg)
+                .stroke(Stroke::new(1.0, p.border))
+                .min_size(Vec2::new(28.0, 28.0))
+                .corner_radius(3.0),
+            )
+            .on_hover_text("Close the workspace restored by Undo close");
+        if redo_close_btn.clicked() {
+            changed |= app.redo_close_workspace();
+        }
+
+        // ⚙ settings button.
         let _ = egui::containers::menu::MenuButton::from_button(egui::Button::new(
-            RichText::new("⚙").size(16.0).family(FontFamily::Monospace),
+            RichText::new("⚙").size(18.0).family(FontFamily::Monospace),
         ))
         .config(
             egui::containers::menu::MenuConfig::new()
@@ -5720,31 +5787,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 
     // Handle close workspace (done outside the closure to avoid borrow conflicts).
     if let Some(idx) = close_idx {
-        if app.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
-            app.tab_drag = None;
-        }
-        app.workspaces.remove(idx);
-        if idx < app.workspace_runtime.len() {
-            app.workspace_runtime.remove(idx);
-        }
-        if app.editing_workspace_idx == Some(idx) {
-            app.editing_workspace_idx = None;
-            app.editing_workspace_input.clear();
-        } else if let Some(ei) = app.editing_workspace_idx {
-            if ei > idx {
-                app.editing_workspace_idx = Some(ei - 1);
-            }
-        }
-        if app.workspaces.is_empty() {
-            app.selected_workspace = 0;
-        } else if app.selected_workspace > idx {
-            app.selected_workspace -= 1;
-        } else if app.selected_workspace == idx {
-            app.selected_workspace = app.selected_workspace.saturating_sub(1);
-        } else if app.selected_workspace >= app.workspaces.len() {
-            app.selected_workspace = app.workspaces.len().saturating_sub(1);
-        }
-        changed = true;
+        changed |= app.close_workspace_at(idx);
     }
 
     if changed {
@@ -6090,7 +6133,7 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     egui::Frame::default()
         .fill(p.path_bar_bg)
         .stroke(bar_stroke)
-        .inner_margin(Margin::symmetric(10, 4))
+        .inner_margin(Margin::symmetric(10, 2))
         .show(ui, |ui| {
             ui.set_width(full_width);
             let selected_idx = app
@@ -6105,7 +6148,7 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             ui.vertical(|ui| {
                 let mut working_dir_edit_response: Option<egui::Response> = None;
                 ui.horizontal(|ui| {
-                    let row_h = ui.spacing().interact_size.y.max(20.0);
+                    let row_h = ui.spacing().interact_size.y.max(30.0);
                     let path_field_stroke = Stroke::new(1.0, p.path_bar_border);
                     let path_field_fill = p.term_bg;
                     let picker_btn = egui::Button::new(
@@ -6528,6 +6571,199 @@ impl WorkspaceTab {
 }
 
 impl MultermUi {
+    fn workspace_tab_state_from_runtime(
+        tab: &WorkspaceTab,
+        runtime: Option<&WorkspaceRuntime>,
+    ) -> WorkspaceTabState {
+        WorkspaceTabState {
+            title: tab.title.clone(),
+            badge: tab.badge,
+            color_rgba: tab.color_rgba,
+            panel_layout: tab.panel_layout.sanitized(),
+            sync_terminals_to_columns: Some(tab.sync_terminals_to_columns),
+            uniform_equal_terminals: Some(tab.uniform_equal_terminals),
+            working_dir: Some(tab.working_dir.clone()),
+            terminal_sessions: runtime
+                .map(|rt| {
+                    rt.terminals
+                        .iter()
+                        .map(|pane| TerminalPaneState {
+                            id: pane.id,
+                            title: pane.title.clone(),
+                            tmux_session: Some(pane.tmux_session.clone()),
+                            width: pane.desired_size.x,
+                            height: pane.desired_size.y,
+                            x: pane.position.map(|p| p.x),
+                            y: pane.position.map(|p| p.y),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            active_terminal: runtime.and_then(|rt| rt.active_terminal),
+            equal_size_source_terminal_id: runtime.and_then(|rt| rt.equal_size_source_terminal_id),
+        }
+    }
+
+    fn workspace_tab_from_state(state: &WorkspaceTabState) -> WorkspaceTab {
+        WorkspaceTab {
+            title: state.title.clone(),
+            badge: state.badge,
+            color_rgba: state.color_rgba,
+            working_dir: state
+                .working_dir
+                .clone()
+                .unwrap_or_else(default_working_dir),
+            panel_layout: state.panel_layout.sanitized(),
+            sync_terminals_to_columns: state.sync_terminals_to_columns.unwrap_or(false),
+            uniform_equal_terminals: state.uniform_equal_terminals.unwrap_or(false),
+        }
+    }
+
+    fn runtime_from_workspace_state(
+        &mut self,
+        workspace_idx: usize,
+        state: &WorkspaceTabState,
+    ) -> WorkspaceRuntime {
+        let mut runtime = WorkspaceRuntime::default();
+        for pane_state in &state.terminal_sessions {
+            let terminal_id = pane_state.id.max(self.next_terminal_id);
+            let tmux_session = pane_state
+                .tmux_session
+                .clone()
+                .unwrap_or_else(|| tmux_session_name(workspace_idx, terminal_id));
+            let mut pane = spawn_terminal_pane(
+                pane_state.title.clone(),
+                terminal_id,
+                state.working_dir.as_deref().unwrap_or(""),
+                &tmux_session,
+            );
+            self.next_terminal_id = terminal_id + 1;
+            pane.desired_size =
+                Vec2::new(pane_state.width.max(220.0), pane_state.height.max(120.0));
+            pane.position = match (pane_state.x, pane_state.y) {
+                (Some(x), Some(y)) => Some(Pos2::new(x, y)),
+                _ => None,
+            };
+            runtime.terminals.push(pane);
+        }
+        runtime.active_terminal = state.active_terminal.and_then(|i| {
+            if i < runtime.terminals.len() {
+                Some(i)
+            } else {
+                runtime.terminals.len().checked_sub(1)
+            }
+        });
+        runtime.equal_size_source_terminal_id = state.equal_size_source_terminal_id;
+        Self::sync_workspace_runtime_buffers(&mut runtime);
+        runtime
+    }
+
+    fn push_closed_workspace_undo(&mut self, record: ClosedWorkspaceRecord) {
+        self.closed_workspace_undo_stack.push(record);
+        if self.closed_workspace_undo_stack.len() > CLOSED_WORKSPACE_HISTORY_MAX {
+            let overflow = self.closed_workspace_undo_stack.len() - CLOSED_WORKSPACE_HISTORY_MAX;
+            self.closed_workspace_undo_stack.drain(0..overflow);
+        }
+    }
+
+    fn close_workspace_at(&mut self, idx: usize) -> bool {
+        if idx >= self.workspaces.len() {
+            return false;
+        }
+        let state = Self::workspace_tab_state_from_runtime(
+            &self.workspaces[idx],
+            self.workspace_runtime.get(idx),
+        );
+        self.push_closed_workspace_undo(ClosedWorkspaceRecord {
+            index: idx,
+            tab: state,
+        });
+        self.closed_workspace_redo_stack.clear();
+
+        if self.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
+            self.tab_drag = None;
+        }
+        self.workspaces.remove(idx);
+        if idx < self.workspace_runtime.len() {
+            self.workspace_runtime.remove(idx);
+        }
+        if self.editing_workspace_idx == Some(idx) {
+            self.editing_workspace_idx = None;
+            self.editing_workspace_input.clear();
+        } else if let Some(ei) = self.editing_workspace_idx {
+            if ei > idx {
+                self.editing_workspace_idx = Some(ei - 1);
+            }
+        }
+        if self.workspaces.is_empty() {
+            self.selected_workspace = 0;
+        } else if self.selected_workspace > idx {
+            self.selected_workspace -= 1;
+        } else if self.selected_workspace == idx {
+            self.selected_workspace = self.selected_workspace.saturating_sub(1);
+        } else if self.selected_workspace >= self.workspaces.len() {
+            self.selected_workspace = self.workspaces.len().saturating_sub(1);
+        }
+        true
+    }
+
+    fn undo_close_workspace(&mut self) -> bool {
+        let Some(record) = self.closed_workspace_undo_stack.pop() else {
+            return false;
+        };
+        let insert_idx = record.index.min(self.workspaces.len());
+        let tab = Self::workspace_tab_from_state(&record.tab);
+        self.workspaces.insert(insert_idx, tab);
+        let runtime = self.runtime_from_workspace_state(insert_idx, &record.tab);
+        self.workspace_runtime.insert(insert_idx, runtime);
+        self.selected_workspace = insert_idx;
+        self.closed_workspace_redo_stack.push(record);
+        true
+    }
+
+    fn redo_close_workspace(&mut self) -> bool {
+        let Some(record) = self.closed_workspace_redo_stack.pop() else {
+            return false;
+        };
+        if self.workspaces.is_empty() {
+            return false;
+        }
+        let idx = record.index.min(self.workspaces.len().saturating_sub(1));
+        let removed_state = Self::workspace_tab_state_from_runtime(
+            &self.workspaces[idx],
+            self.workspace_runtime.get(idx),
+        );
+        if self.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
+            self.tab_drag = None;
+        }
+        self.workspaces.remove(idx);
+        if idx < self.workspace_runtime.len() {
+            self.workspace_runtime.remove(idx);
+        }
+        if self.editing_workspace_idx == Some(idx) {
+            self.editing_workspace_idx = None;
+            self.editing_workspace_input.clear();
+        } else if let Some(ei) = self.editing_workspace_idx {
+            if ei > idx {
+                self.editing_workspace_idx = Some(ei - 1);
+            }
+        }
+        if self.workspaces.is_empty() {
+            self.selected_workspace = 0;
+        } else if self.selected_workspace > idx {
+            self.selected_workspace -= 1;
+        } else if self.selected_workspace == idx {
+            self.selected_workspace = self.selected_workspace.saturating_sub(1);
+        } else if self.selected_workspace >= self.workspaces.len() {
+            self.selected_workspace = self.workspaces.len().saturating_sub(1);
+        }
+        self.push_closed_workspace_undo(ClosedWorkspaceRecord {
+            index: idx,
+            tab: removed_state,
+        });
+        true
+    }
+
     fn push_color_history(&mut self, color: Color32) {
         let rgba = [color.r(), color.g(), color.b(), color.a()];
         self.color_history.retain(|item| *item != rgba);
@@ -6598,7 +6834,9 @@ impl MultermUi {
                 .scrollback_searches
                 .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
         } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
-            runtime.scrollback_searches.truncate(runtime.terminals.len());
+            runtime
+                .scrollback_searches
+                .truncate(runtime.terminals.len());
         }
     }
 

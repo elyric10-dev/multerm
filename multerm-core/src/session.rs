@@ -6,8 +6,8 @@ use crate::ids::PaneId;
 /// A live terminal session: parser state + PTY output channel.
 pub struct TerminalSession {
     pub pane_id: PaneId,
-    pub parser:  TerminalParser,
-    pub rx:      Receiver<Vec<u8>>,
+    pub parser: TerminalParser,
+    pub rx: Receiver<Vec<u8>>,
 }
 
 impl TerminalSession {

@@ -12,8 +12,8 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// A running PTY subprocess.
 pub struct PtyHandle {
-    pub writer:    Arc<Mutex<Box<dyn Write + Send>>>,
-    master:        Box<dyn portable_pty::MasterPty>,
+    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: Box<dyn portable_pty::MasterPty>,
     pub stop_flag: Arc<AtomicBool>,
 }
 
@@ -21,7 +21,12 @@ impl PtyHandle {
     /// Resize the PTY to `rows × cols`.
     pub fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
         self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("PTY resize")?;
         Ok(())
     }
@@ -55,7 +60,12 @@ pub fn spawn_pty(
 ) -> anyhow::Result<PtyHandle> {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .context("openpty")?;
 
     // Spawn the shell
@@ -103,8 +113,8 @@ pub fn spawn_pty(
         .context("spawn PTY reader thread")?;
 
     Ok(PtyHandle {
-        writer:    Arc::new(Mutex::new(writer)),
-        master:    pair.master,
+        writer: Arc::new(Mutex::new(writer)),
+        master: pair.master,
         stop_flag,
     })
 }

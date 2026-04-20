@@ -1,5 +1,5 @@
-use uuid::Uuid;
 use std::fmt;
+use uuid::Uuid;
 
 macro_rules! newtype_uuid {
     ($name:ident) => {

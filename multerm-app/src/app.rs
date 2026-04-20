@@ -41,7 +41,10 @@ struct PaneHistory {
 
 impl PaneHistory {
     fn new() -> Self {
-        Self { snapshots: VecDeque::new(), steps_back: 0 }
+        Self {
+            snapshots: VecDeque::new(),
+            steps_back: 0,
+        }
     }
 
     /// Push a snapshot of the current grid (called before each PTY data batch).
@@ -263,8 +266,8 @@ exec "${{SHELL:-/bin/zsh}}" -i
     }
 
     fn daemon_session_key_for_pane(pane_index: usize) -> String {
-        let prefix = std::env::var("MULTERM_DAEMON_SESSION_PREFIX")
-            .unwrap_or_else(|_| "multerm".into());
+        let prefix =
+            std::env::var("MULTERM_DAEMON_SESSION_PREFIX").unwrap_or_else(|_| "multerm".into());
 
         // Sanitize to tmux-like charset so it is safe for the daemon.
         let sanitize = |s: &str| {
@@ -291,7 +294,11 @@ exec "${{SHELL:-/bin/zsh}}" -i
         Ok((frame_type, payload))
     }
 
-    fn write_frame_tcp(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> anyhow::Result<()> {
+    fn write_frame_tcp(
+        stream: &mut TcpStream,
+        frame_type: u8,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
         let len = payload.len() as u32;
         let mut header = [0u8; 5];
         header[0] = frame_type;
@@ -367,17 +374,15 @@ exec "${{SHELL:-/bin/zsh}}" -i
                             let proxy = self.proxy.clone();
                             let out_tx = tx.clone();
                             let wake_proxy = proxy.clone();
-                            std::thread::spawn(move || {
-                                loop {
-                                    let Ok((ft, payload)) = Self::read_frame_tcp(&mut reader) else {
-                                        break;
-                                    };
-                                    if ft == FRAME_OUTPUT {
-                                        let _ = out_tx.send(payload);
-                                        let _ = wake_proxy.send_event(UserEvent::PtyData);
-                                    } else if ft == FRAME_ATTACH_ERROR {
-                                        break;
-                                    }
+                            std::thread::spawn(move || loop {
+                                let Ok((ft, payload)) = Self::read_frame_tcp(&mut reader) else {
+                                    break;
+                                };
+                                if ft == FRAME_OUTPUT {
+                                    let _ = out_tx.send(payload);
+                                    let _ = wake_proxy.send_event(UserEvent::PtyData);
+                                } else if ft == FRAME_ATTACH_ERROR {
+                                    break;
                                 }
                             });
 
@@ -448,12 +453,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
         let cell_w = atlas.cell_width().max(1.0);
         let cell_h = atlas.cell_height().max(1.0);
 
-        for (pane_idx, (pane, rect)) in self
-            .panes
-            .iter_mut()
-            .zip(pane_rects.iter())
-            .enumerate()
-        {
+        for (pane_idx, (pane, rect)) in self.panes.iter_mut().zip(pane_rects.iter()).enumerate() {
             let cols = (rect.w / cell_w).max(1.0) as usize;
             let rows = (rect.h / cell_h).max(1.0) as usize;
             pane.session.parser.resize(rows, cols);
@@ -615,9 +615,7 @@ impl ApplicationHandler<UserEvent> for MultermApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
                 if let Some(drag) = self.selection_drag {
-                    if let Some((row, col)) =
-                        self.cell_pos_at_cursor_in_pane(drag.pane_idx)
-                    {
+                    if let Some((row, col)) = self.cell_pos_at_cursor_in_pane(drag.pane_idx) {
                         self.selection_drag = Some(SelectionDrag {
                             pane_idx: drag.pane_idx,
                             start: drag.start,
@@ -813,24 +811,34 @@ impl MultermApp {
                 if let Some(h) = self.histories.get_mut(self.active_pane) {
                     h.undo();
                 }
-                if let Some(window) = &self.window { window.request_redraw(); }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
                 return;
             }
             if is_redo {
                 if let Some(h) = self.histories.get_mut(self.active_pane) {
                     h.redo();
                 }
-                if let Some(window) = &self.window { window.request_redraw(); }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
                 return;
             }
 
             // Any other key press while viewing a snapshot resumes live first.
-            let in_snapshot = self.histories.get(self.active_pane).map(|h| !h.is_live()).unwrap_or(false);
+            let in_snapshot = self
+                .histories
+                .get(self.active_pane)
+                .map(|h| !h.is_live())
+                .unwrap_or(false);
             if in_snapshot {
                 if let Some(h) = self.histories.get_mut(self.active_pane) {
                     h.resume_live();
                 }
-                if let Some(window) = &self.window { window.request_redraw(); }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
                 // Fall through so the key is also sent normally.
             }
 
@@ -846,19 +854,16 @@ impl MultermApp {
             }
 
             // Select-all
-            let is_select_all =
-                (cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')))
-                    || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')));
+            let is_select_all = (cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')))
+                || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'a')));
             if is_select_all {
                 self.select_all_in_active_pane();
                 return;
             }
 
             // Copy: plain (Cmd/Ctrl+C), rich ANSI (Cmd+Shift+C).
-            let is_copy_rich = has_sel
-                && cmd
-                && shift
-                && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'));
+            let is_copy_rich =
+                has_sel && cmd && shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'));
             let is_copy_plain = has_sel
                 && ((cmd && !shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c')))
                     || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))));
@@ -872,10 +877,7 @@ impl MultermApp {
             }
 
             // Prevent Cmd/Ctrl+C from inserting "c" when there is no selection.
-            if (cmd || ctrl)
-                && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))
-                && !has_sel
-            {
+            if (cmd || ctrl) && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c')) && !has_sel {
                 return;
             }
 
@@ -885,13 +887,10 @@ impl MultermApp {
                 ctrl && shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
             let is_paste_ctrl_v =
                 ctrl && !shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
-            let is_paste_shift_insert = shift && matches!(event.logical_key, Key::Named(NamedKey::Insert));
+            let is_paste_shift_insert =
+                shift && matches!(event.logical_key, Key::Named(NamedKey::Insert));
 
-            if is_paste_cmd_v
-                || is_paste_ctrl_shift_v
-                || is_paste_ctrl_v
-                || is_paste_shift_insert
-            {
+            if is_paste_cmd_v || is_paste_ctrl_shift_v || is_paste_ctrl_v || is_paste_shift_insert {
                 self.paste_clipboard_into_active_pane();
                 return;
             }
@@ -932,7 +931,9 @@ impl MultermApp {
         let pane_grids: Vec<([f32; 4], &multerm_vt::TerminalGrid)> = {
             let mut grids = Vec::with_capacity(self.panes.len());
             for (i, (pane, rect)) in self.panes.iter().zip(pane_rects.iter()).enumerate() {
-                let grid = self.histories.get(i)
+                let grid = self
+                    .histories
+                    .get(i)
                     .and_then(|h| h.current_snapshot())
                     .unwrap_or_else(|| pane.session.parser.grid());
                 grids.push((rect.as_array(), grid));

@@ -40,21 +40,21 @@ pub enum WideKind {
 /// A single terminal cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    pub ch:    char,
-    pub fg:    Color,
-    pub bg:    Color,
+    pub ch: char,
+    pub fg: Color,
+    pub bg: Color,
     pub attrs: CellAttrs,
-    pub wide:  WideKind,
+    pub wide: WideKind,
 }
 
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            ch:    ' ',
-            fg:    Color::Default,
-            bg:    Color::Default,
+            ch: ' ',
+            fg: Color::Default,
+            bg: Color::Default,
             attrs: CellAttrs::empty(),
-            wide:  WideKind::None,
+            wide: WideKind::None,
         }
     }
 }

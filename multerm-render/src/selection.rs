@@ -81,4 +81,3 @@ mod tests {
         assert!(!sel.contains(2, 10, 10, 80));
     }
 }
-

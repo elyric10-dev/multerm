@@ -509,11 +509,17 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<DaemonCmd>) -> anyhow::Re
     // Then forward live output until disconnected.
     while let Ok(chunk) = out_rx.recv() {
         if let Err(e) = write_frame(&mut out_stream, FRAME_OUTPUT, &chunk) {
-            let _ = cmd_tx.send(DaemonCmd::Detach { session_key, gen: attach_gen });
+            let _ = cmd_tx.send(DaemonCmd::Detach {
+                session_key,
+                gen: attach_gen,
+            });
             return Err(e.into());
         }
     }
 
-    let _ = cmd_tx.send(DaemonCmd::Detach { session_key, gen: attach_gen });
+    let _ = cmd_tx.send(DaemonCmd::Detach {
+        session_key,
+        gen: attach_gen,
+    });
     Ok(())
 }

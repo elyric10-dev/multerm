@@ -5,7 +5,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum ContextBusEvent {
     /// Raw PTY output captured from a pane.
-    PaneOutput { pane_id: crate::ids::PaneId, data: Vec<u8> },
+    PaneOutput {
+        pane_id: crate::ids::PaneId,
+        data: Vec<u8>,
+    },
     /// A watched file changed.
     FileChanged { path: String },
     /// User-initiated notepad edit.

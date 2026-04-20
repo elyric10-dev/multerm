@@ -9,5 +9,5 @@ pub mod surface;
 pub use atlas::{GlyphAtlas, GlyphKey, GlyphUV};
 pub use compositor::Compositor;
 pub use cursor::CursorState;
-pub use surface::GpuContext;
 pub use selection::SelectionRange;
+pub use surface::GpuContext;

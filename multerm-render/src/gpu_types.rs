@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct BgQuadInstance {
     /// Pixel-space rect: x, y, width, height.
-    pub rect:  [f32; 4],
+    pub rect: [f32; 4],
     /// Linear-space RGBA colour.
     pub color: [f32; 4],
 }
@@ -17,7 +17,7 @@ pub struct GlyphInstance {
     /// Destination rect in pixel space: x, y, width, height.
     pub dest_rect: [f32; 4],
     /// Source rect in normalised atlas UV space: u, v, uw, vh.
-    pub src_rect:  [f32; 4],
+    pub src_rect: [f32; 4],
     /// Linear-space RGBA foreground colour.
-    pub color:     [f32; 4],
+    pub color: [f32; 4],
 }
