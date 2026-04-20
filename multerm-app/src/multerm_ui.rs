@@ -3400,6 +3400,9 @@ impl MultermUi {
     }
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
+        if self.handle_workspace_close_history_shortcuts(ctx) {
+            return;
+        }
         self.ensure_workspace_runtime_slots();
         let ws = self
             .selected_workspace
@@ -3414,6 +3417,43 @@ impl MultermUi {
             return;
         }
         self.route_workspace_terminal_keyboard(ctx, ws, active_idx);
+    }
+
+    fn handle_workspace_close_history_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        let mut changed = false;
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if !pressed || key != egui::Key::Z {
+                continue;
+            }
+            let cmd_or_ctrl = modifiers.command || modifiers.ctrl;
+            if !cmd_or_ctrl {
+                continue;
+            }
+            if modifiers.shift {
+                if !self.closed_workspace_redo_stack.is_empty() {
+                    changed |= self.redo_close_workspace();
+                }
+            } else {
+                if !self.closed_workspace_undo_stack.is_empty() {
+                    changed |= self.undo_close_workspace();
+                }
+            }
+        }
+        if changed {
+            self.next_workspace_index = compute_next_workspace_index(&self.workspaces);
+            save_workspace_state(self);
+        }
+        changed
     }
 
     fn route_workspace_terminal_keyboard(
@@ -5402,9 +5442,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     let fixed_tab_width = 180.0_f32;
 
     // Keep workspace tabs at a fixed width so labels don't resize the strip.
-    let tab_widths: Vec<f32> = (0..n_tabs)
-        .map(|_| fixed_tab_width)
-        .collect();
+    let tab_widths: Vec<f32> = (0..n_tabs).map(|_| fixed_tab_width).collect();
     let total_tab_w: f32 = tab_widths.iter().sum();
 
     // Determine where each tab wants to be in the "after-drop" layout so that
