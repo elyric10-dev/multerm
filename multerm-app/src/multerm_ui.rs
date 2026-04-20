@@ -546,6 +546,26 @@ fn color_with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+fn tab_auto_text_color(bg: Color32) -> Color32 {
+    let to_linear = |component: u8| -> f32 {
+        let s = component as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = to_linear(bg.r());
+    let g = to_linear(bg.g());
+    let b = to_linear(bg.b());
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if luminance > 0.38 {
+        Color32::from_rgb(20, 24, 31)
+    } else {
+        Color32::from_rgb(245, 247, 252)
+    }
+}
+
 fn apply_egui_visuals(ctx: &egui::Context, theme: UiTheme, p: UiPalette) {
     let mut visuals = match theme {
         UiTheme::Dark => egui::Visuals::dark(),
@@ -557,6 +577,9 @@ fn apply_egui_visuals(ctx: &egui::Context, theme: UiTheme, p: UiPalette) {
     visuals.widgets.noninteractive.bg_fill = p.panel_bg;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+    });
 }
 const CELL_W: f32 = 9.0;
 const CELL_H: f32 = 18.0;
@@ -5354,27 +5377,33 @@ fn selection_delete_bytes(
 }
 
 fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
+    fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+        let len = value.chars().count();
+        if len <= max_chars {
+            return value.to_owned();
+        }
+        if max_chars <= 3 {
+            return "...".to_owned();
+        }
+        let keep = max_chars - 3;
+        let mut out = value.chars().take(keep).collect::<String>();
+        out.push_str("...");
+        out
+    }
+
     let mut changed = false;
     let mut close_idx: Option<usize> = None;
 
     let n_tabs = app.workspaces.len();
-    let tab_h = 28.0_f32;
+    let tab_h = 36.0_f32;
     let inner_x = 6.0_f32;
     let close_w = 14.0_f32;
+    let max_tab_label_chars = 16_usize;
+    let fixed_tab_width = 180.0_f32;
 
-    // Estimate each tab's display width from title character count.
-    // Monospace 12pt ≈ 7.2 logical px/char; the ">_  " prefix adds 4 chars.
+    // Keep workspace tabs at a fixed width so labels don't resize the strip.
     let tab_widths: Vec<f32> = (0..n_tabs)
-        .map(|i| {
-            let char_count = app.workspaces[i].title.chars().count() + 4;
-            let label_w = (char_count as f32 * 7.2_f32).max(88.0);
-            let badge_extra = if app.workspaces[i].badge.is_some() {
-                18.0
-            } else {
-                0.0
-            };
-            (inner_x * 2.0 + label_w + badge_extra + 4.0 + close_w + 2.0).ceil()
-        })
+        .map(|_| fixed_tab_width)
         .collect();
     let total_tab_w: f32 = tab_widths.iter().sum();
 
@@ -5424,8 +5453,9 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             let active = idx == app.selected_workspace;
             let fill = app.workspace_tab_fill_color(idx, active, p);
             let title = app.workspaces[idx].title.clone();
+            let display_title = truncate_with_ellipsis(&title, max_tab_label_chars);
             let badge = app.workspaces[idx].badge;
-            let tc = if active { p.tab_label_active } else { p.muted };
+            let tc = tab_auto_text_color(fill);
             let is_editing = app.editing_workspace_idx == Some(idx);
             let is_drag_src = src_idx == Some(idx);
 
@@ -5456,7 +5486,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 painter.text(
                     Pos2::new(gx + inner_x + 2.0, ry + tab_h * 0.5),
                     Align2::LEFT_CENTER,
-                    format!(">_  {}", title),
+                    format!(">_  {}", display_title),
                     FontId::monospace(12.0),
                     Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 215),
                 );
@@ -5587,7 +5617,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             painter.text(
                 Pos2::new(tx + inner_x + 2.0, ry + tab_h * 0.5),
                 Align2::LEFT_CENTER,
-                format!(">_  {}", title),
+                format!(">_  {}", display_title),
                 FontId::monospace(12.0),
                 tc,
             );
@@ -5647,6 +5677,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 egui::Id::new("ttab_label").with(idx),
                 Sense::click_and_drag(),
             );
+            let label_resp = if display_title != title {
+                label_resp.on_hover_text(title.clone())
+            } else {
+                label_resp
+            };
             egui::Popup::context_menu(&label_resp)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
