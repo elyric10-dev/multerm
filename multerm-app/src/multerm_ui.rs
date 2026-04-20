@@ -546,6 +546,16 @@ fn color_with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+fn lighten_toward_white(c: Color32, mix: f32, alpha: u8) -> Color32 {
+    let t = mix.clamp(0.0, 1.0);
+    let lerp = |v: u8| -> u8 {
+        (v as f32 + (255.0 - v as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(lerp(c.r()), lerp(c.g()), lerp(c.b()), alpha)
+}
+
 fn tab_auto_text_color(bg: Color32) -> Color32 {
     let to_linear = |component: u8| -> f32 {
         let s = component as f32 / 255.0;
@@ -5622,6 +5632,25 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 Stroke::new(1.0, p.border),
                 egui::StrokeKind::Inside,
             );
+            if active {
+                let indicator_color = lighten_toward_white(fill, 0.45, 250);
+                let glow_color = lighten_toward_white(fill, 0.62, 145);
+                let y = tab_rect.max.y - 1.5;
+                painter.line_segment(
+                    [
+                        Pos2::new(tab_rect.min.x + 1.5, y),
+                        Pos2::new(tab_rect.max.x - 1.5, y),
+                    ],
+                    Stroke::new(2.2, indicator_color),
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(tab_rect.min.x + 3.0, y - 1.0),
+                        Pos2::new(tab_rect.max.x - 3.0, y - 1.0),
+                    ],
+                    Stroke::new(1.0, glow_color),
+                );
+            }
 
             if is_editing {
                 // Inline rename editor.
