@@ -144,6 +144,31 @@ fn test_erase_screen() {
     assert_eq!(p.grid().cell(0, 5).ch, ' ');
 }
 
+#[test]
+fn test_erase_screen_clears_scrollback() {
+    let mut p = parser(5, 10);
+    for i in 0..5u8 {
+        feed(&mut p, &format!("{}\r\n", i));
+    }
+    assert!(p.grid().scrollback_len() > 0);
+    feed(&mut p, "\x1b[2J");
+    assert_eq!(p.grid().scrollback_len(), 0);
+    assert_eq!(p.grid().total_rows(), 5);
+}
+
+#[test]
+fn test_erase_saved_lines_3j_clears_scrollback_only() {
+    let mut p = parser(5, 10);
+    for i in 0..5u8 {
+        feed(&mut p, &format!("{}\r\n", i));
+    }
+    assert!(p.grid().scrollback_len() > 0);
+    feed(&mut p, "\x1b[3J");
+    assert_eq!(p.grid().scrollback_len(), 0);
+    // Visible grid still shows last scrolled state (not cleared by 3 J alone).
+    assert_eq!(p.grid().cell(0, 0).ch, '1');
+}
+
 // ── Scroll region ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -164,6 +189,18 @@ fn test_scroll_up_wraps() {
     }
     // Row 0 should have been scrolled off, row 0 now = '1'
     assert_eq!(p.grid().cell(0, 0).ch, '1');
+}
+
+#[test]
+fn test_scroll_up_preserves_primary_scrollback() {
+    let mut p = parser(5, 10);
+    for i in 0..5u8 {
+        let s = format!("{}\r\n", i);
+        feed(&mut p, &s);
+    }
+    assert_eq!(p.grid().scrollback_len(), 1);
+    assert_eq!(p.grid().scrollback[0][0].ch, '0');
+    assert_eq!(p.grid().total_rows(), 6);
 }
 
 // ── Alternate screen ──────────────────────────────────────────────────────────

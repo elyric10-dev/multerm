@@ -730,17 +730,9 @@ impl TermiteApp {
             return;
         };
         let grid = pane.session.parser.grid();
-        if grid.rows == 0 || grid.cols == 0 {
-            return;
+        if let Some(sel) = clipboard::selection_range_select_input_block(grid) {
+            self.selections[self.active_pane] = Some(sel);
         }
-
-        self.selections[self.active_pane] = Some(SelectionRange {
-            start_row: 0,
-            start_col: 0,
-            end_row: grid.rows - 1,
-            end_col: grid.cols - 1,
-            active: true,
-        });
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -748,6 +740,21 @@ impl TermiteApp {
     }
 
     fn copy_active_selection_to_clipboard(&mut self) {
+        let Some(range) = self.active_selection() else {
+            return;
+        };
+        let Some(pane) = self.panes.get(self.active_pane) else {
+            return;
+        };
+        let grid = pane.session.parser.grid();
+
+        let text = clipboard::selection_to_plain_text(grid, range);
+        if let Err(e) = clipboard::set_clipboard_text(&text) {
+            tracing::warn!("failed to set clipboard text: {e}");
+        }
+    }
+
+    fn copy_active_selection_rich_to_clipboard(&mut self) {
         let Some(range) = self.active_selection() else {
             return;
         };
@@ -847,16 +854,24 @@ impl TermiteApp {
                 return;
             }
 
-            // Copy (only when we have an active selection).
-            let is_copy = has_sel
-                && ((cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c')))
+            // Copy: plain (Cmd/Ctrl+C), rich ANSI (Cmd+Shift+C).
+            let is_copy_rich = has_sel
+                && cmd
+                && shift
+                && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'));
+            let is_copy_plain = has_sel
+                && ((cmd && !shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c')))
                     || (ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))));
-            if is_copy {
+            if is_copy_rich {
+                self.copy_active_selection_rich_to_clipboard();
+                return;
+            }
+            if is_copy_plain {
                 self.copy_active_selection_to_clipboard();
                 return;
             }
 
-            // Prevent Cmd+C from inserting "c" into the terminal when no selection exists.
+            // Prevent Cmd/Ctrl+C from inserting "c" when there is no selection.
             if (cmd || ctrl)
                 && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'c'))
                 && !has_sel
@@ -866,10 +881,17 @@ impl TermiteApp {
 
             // Paste
             let is_paste_cmd_v = cmd && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
-            let is_paste_ctrl_v = ctrl && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
+            let is_paste_ctrl_shift_v =
+                ctrl && shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
+            let is_paste_ctrl_v =
+                ctrl && !shift && key_char.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
             let is_paste_shift_insert = shift && matches!(event.logical_key, Key::Named(NamedKey::Insert));
 
-            if is_paste_cmd_v || is_paste_ctrl_v || is_paste_shift_insert {
+            if is_paste_cmd_v
+                || is_paste_ctrl_shift_v
+                || is_paste_ctrl_v
+                || is_paste_shift_insert
+            {
                 self.paste_clipboard_into_active_pane();
                 return;
             }

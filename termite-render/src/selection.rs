@@ -48,7 +48,7 @@ impl SelectionRange {
         let ((sr, sc), (er, ec)) = self.normalized_start_end();
         if sr == er {
             let (min_c, max_c) = if sc <= ec { (sc, ec) } else { (ec, sc) };
-            return col >= min_c && col <= max_c;
+            return row == sr && col >= min_c && col <= max_c;
         }
 
         if row == sr {
@@ -58,6 +58,27 @@ impl SelectionRange {
         } else {
             row > sr && row < er
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SelectionRange;
+
+    #[test]
+    fn contains_single_row_only_matches_that_row() {
+        let sel = SelectionRange {
+            start_row: 2,
+            start_col: 5,
+            end_row: 2,
+            end_col: 9,
+            active: true,
+        };
+        assert!(sel.contains(2, 7, 10, 80));
+        assert!(!sel.contains(0, 7, 10, 80));
+        assert!(!sel.contains(3, 7, 10, 80));
+        assert!(!sel.contains(2, 4, 10, 80));
+        assert!(!sel.contains(2, 10, 10, 80));
     }
 }
 

@@ -1,4 +1,9 @@
-use crate::cell::Cell;
+use std::collections::VecDeque;
+
+use crate::cell::{Cell, CellAttrs, Color, WideKind};
+
+/// Hard cap on saved primary-buffer lines (oldest dropped first).
+pub const SCROLLBACK_MAX_LINES: usize = 100_000;
 
 /// Cursor position within the grid.
 #[derive(Clone, Copy, Debug, Default)]
@@ -24,6 +29,9 @@ pub struct TerminalGrid {
     /// Saved primary screen when inside alternate screen; `None` when on primary.
     alternate:      Option<Box<TerminalGrid>>,
     pub in_alt:     bool,
+    /// Primary-buffer lines that scrolled off the top (oldest at front). Not used on the
+    /// alternate screen. Each row has length `cols`.
+    pub scrollback: VecDeque<Vec<Cell>>,
 }
 
 impl TerminalGrid {
@@ -39,6 +47,7 @@ impl TerminalGrid {
             scroll_bot: rows.saturating_sub(1),
             alternate:  None,
             in_alt:     false,
+            scrollback: VecDeque::new(),
         }
     }
 
@@ -76,6 +85,65 @@ impl TerminalGrid {
         self.cursor.col = self.cursor.col.min(new_cols - 1);
         self.scroll_top = 0;
         self.scroll_bot = new_rows - 1;
+        for line in self.scrollback.iter_mut() {
+            line.resize(new_cols, Cell::default());
+        }
+    }
+
+    /// Rows in the live buffer plus saved scrollback (for display / hit testing).
+    #[inline]
+    pub fn total_rows(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    #[inline]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Row index in the combined view: `0..scrollback_len()` then live rows.
+    #[inline]
+    pub fn virtual_cell(&self, vrow: usize, col: usize) -> &Cell {
+        let sb = self.scrollback.len();
+        if vrow < sb {
+            &self.scrollback[vrow][col]
+        } else {
+            &self.cells[(vrow - sb) * self.cols + col]
+        }
+    }
+
+    /// Exclusive end column on virtual row `vrow` (trim trailing unstyled spaces).
+    pub fn virtual_row_render_end(&self, vrow: usize) -> usize {
+        if vrow >= self.total_rows() || self.cols == 0 {
+            return 0;
+        }
+        let visible_space_attrs = CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
+        let mut end = self.cols;
+        while end > 0 {
+            let cell = self.virtual_cell(vrow, end - 1);
+            if cell.wide == WideKind::Trailing {
+                end -= 1;
+                continue;
+            }
+            if cell.ch != ' ' {
+                break;
+            }
+            if cell.bg != Color::Default {
+                break;
+            }
+            if cell.attrs.intersects(visible_space_attrs) {
+                break;
+            }
+            end -= 1;
+        }
+        end
+    }
+
+    fn push_scrollback_line(&mut self, line: Vec<Cell>) {
+        self.scrollback.push_back(line);
+        while self.scrollback.len() > SCROLLBACK_MAX_LINES {
+            self.scrollback.pop_front();
+        }
     }
 
     // ── Scroll helpers ───────────────────────────────────────────────────────
@@ -84,6 +152,13 @@ impl TerminalGrid {
     pub fn scroll_up(&mut self, top: usize, bot: usize, n: usize) {
         let n = n.min(bot - top + 1);
         for _ in 0..n {
+            if !self.in_alt {
+                let mut line = Vec::with_capacity(self.cols);
+                for c in 0..self.cols {
+                    line.push(self.cells[top * self.cols + c].clone());
+                }
+                self.push_scrollback_line(line);
+            }
             for r in top..bot {
                 for c in 0..self.cols {
                     self.cells[r * self.cols + c] = self.cells[(r + 1) * self.cols + c].clone();
@@ -119,6 +194,12 @@ impl TerminalGrid {
     pub fn clear_all(&mut self) {
         self.cells.iter_mut().for_each(|c| *c = Cell::default());
         self.dirty.iter_mut().for_each(|d| *d = true);
+    }
+
+    /// Drop primary-buffer lines saved from scrolling (no-op on alternate screen callers
+    /// that target this grid's deque; nested primary while in alt is unchanged).
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
     }
 
     /// Erase columns `from_col..to_col` on `row` (to_col is exclusive).

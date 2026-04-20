@@ -2,7 +2,7 @@ use crossbeam_channel::unbounded;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke,
-    Vec2,
+    TextEdit, Vec2,
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,28 @@ impl LineEditor {
         }
     }
 
+    /// Insert pasted text as one undo step (does not split on word boundaries like [`push_text`]).
+    fn push_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.push_snapshot();
+        for ch in text.chars() {
+            let byte_pos = self.cursor_byte_pos();
+            self.current.text.insert(byte_pos, ch);
+            self.current.cursor += 1;
+        }
+    }
+
+    /// Replace the whole shadow line with pasted text (one undo step). Used when pasting over
+    /// a host selection so undo matches "replaced region → new text".
+    fn replace_with_paste(&mut self, text: &str) {
+        self.push_snapshot();
+        self.current.text.clear();
+        self.current.text.push_str(text);
+        self.current.cursor = text.chars().count();
+    }
+
     fn push_backspace(&mut self) {
         if self.current.cursor == 0 {
             return;
@@ -194,6 +216,163 @@ impl LineEditor {
         self.undo_stack.clear();
         self.redo_stack.clear();
     }
+}
+
+/// Per-terminal "find in scrollback" (search host buffer, not the PTY).
+#[derive(Clone)]
+struct ScrollbackSearchPaneState {
+    open: bool,
+    query: String,
+    /// Index into the match list for the current `query` (wrapped by match count).
+    current_match: usize,
+}
+
+impl Default for ScrollbackSearchPaneState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            current_match: 0,
+        }
+    }
+}
+
+fn scrollback_search_text_id(pane_id: u64) -> egui::Id {
+    egui::Id::new(("termite_scrollback_search", pane_id))
+}
+
+#[inline]
+fn scrollback_chars_match(a: char, b: char, ascii_case_insensitive: bool) -> bool {
+    if ascii_case_insensitive && a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(&b);
+    }
+    a == b
+}
+
+/// Flatten the grid to characters plus a `(row, col)` anchor for each character (for mapping matches).
+fn scrollback_flat_haystack(grid: &TerminalGrid) -> (Vec<char>, Vec<(usize, usize)>) {
+    let mut chars = Vec::new();
+    let mut map = Vec::new();
+    let total = grid.total_rows();
+    for vrow in 0..total {
+        if vrow > 0 {
+            chars.push('\n');
+            // Anchor the synthetic newline on the **previous** row's last rendered column so
+            // haystack indices never share `(vrow, col)` with the first cell of the next row.
+            // Duplicate anchors corrupted match ranges and painted highlights on the wrong rows.
+            let pv = vrow - 1;
+            let pe = row_render_end_virtual(grid, pv).min(grid.cols);
+            let anchor = if pe == 0 {
+                0usize
+            } else {
+                let lc = (pe - 1).min(grid.cols.saturating_sub(1));
+                snap_to_leading_cell_v(grid, pv, lc)
+            };
+            map.push((pv, anchor));
+        }
+        let end = row_render_end_virtual(grid, vrow).min(grid.cols);
+        let mut col = 0usize;
+        while col < end {
+            let cell = grid.virtual_cell(vrow, col);
+            if cell.wide == WideKind::Trailing {
+                col += 1;
+                continue;
+            }
+            chars.push(cell.ch);
+            map.push((vrow, col));
+            col += if cell.wide == WideKind::Leading && col + 1 < end {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    (chars, map)
+}
+
+fn scrollback_find_match_start_indices(
+    hay: &[char],
+    needle: &[char],
+    ascii_case_insensitive: bool,
+) -> Vec<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return Vec::new();
+    }
+    let nlen = needle.len();
+    let max_start = hay.len() - nlen;
+    let mut out = Vec::new();
+    'try_start: for i in 0..=max_start {
+        for j in 0..nlen {
+            if !scrollback_chars_match(hay[i + j], needle[j], ascii_case_insensitive) {
+                continue 'try_start;
+            }
+        }
+        out.push(i);
+    }
+    out
+}
+
+fn wide_span_end_col_v(grid: &TerminalGrid, vrow: usize, start_col: usize) -> usize {
+    if grid.virtual_cell(vrow, start_col).wide == WideKind::Leading && start_col + 1 < grid.cols {
+        start_col + 1
+    } else {
+        start_col
+    }
+}
+
+fn scrollback_match_to_range(
+    grid: &TerminalGrid,
+    map: &[(usize, usize)],
+    hay_len: usize,
+    start_ci: usize,
+    needle_len: usize,
+) -> Option<SelectionRange> {
+    if needle_len == 0
+        || start_ci + needle_len > hay_len
+        || map.len() != hay_len
+        || start_ci + needle_len > map.len()
+    {
+        return None;
+    }
+    let (sr, sc) = map[start_ci];
+    let (lr, lc) = map[start_ci + needle_len - 1];
+    let ec = wide_span_end_col_v(grid, lr, lc);
+    Some(SelectionRange {
+        start_row: sr,
+        start_col: sc,
+        end_row: lr,
+        end_col: ec,
+        active: true,
+    })
+}
+
+fn scrollback_compute_match_ranges(grid: &TerminalGrid, query: &str) -> Vec<SelectionRange> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (hay_chars, map) = scrollback_flat_haystack(grid);
+    let needle: Vec<char> = query.chars().collect();
+    let starts = scrollback_find_match_start_indices(&hay_chars, &needle, true);
+    let hay_len = hay_chars.len();
+    starts
+        .into_iter()
+        .filter_map(|i| scrollback_match_to_range(grid, &map, hay_len, i, needle.len()))
+        .collect()
+}
+
+fn scrollback_search_advance_pane(
+    pane: &TerminalPane,
+    search_state: &mut ScrollbackSearchPaneState,
+    delta: isize,
+) {
+    let grid = pane.session.parser.grid();
+    let ranges = scrollback_compute_match_ranges(grid, &search_state.query);
+    if ranges.is_empty() {
+        return;
+    }
+    let n = ranges.len();
+    let cur = search_state.current_match % n;
+    search_state.current_match = (cur as isize + delta).rem_euclid(n as isize) as usize;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -379,6 +558,8 @@ fn apply_egui_visuals(ctx: &egui::Context, theme: UiTheme, p: UiPalette) {
 }
 const CELL_W: f32 = 9.0;
 const CELL_H: f32 = 18.0;
+/// Shift caret / search overlay up (negative Y) so the block aligns with monospace glyphs in the cell.
+const TERMINAL_CELL_OVERLAY_Y_NUDGE: f32 = -2.5;
 const GRID_SPACING: f32 = 10.0;
 /// Vertical gap between stacked terminals (horizontal column gutters use [`GRID_SPACING`]).
 const STACK_GAP_Y: f32 = 6.0;
@@ -668,6 +849,8 @@ struct TerminalPane {
     backend: TerminalBackend,
     desired_size: Vec2,
     position: Option<Pos2>,
+    /// Last caret `(virtual_row, col)` we auto-scrolled to; `None` until first scroll this session.
+    last_autoscroll_caret_v: Option<(usize, usize)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -753,15 +936,33 @@ struct TermiteUi {
     workspace_autosave_deadline: Instant,
     /// Active tab drag state; `None` when no drag is in progress.
     tab_drag: Option<TabDragState>,
+    /// When the focused terminal changes, scrollback find UI closes (see `update`).
+    prev_terminal_focus_key: Option<(usize, Option<usize>)>,
 }
 
-#[derive(Default)]
 struct WorkspaceRuntime {
     terminals: Vec<TerminalPane>,
     active_terminal: Option<usize>,
     equal_size_source_terminal_id: Option<u64>,
     selections: Vec<Option<SelectionRange>>,
     line_editors: Vec<LineEditor>,
+    scrollback_searches: Vec<ScrollbackSearchPaneState>,
+    /// After Ctrl/Cmd+F, focus the search field once (uses `Cell` for nested UI borrows).
+    scrollback_search_focus_pane: std::cell::Cell<Option<u64>>,
+}
+
+impl Default for WorkspaceRuntime {
+    fn default() -> Self {
+        Self {
+            terminals: Vec::new(),
+            active_terminal: None,
+            equal_size_source_terminal_id: None,
+            selections: Vec::new(),
+            line_editors: Vec::new(),
+            scrollback_searches: Vec::new(),
+            scrollback_search_focus_pane: std::cell::Cell::new(None),
+        }
+    }
 }
 
 struct WorkspaceTab {
@@ -896,6 +1097,7 @@ impl Default for TermiteUi {
                 equal_size_template_blink_started_at: None,
                 workspace_autosave_deadline: Instant::now(),
                 tab_drag: None,
+                prev_terminal_focus_key: None,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1029,6 +1231,7 @@ impl Default for TermiteUi {
             equal_size_template_blink_started_at: None,
             workspace_autosave_deadline: Instant::now(),
             tab_drag: None,
+            prev_terminal_focus_key: None,
         }
     }
 }
@@ -1205,15 +1408,6 @@ fn new_terminal_context_menu(
         app.pending_context_terminal = None;
         ui.close();
     }
-    if is_cli_command_available("agent") && ui.button("New Cursor").clicked() {
-        let spawn_pos = app.pending_terminal_spawn_pos.take();
-        let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
-        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
-            app.launch_cli_tool(ui.ctx(), None, "agent");
-        }
-        app.pending_context_terminal = None;
-        ui.close();
-    }
     ui.separator();
     if app.active_workspace_tab_mut().is_some() {
         let mut panel_layout = app.active_panel_layout();
@@ -1293,6 +1487,20 @@ impl eframe::App for TermiteUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep refreshing so PTY output appears live without explicit wakeups.
         self.sync_all_workspace_runtime_buffers();
+        let focus_key = self.active_workspace_runtime().map(|r| {
+            let ws = self
+                .selected_workspace
+                .min(self.workspaces.len().saturating_sub(1));
+            (ws, r.active_terminal)
+        });
+        if self.prev_terminal_focus_key != focus_key {
+            for rt in &mut self.workspace_runtime {
+                for st in &mut rt.scrollback_searches {
+                    st.open = false;
+                }
+            }
+            self.prev_terminal_focus_key = focus_key;
+        }
         ctx.request_repaint_after(Duration::from_millis(16));
         self.drain_terminals();
         self.tick_workspace_terminal_spawn_notice();
@@ -2303,6 +2511,89 @@ impl eframe::App for TermiteUi {
                                                             },
                                                         );
                                                     });
+                                                    if is_active
+                                                        && runtime
+                                                            .scrollback_searches
+                                                            .get(idx)
+                                                            .is_some_and(|s| s.open)
+                                                    {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new("Find:")
+                                                                    .size(11.0)
+                                                                    .color(p.muted),
+                                                            );
+                                                            let sid = scrollback_search_text_id(pane.id);
+                                                            let search_changed = {
+                                                                let st =
+                                                                    &mut runtime.scrollback_searches[idx];
+                                                                let resp = ui.add(
+                                                                    TextEdit::singleline(&mut st.query)
+                                                                        .id(sid)
+                                                                        .hint_text("Scrollback…")
+                                                                        .desired_width(200.0),
+                                                                );
+                                                                if runtime
+                                                                    .scrollback_search_focus_pane
+                                                                    .get()
+                                                                    == Some(pane.id)
+                                                                {
+                                                                    resp.request_focus();
+                                                                    runtime
+                                                                        .scrollback_search_focus_pane
+                                                                        .set(None);
+                                                                }
+                                                                resp.changed()
+                                                            };
+                                                            if search_changed {
+                                                                runtime.scrollback_searches[idx]
+                                                                    .current_match = 0;
+                                                            }
+                                                            let grid_ct =
+                                                                pane.session.parser.grid();
+                                                            let n = scrollback_compute_match_ranges(
+                                                                grid_ct,
+                                                                &runtime.scrollback_searches[idx]
+                                                                    .query,
+                                                            )
+                                                            .len();
+                                                            let st = &runtime.scrollback_searches[idx];
+                                                            let label = if n > 0 {
+                                                                format!(
+                                                                    "{} / {}",
+                                                                    st.current_match % n + 1,
+                                                                    n
+                                                                )
+                                                            } else {
+                                                                "0 / 0".to_string()
+                                                            };
+                                                            ui.label(
+                                                                RichText::new(label)
+                                                                    .size(11.0)
+                                                                    .color(p.muted),
+                                                            );
+                                                            if ui.small_button("Prev").clicked() {
+                                                                scrollback_search_advance_pane(
+                                                                    pane,
+                                                                    &mut runtime.scrollback_searches
+                                                                        [idx],
+                                                                    -1,
+                                                                );
+                                                            }
+                                                            if ui.small_button("Next").clicked() {
+                                                                scrollback_search_advance_pane(
+                                                                    pane,
+                                                                    &mut runtime.scrollback_searches
+                                                                        [idx],
+                                                                    1,
+                                                                );
+                                                            }
+                                                            if ui.small_button("Close").clicked() {
+                                                                runtime.scrollback_searches[idx]
+                                                                    .open = false;
+                                                            }
+                                                        });
+                                                    }
                                                     ui.separator();
                                                     let terminal_height =
                                                         ui.available_height().max(120.0);
@@ -2316,6 +2607,27 @@ impl eframe::App for TermiteUi {
                                                         .get_mut(idx)
                                                         .expect("selection slot should exist");
                                                     let grid = pane.session.parser.grid();
+                                                    let search_highlight = if is_active
+                                                        && runtime
+                                                            .scrollback_searches
+                                                            .get(idx)
+                                                            .is_some_and(|s| s.open)
+                                                    {
+                                                        let ranges = scrollback_compute_match_ranges(
+                                                            grid,
+                                                            &runtime.scrollback_searches[idx].query,
+                                                        );
+                                                        if ranges.is_empty() {
+                                                            None
+                                                        } else {
+                                                            let i = runtime.scrollback_searches[idx]
+                                                                .current_match
+                                                                % ranges.len();
+                                                            Some(ranges[i])
+                                                        }
+                                                    } else {
+                                                        None
+                                                    };
                                                     let show_caret = pane
                                                         .session
                                                         .parser
@@ -2323,17 +2635,26 @@ impl eframe::App for TermiteUi {
                                                         || pane.session.parser.app_cursor_keys()
                                                         || grid.in_alt;
                                                     clicked_cell_from_grid = render_terminal_grid(
-                                                        ui, pane.id, grid, p, selection, is_active,
+                                                        ui,
+                                                        pane.id,
+                                                        grid,
+                                                        p,
+                                                        selection,
+                                                        is_active,
                                                         show_caret,
+                                                        search_highlight,
+                                                        &mut pane.last_autoscroll_caret_v,
                                                     );
 
-                                                    if let Some((clicked_row, clicked_col)) =
+                                                    if let Some((clicked_vrow, clicked_col)) =
                                                         clicked_cell_from_grid
                                                     {
                                                         runtime.active_terminal = Some(idx);
                                                         clicked_on_pane = true;
                                                         let grid = pane.session.parser.grid();
-                                                        if grid.cols > 0 {
+                                                        let sb = grid.scrollback_len();
+                                                        if clicked_vrow >= sb && grid.cols > 0 {
+                                                            let clicked_row = clicked_vrow - sb;
                                                             let target_row = clicked_row
                                                                 .min(grid.rows.saturating_sub(1));
                                                             let row_end =
@@ -2503,6 +2824,7 @@ impl eframe::App for TermiteUi {
                                     let removed_id = runtime.terminals.get(idx).map(|pane| pane.id);
                                     runtime.terminals.remove(idx);
                                     runtime.selections.remove(idx);
+                                    runtime.scrollback_searches.remove(idx);
                                     if runtime
                                         .equal_size_source_terminal_id
                                         .is_some_and(|id| Some(id) == removed_id)
@@ -2836,6 +3158,7 @@ impl TermiteUi {
             runtime.terminals.push(pane);
             runtime.selections.push(None);
             runtime.line_editors.push(LineEditor::new());
+            runtime.scrollback_searches.push(ScrollbackSearchPaneState::default());
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
         self.next_terminal_id = next_terminal_id + 1;
@@ -2877,12 +3200,27 @@ impl TermiteUi {
         } else if runtime.line_editors.len() > runtime.terminals.len() {
             runtime.line_editors.truncate(runtime.terminals.len());
         }
+        if runtime.scrollback_searches.len() < runtime.terminals.len() {
+            runtime
+                .scrollback_searches
+                .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
+        } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
+            runtime.scrollback_searches.truncate(runtime.terminals.len());
+        }
         let Some(active_idx) = runtime.active_terminal else {
             return;
         };
         if active_idx >= runtime.terminals.len() {
             return;
         }
+
+        let pane_id = runtime.terminals[active_idx].id;
+        let search_id = scrollback_search_text_id(pane_id);
+        let search_focused = ctx.memory(|m| m.focused() == Some(search_id));
+        let search_open = runtime
+            .scrollback_searches
+            .get(active_idx)
+            .is_some_and(|s| s.open);
 
         let mut shortcut_new_terminal = false;
         let events = ctx.input(|i| i.events.clone());
@@ -2895,6 +3233,9 @@ impl TermiteUi {
                     if mods.command || mods.ctrl {
                         continue;
                     }
+                    if search_focused {
+                        continue;
+                    }
                     if !text.is_empty() {
                         runtime.line_editors[active_idx].push_text(&text);
                         runtime.terminals[active_idx]
@@ -2903,12 +3244,66 @@ impl TermiteUi {
                     }
                 }
                 egui::Event::Paste(text) => {
-                    if !text.is_empty() {
-                        runtime.line_editors[active_idx].reset();
-                        let bytes = clipboard::clipboard_text_to_pty_bytes(&text);
-                        runtime.terminals[active_idx].backend.write_all(&bytes);
+                    if search_focused {
+                        continue;
                     }
+                    let clean = clipboard::sanitize_pasted_terminal_text(&text);
+                    let had_sel = runtime.selections[active_idx].is_some_and(|r| r.active);
+                    let delete_bytes = runtime.selections[active_idx]
+                        .filter(|r| r.active)
+                        .map(|range| {
+                            let grid = runtime.terminals[active_idx].session.parser.grid();
+                            selection_delete_bytes(grid, range, egui::Key::Backspace)
+                        })
+                        .unwrap_or_default();
                     runtime.selections[active_idx] = None;
+                    if !clean.is_empty() {
+                        let ed = &mut runtime.line_editors[active_idx];
+                        if had_sel && !delete_bytes.is_empty() {
+                            ed.replace_with_paste(&clean);
+                        } else {
+                            ed.push_paste(&clean);
+                        }
+                        let mut buf = delete_bytes;
+                        buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(&clean));
+                        let _ = runtime.terminals[active_idx].backend.write_all(&buf);
+                    }
+                }
+                // egui-winit turns Cmd+C / Cmd+X into these and does not emit `Key::C` / `Key::X`.
+                egui::Event::Copy => {
+                    if search_focused {
+                        continue;
+                    }
+                    let shift = ctx.input(|i| i.modifiers.shift);
+                    if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
+                        let grid = runtime.terminals[active_idx].session.parser.grid();
+                        let text = if shift {
+                            clipboard::selection_to_ansi_sgr_text(grid, range)
+                        } else {
+                            clipboard::selection_to_plain_text(grid, range)
+                        };
+                        let _ = clipboard::set_clipboard_text(&text);
+                    }
+                }
+                egui::Event::Cut => {
+                    if search_focused {
+                        continue;
+                    }
+                    if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
+                        let grid = runtime.terminals[active_idx].session.parser.grid();
+                        let text = clipboard::selection_to_plain_text(grid, range);
+                        let _ = clipboard::set_clipboard_text(&text);
+                        let bytes = selection_delete_bytes(grid, range, egui::Key::Backspace);
+                        if !bytes.is_empty() {
+                            let _ = runtime.terminals[active_idx].backend.write_all(&bytes);
+                        }
+                        runtime.selections[active_idx] = None;
+                        ctx.with_plugin(
+                            |label_sel: &mut egui::text_selection::LabelSelectionState| {
+                                label_sel.clear_selection();
+                            },
+                        );
+                    }
                 }
                 egui::Event::Key {
                     key,
@@ -2925,7 +3320,41 @@ impl TermiteUi {
                     let ctrl = modifiers.ctrl;
                     let shift = modifiers.shift;
 
+                    let is_open_find =
+                        key == egui::Key::F && (cmd || ctrl) && !shift;
+                    if is_open_find {
+                        runtime.scrollback_searches[active_idx].open = true;
+                        runtime.scrollback_search_focus_pane.set(Some(pane_id));
+                        continue;
+                    }
+
+                    if search_open && key == egui::Key::Escape {
+                        runtime.scrollback_searches[active_idx].open = false;
+                        continue;
+                    }
+
+                    if search_open && key == egui::Key::F3 {
+                        scrollback_search_advance_pane(
+                            &runtime.terminals[active_idx],
+                            &mut runtime.scrollback_searches[active_idx],
+                            if shift { -1 } else { 1 },
+                        );
+                        continue;
+                    }
+
+                    if search_focused && key == egui::Key::Enter {
+                        scrollback_search_advance_pane(
+                            &runtime.terminals[active_idx],
+                            &mut runtime.scrollback_searches[active_idx],
+                            if shift { -1 } else { 1 },
+                        );
+                        continue;
+                    }
+
                     // ── Undo / redo typed text ────────────────────────────────
+                    if search_focused && ((cmd && !shift && key == egui::Key::Z) || (cmd && shift && key == egui::Key::Z)) {
+                        continue;
+                    }
                     if cmd && !shift && key == egui::Key::Z {
                         let ed = &mut runtime.line_editors[active_idx];
                         let total_chars = ed.current.text.chars().count();
@@ -2945,47 +3374,95 @@ impl TermiteUi {
                         continue;
                     }
 
-                    // macOS-like shortcuts:
-                    // - Cmd/Ctrl+Shift+A = Select all
-                    // - Cmd/Ctrl+Shift+C = Copy (rich text via ANSI SGR)
-                    // - Cmd/Ctrl+Shift+V = Paste
-                    // - Shift+Insert     = Paste
+                    // Select all: input block (cursor row + contiguous non-empty live rows above),
+                    // not scrollback / full buffer. Not plain Ctrl+A (readline beginning-of-line).
                     let is_select_all = (cmd && key == egui::Key::A)
                         || (cmd && shift && key == egui::Key::A)
                         || (ctrl && shift && key == egui::Key::A);
+                    if is_select_all && search_focused {
+                        continue;
+                    }
                     if is_select_all {
                         let grid = runtime.terminals[active_idx].session.parser.grid();
-                        if grid.rows > 0 && grid.cols > 0 {
-                            runtime.selections[active_idx] = Some(SelectionRange {
-                                start_row: 0,
-                                start_col: 0,
-                                end_row: grid.rows - 1,
-                                end_col: grid.cols - 1,
-                                active: true,
-                            });
+                        if let Some(sel) = clipboard::selection_range_select_input_block(grid) {
+                            runtime.selections[active_idx] = Some(sel);
+                        }
+                        ctx.with_plugin(
+                            |label_sel: &mut egui::text_selection::LabelSelectionState| {
+                                label_sel.clear_selection();
+                            },
+                        );
+                        continue;
+                    }
+
+                    // Copy: plain (Cmd+C, Ctrl+Shift+C) for pasting back into the shell; rich (Cmd+Shift+C) with ANSI SGR.
+                    let is_copy_rich = cmd && shift && key == egui::Key::C;
+                    let is_copy_plain = (cmd && !shift && key == egui::Key::C)
+                        || (ctrl && shift && key == egui::Key::C);
+                    if (is_copy_plain || is_copy_rich) && search_focused {
+                        continue;
+                    }
+                    if is_copy_rich {
+                        if let Some(range) = runtime.selections[active_idx]
+                            .filter(|r| r.active)
+                        {
+                            let grid = runtime.terminals[active_idx].session.parser.grid();
+                            let text = clipboard::selection_to_ansi_sgr_text(grid, range);
+                            let _ = clipboard::set_clipboard_text(&text);
+                        }
+                        continue;
+                    }
+                    if is_copy_plain {
+                        if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
+                            let grid = runtime.terminals[active_idx].session.parser.grid();
+                            let text = clipboard::selection_to_plain_text(grid, range);
+                            let _ = clipboard::set_clipboard_text(&text);
                         }
                         continue;
                     }
 
-                    let is_copy =
-                        (cmd && key == egui::Key::C) || (ctrl && shift && key == egui::Key::C);
-                    if is_copy {
-                        if let Some(range) =
-                            runtime.selections.get(active_idx).copied().unwrap_or(None)
-                        {
-                            let grid = runtime.terminals[active_idx].session.parser.grid();
-                            let text = clipboard::selection_to_ansi_sgr_text(grid, range);
-                            if let Err(_e) = clipboard::set_clipboard_text(&text) {}
+                    // Paste from system clipboard (keyboard); `Event::Paste` also handles OS paste.
+                    let is_paste = (cmd && !shift && key == egui::Key::V)
+                        || (ctrl && shift && key == egui::Key::V)
+                        || (ctrl && !shift && key == egui::Key::V)
+                        || (shift && key == egui::Key::Insert);
+                    if is_paste && search_focused {
+                        continue;
+                    }
+                    if is_paste {
+                        if let Ok(text) = clipboard::get_clipboard_text() {
+                            let clean = clipboard::sanitize_pasted_terminal_text(&text);
+                            let had_sel = runtime.selections[active_idx].is_some_and(|r| r.active);
+                            let delete_bytes = runtime.selections[active_idx]
+                                .filter(|r| r.active)
+                                .map(|range| {
+                                    let grid = runtime.terminals[active_idx].session.parser.grid();
+                                    selection_delete_bytes(grid, range, egui::Key::Backspace)
+                                })
+                                .unwrap_or_default();
+                            runtime.selections[active_idx] = None;
+                            if !clean.is_empty() {
+                                let ed = &mut runtime.line_editors[active_idx];
+                                if had_sel && !delete_bytes.is_empty() {
+                                    ed.replace_with_paste(&clean);
+                                } else {
+                                    ed.push_paste(&clean);
+                                }
+                                let mut buf = delete_bytes;
+                                buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(&clean));
+                                let _ = runtime.terminals[active_idx].backend.write_all(&buf);
+                            }
+                        } else {
+                            runtime.selections[active_idx] = None;
                         }
-                        // Even without an internal rich selection, don't forward the
-                        // keystroke into the PTY (Cmd/C is typically used for copy).
                         continue;
                     }
 
                     if matches!(key, egui::Key::Backspace | egui::Key::Delete) {
-                        if let Some(range) =
-                            runtime.selections.get(active_idx).copied().unwrap_or(None)
-                        {
+                        if search_focused {
+                            continue;
+                        }
+                        if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
                             let grid = runtime.terminals[active_idx].session.parser.grid();
                             let bytes = selection_delete_bytes(grid, range, key);
                             if !bytes.is_empty() {
@@ -3009,6 +3486,9 @@ impl TermiteUi {
 
                     // Update cursor offset for navigation keys so mid-line insertions
                     // are tracked accurately; reset only when the line context is lost.
+                    if search_focused {
+                        continue;
+                    }
                     let ed = &mut runtime.line_editors[active_idx];
                     match key {
                         egui::Key::ArrowLeft => ed.move_left(),
@@ -3194,6 +3674,7 @@ fn spawn_terminal_pane(
                                 backend: TerminalBackend::DaemonPty { writer },
                                 desired_size: Vec2::new(520.0, 280.0),
                                 position: None,
+                                last_autoscroll_caret_v: None,
                             };
                         }
                     }
@@ -3224,6 +3705,7 @@ fn spawn_terminal_pane(
         backend: TerminalBackend::LocalPty { pty },
         desired_size: Vec2::new(520.0, 280.0),
         position: None,
+        last_autoscroll_caret_v: None,
     }
 }
 
@@ -3905,6 +4387,7 @@ fn cell_text_format(
 
     TextFormat {
         font_id,
+        line_height: Some(CELL_H),
         color: fg,
         background,
         italics: cell.attrs.contains(CellAttrs::ITALIC),
@@ -3923,32 +4406,15 @@ fn formats_match(a: &TextFormat, b: &TextFormat) -> bool {
         && a.strikethrough == b.strikethrough
 }
 
-/// Last column index + 1 to render on `row`, trimming only trailing unstyled spaces.
 fn row_render_end(grid: &TerminalGrid, row: usize) -> usize {
-    // Styling that makes an otherwise-blank space visually non-trivial
-    // (reverse swaps fg/bg, underline/strikethrough draw strokes). Trimming such
-    // cells hides TUI cursors that render as `\e[7m \e[27m` on a default bg.
-    let visible_space_attrs = CellAttrs::REVERSE | CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH;
-
-    let mut end = grid.cols;
-    while end > 0 {
-        let cell = grid.cell(row, end - 1);
-        if cell.wide == WideKind::Trailing {
-            end -= 1;
-            continue;
-        }
-        if cell.ch != ' ' {
-            break;
-        }
-        if cell.bg != Color::Default {
-            break;
-        }
-        if cell.attrs.intersects(visible_space_attrs) {
-            break;
-        }
-        end -= 1;
+    if row >= grid.rows {
+        return 0;
     }
-    end
+    grid.virtual_row_render_end(grid.scrollback_len() + row)
+}
+
+fn row_render_end_virtual(grid: &TerminalGrid, vrow: usize) -> usize {
+    grid.virtual_row_render_end(vrow)
 }
 
 #[inline]
@@ -3962,61 +4428,61 @@ fn terminal_char_category(ch: char) -> u8 {
     }
 }
 
-fn snap_to_leading_cell(grid: &TerminalGrid, row: usize, mut col: usize) -> usize {
-    if grid.cell(row, col).wide == WideKind::Trailing && col > 0 {
+fn snap_to_leading_cell_v(grid: &TerminalGrid, vrow: usize, mut col: usize) -> usize {
+    if col < grid.cols && grid.virtual_cell(vrow, col).wide == WideKind::Trailing && col > 0 {
         col -= 1;
     }
     col
 }
 
-fn wide_span_end_col(grid: &TerminalGrid, row: usize, start_col: usize) -> usize {
-    if grid.cell(row, start_col).wide == WideKind::Leading && start_col + 1 < grid.cols {
-        start_col + 1
-    } else {
-        start_col
-    }
-}
-
-fn prev_char_start_col(grid: &TerminalGrid, row: usize, col: usize) -> Option<usize> {
+fn prev_char_start_col_v(grid: &TerminalGrid, vrow: usize, col: usize) -> Option<usize> {
     if col == 0 {
         return None;
     }
     let mut pc = col - 1;
-    if grid.cell(row, pc).wide == WideKind::Trailing {
+    if grid.virtual_cell(vrow, pc).wide == WideKind::Trailing {
         pc = pc.checked_sub(1)?;
     }
     Some(pc)
 }
 
-fn next_char_start_after_end_col(grid: &TerminalGrid, row: usize, end_col: usize) -> Option<usize> {
+fn next_char_start_after_end_col_v(
+    grid: &TerminalGrid,
+    vrow: usize,
+    end_col: usize,
+) -> Option<usize> {
     let next = end_col + 1;
     if next >= grid.cols {
         return None;
     }
-    Some(snap_to_leading_cell(grid, row, next))
+    Some(snap_to_leading_cell_v(grid, vrow, next))
 }
 
-/// Inclusive `(start_col, end_col)` on `row` for double-click word selection.
-fn terminal_word_selection_span(grid: &TerminalGrid, row: usize, col: usize) -> Option<(usize, usize)> {
-    if row >= grid.rows || grid.cols == 0 {
+/// Virtual row (`0..total_rows`) for combined scrollback + live buffer.
+fn terminal_word_selection_span_v(
+    grid: &TerminalGrid,
+    vrow: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    if vrow >= grid.total_rows() || grid.cols == 0 {
         return None;
     }
     let col = col.min(grid.cols - 1);
-    let anchor = snap_to_leading_cell(grid, row, col);
-    let cat = terminal_char_category(grid.cell(row, anchor).ch);
+    let anchor = snap_to_leading_cell_v(grid, vrow, col);
+    let cat = terminal_char_category(grid.virtual_cell(vrow, anchor).ch);
     let mut start = anchor;
-    let mut end = wide_span_end_col(grid, row, anchor);
-    while let Some(ps) = prev_char_start_col(grid, row, start) {
-        if terminal_char_category(grid.cell(row, ps).ch) != cat {
+    let mut end = wide_span_end_col_v(grid, vrow, anchor);
+    while let Some(ps) = prev_char_start_col_v(grid, vrow, start) {
+        if terminal_char_category(grid.virtual_cell(vrow, ps).ch) != cat {
             break;
         }
         start = ps;
     }
-    while let Some(ns) = next_char_start_after_end_col(grid, row, end) {
-        if terminal_char_category(grid.cell(row, ns).ch) != cat {
+    while let Some(ns) = next_char_start_after_end_col_v(grid, vrow, end) {
+        if terminal_char_category(grid.virtual_cell(vrow, ns).ch) != cat {
             break;
         }
-        end = wide_span_end_col(grid, row, ns);
+        end = wide_span_end_col_v(grid, vrow, ns);
     }
     Some((start, end))
 }
@@ -4029,10 +4495,16 @@ fn render_terminal_grid(
     selection: &mut Option<SelectionRange>,
     is_focused_terminal: bool,
     _show_caret: bool,
+    search_highlight: Option<SelectionRange>,
+    caret_autoscroll: &mut Option<(usize, usize)>,
 ) -> Option<(usize, usize)> {
+    if !is_focused_terminal {
+        *caret_autoscroll = None;
+    }
     let font_id = FontId::monospace(12.0);
     let newline_fmt = TextFormat {
         font_id: font_id.clone(),
+        line_height: Some(CELL_H),
         color: p.vt_default_fg,
         background: Color32::TRANSPARENT,
         ..Default::default()
@@ -4048,26 +4520,30 @@ fn render_terminal_grid(
     let show_block_cursor = is_focused_terminal && blink_visible;
     let cursor_row = grid.cursor.row.min(grid.rows.saturating_sub(1));
     let cursor_col = grid.cursor.col.min(grid.cols.saturating_sub(1));
+    let cursor_row_v = grid.scrollback_len() + cursor_row;
+    let total_rows = grid.total_rows();
 
     let mut job = LayoutJob::default();
-    for row in 0..grid.rows {
-        let mut trim_end = row_render_end(grid, row);
-        // Extend the rendered region to cover the cursor cell so the block
-        // cursor is visible even when it sits on a trailing space.
-        if show_block_cursor && row == cursor_row && cursor_col < grid.cols {
+    for vrow in 0..total_rows {
+        let mut trim_end = row_render_end_virtual(grid, vrow);
+        if show_block_cursor && vrow == cursor_row_v && cursor_col < grid.cols {
             trim_end = trim_end.max(cursor_col + 1);
         }
         let mut col = 0;
         while col < trim_end {
-            let cell = grid.cell(row, col);
+            let cell = grid.virtual_cell(vrow, col);
             if cell.wide == WideKind::Trailing {
                 col += 1;
                 continue;
             }
 
-            let mut fmt = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
-            let is_selected =
-                selection.map_or(false, |sel| sel.contains(row, col, grid.rows, grid.cols));
+            let base_fmt_start = cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
+            let mut fmt = base_fmt_start.clone();
+            let is_selected = selection.map_or(false, |sel| {
+                sel.contains(vrow, col, total_rows, grid.cols)
+            });
+            let in_search = search_highlight
+                .is_some_and(|r| r.contains(vrow, col, total_rows, grid.cols));
             if is_selected {
                 // Invert the displayed fg/bg to highlight selection.
                 let normal_fg = fmt.color;
@@ -4078,13 +4554,14 @@ fn render_terminal_grid(
                 };
                 fmt.color = normal_bg;
                 fmt.background = normal_fg;
+            } else if in_search {
+                let normal_fg = fmt.color;
+                fmt.background = Color32::from_rgb(210, 165, 45);
+                fmt.color = normal_fg;
             }
-            // Some TUIs render the cursor by toggling reverse-video on the
-            // cursor cell itself. When blink is in the "off" phase, undo that
-            // cursor-cell reverse so the caret actually disappears.
             if is_focused_terminal
                 && !show_block_cursor
-                && row == cursor_row
+                && vrow == cursor_row_v
                 && col == cursor_col
                 && cell.attrs.contains(CellAttrs::REVERSE)
             {
@@ -4097,9 +4574,7 @@ fn render_terminal_grid(
                 fmt.color = effective_bg;
                 fmt.background = effective_fg;
             }
-            // Block cursor: invert this cell's colors so the cursor is a
-            // filled rectangle aligned with the rest of the glyph grid.
-            if show_block_cursor && row == cursor_row && col == cursor_col {
+            if show_block_cursor && vrow == cursor_row_v && col == cursor_col {
                 let effective_bg = if fmt.background == Color32::TRANSPARENT {
                     p.term_bg
                 } else {
@@ -4117,18 +4592,24 @@ fn render_terminal_grid(
             }
 
             while next < trim_end {
-                // Never merge the cursor cell into a preceding run so the
-                // block-cursor format is applied to exactly one segment.
-                if show_block_cursor && row == cursor_row && next == cursor_col {
+                if show_block_cursor && vrow == cursor_row_v && next == cursor_col {
                     break;
                 }
-                let c2 = grid.cell(row, next);
+                let c2 = grid.virtual_cell(vrow, next);
                 if c2.wide == WideKind::Trailing {
                     next += 1;
                     continue;
                 }
-                let fmt2 = cell_text_format(c2, font_id.clone(), p.term_bg, p.vt_default_fg);
-                if !formats_match(&fmt, &fmt2) {
+                let fmt2_base = cell_text_format(c2, font_id.clone(), p.term_bg, p.vt_default_fg);
+                let is_sel2 = selection.map_or(false, |sel| {
+                    sel.contains(vrow, next, total_rows, grid.cols)
+                });
+                let in_srch2 = search_highlight
+                    .is_some_and(|r| r.contains(vrow, next, total_rows, grid.cols));
+                if is_selected != is_sel2
+                    || in_search != in_srch2
+                    || !formats_match(&base_fmt_start, &fmt2_base)
+                {
                     break;
                 }
                 chunk.push(c2.ch);
@@ -4142,7 +4623,7 @@ fn render_terminal_grid(
             job.append(&chunk, 0.0, fmt);
             col = next;
         }
-        if row + 1 < grid.rows {
+        if vrow + 1 < total_rows {
             job.append("\n", 0.0, newline_fmt.clone());
         }
     }
@@ -4152,12 +4633,15 @@ fn render_terminal_grid(
         .id_salt(("term-scroll", pane_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let row_h = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
+            // Match [`CELL_H`] / PTY sizing and `TextFormat::line_height` so caret,
+            // search highlights, and hit-testing align with the laid-out galley.
+            let row_h = CELL_H;
             let glyph_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'W')).max(1.0);
+            // `selectable(false)` — otherwise Cmd+A selects the entire label galley (all scrollback).
             let response = ui
                 .add(
                     egui::Label::new(job)
-                        .selectable(true)
+                        .selectable(false)
                         .sense(Sense::click_and_drag())
                         .wrap_mode(egui::TextWrapMode::Extend),
                 )
@@ -4171,7 +4655,7 @@ fn render_terminal_grid(
                 let row = (local.y / row_h)
                     .floor()
                     .max(0.0)
-                    .min(grid.rows.saturating_sub(1) as f32) as usize;
+                    .min(total_rows.saturating_sub(1) as f32) as usize;
                 let col = (local.x / glyph_w)
                     .floor()
                     .max(0.0)
@@ -4181,12 +4665,12 @@ fn render_terminal_grid(
 
             if response.double_clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let (row, col) = pointer_to_cell(pointer);
-                    if let Some((sc, ec)) = terminal_word_selection_span(grid, row, col) {
+                    let (vrow, col) = pointer_to_cell(pointer);
+                    if let Some((sc, ec)) = terminal_word_selection_span_v(grid, vrow, col) {
                         *selection = Some(SelectionRange {
-                            start_row: row,
+                            start_row: vrow,
                             start_col: sc,
-                            end_row: row,
+                            end_row: vrow,
                             end_col: ec,
                             active: true,
                         });
@@ -4194,18 +4678,18 @@ fn render_terminal_grid(
                 }
             } else if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let (row, col) = pointer_to_cell(pointer);
-                    clicked_cell = Some((row, col));
+                    let (vrow, col) = pointer_to_cell(pointer);
+                    clicked_cell = Some((vrow, col));
                 }
             }
 
             if response.drag_started() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let (row, col) = pointer_to_cell(pointer);
+                    let (vrow, col) = pointer_to_cell(pointer);
                     *selection = Some(SelectionRange {
-                        start_row: row,
+                        start_row: vrow,
                         start_col: col,
-                        end_row: row,
+                        end_row: vrow,
                         end_col: col,
                         active: true,
                     });
@@ -4214,20 +4698,19 @@ fn render_terminal_grid(
                 if let (Some(pointer), Some(range)) =
                     (response.interact_pointer_pos(), selection.as_mut())
                 {
-                    let (row, col) = pointer_to_cell(pointer);
-                    range.end_row = row;
+                    let (vrow, col) = pointer_to_cell(pointer);
+                    range.end_row = vrow;
                     range.end_col = col;
                     range.active = true;
                 }
             }
 
-            // Fallback cursor overlay: guarantees a visible caret even when the
-            // current cell is a trailing space run that the text layout may trim.
-            if show_block_cursor && grid.rows > 0 && grid.cols > 0 {
-                let caret_row = cursor_row.min(grid.rows.saturating_sub(1));
+            if show_block_cursor && total_rows > 0 && grid.cols > 0 {
+                let caret_row_v = cursor_row_v.min(total_rows.saturating_sub(1));
                 let caret_col = cursor_col.min(grid.cols.saturating_sub(1));
                 let caret_x = response.rect.min.x + caret_col as f32 * glyph_w;
-                let caret_y = response.rect.min.y + caret_row as f32 * row_h;
+                let caret_y =
+                    response.rect.min.y + caret_row_v as f32 * row_h + TERMINAL_CELL_OVERLAY_Y_NUDGE;
                 let caret_rect = egui::Rect::from_min_size(
                     Pos2::new(caret_x, caret_y),
                     Vec2::new(glyph_w.clamp(6.0, 12.0), row_h.max(10.0)),
@@ -4239,8 +4722,26 @@ fn render_terminal_grid(
                     Stroke::new(1.0, Color32::BLACK),
                     egui::StrokeKind::Outside,
                 );
-                // Keep the caret in view for TUIs that place the prompt near the bottom.
-                ui.scroll_to_rect(caret_rect, Some(egui::Align::Center));
+                let caret_key = (caret_row_v, caret_col);
+                if search_highlight.is_none()
+                    && (*caret_autoscroll != Some(caret_key))
+                {
+                    ui.scroll_to_rect(caret_rect, Some(egui::Align::Center));
+                    *caret_autoscroll = Some(caret_key);
+                }
+            }
+            if let Some(range) = search_highlight {
+                let ((sr, sc), _) = range.normalized_start_end();
+                let sr = sr.min(total_rows.saturating_sub(1));
+                let sc = sc.min(grid.cols.saturating_sub(1));
+                let match_x = response.rect.min.x + sc as f32 * glyph_w;
+                let match_y =
+                    response.rect.min.y + sr as f32 * row_h + TERMINAL_CELL_OVERLAY_Y_NUDGE;
+                let match_rect = egui::Rect::from_min_size(
+                    Pos2::new(match_x, match_y),
+                    Vec2::new(glyph_w.max(8.0), row_h.max(10.0)),
+                );
+                ui.scroll_to_rect(match_rect, Some(egui::Align::Center));
             }
         });
     clicked_cell
@@ -4393,28 +4894,37 @@ fn selection_delete_bytes(
     mut range: SelectionRange,
     key: egui::Key,
 ) -> Vec<u8> {
-    if !range.active || grid.rows == 0 || grid.cols == 0 {
+    let total = grid.total_rows();
+    if !range.active || total == 0 || grid.cols == 0 {
         return key_to_ansi_bytes(key, false, false).unwrap_or_default();
     }
 
-    range.clamp_to_grid(grid.rows, grid.cols);
+    range.clamp_to_grid(total, grid.cols);
     let ((start_row, start_col), (end_row, end_col)) = range.normalized_start_end();
-    let selected_len = if start_row == end_row {
-        let mut count = 0usize;
-        for col in start_col..=end_col {
-            let cell = grid.cell(start_row, col);
-            if cell.wide != WideKind::Trailing {
-                count += 1;
+    if start_row < grid.scrollback_len() {
+        return Vec::new();
+    }
+    let end_grid_row = end_row.saturating_sub(grid.scrollback_len());
+
+    let mut selected_len = 0usize;
+    for row in start_row..=end_row {
+        let from_c = if row == start_row { start_col } else { 0 };
+        let to_c = if row == end_row {
+            end_col
+        } else {
+            grid.cols.saturating_sub(1)
+        };
+        for col in from_c..=to_c {
+            if grid.virtual_cell(row, col).wide != WideKind::Trailing {
+                selected_len += 1;
             }
         }
-        count
-    } else {
-        0
-    };
+    }
 
-    // Reliable deletion for line-editor prompts: normalize cursor to the selected span
-    // and emit delete/backspace the right number of times.
-    if selected_len > 0 && start_row == grid.cursor.row {
+    // Cursor must sit on the last selected row (normal after Cmd+A input block). Align column,
+    // then emit one backspace/delete per selected cell (works for multi-line when the shell
+    // joins logical lines, e.g. readline-style prompts).
+    if selected_len > 0 && grid.cursor.row == end_grid_row {
         let mut bytes = Vec::new();
         match key {
             egui::Key::Backspace => {
@@ -5715,6 +6225,13 @@ impl TermiteUi {
                 .resize_with(runtime.terminals.len(), LineEditor::new);
         } else if runtime.line_editors.len() > runtime.terminals.len() {
             runtime.line_editors.truncate(runtime.terminals.len());
+        }
+        if runtime.scrollback_searches.len() < runtime.terminals.len() {
+            runtime
+                .scrollback_searches
+                .resize_with(runtime.terminals.len(), ScrollbackSearchPaneState::default);
+        } else if runtime.scrollback_searches.len() > runtime.terminals.len() {
+            runtime.scrollback_searches.truncate(runtime.terminals.len());
         }
     }
 

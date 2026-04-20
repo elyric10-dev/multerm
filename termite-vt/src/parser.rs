@@ -220,8 +220,20 @@ impl VtePerformer {
                 }
                 self.grid.clear_line_range(crow, 0, ccol + 1);
             }
-            // Erase entire screen
-            2 | 3 => self.grid.clear_all(),
+            // Erase entire screen (CSI 2 J). Also clear host scrollback on the primary buffer
+            // so `clear` / `\e[2J` matches a literal empty session, not xterm's "keep scrollback".
+            2 => {
+                self.grid.clear_all();
+                if !self.grid.in_alt {
+                    self.grid.clear_scrollback();
+                }
+            }
+            // Erase saved lines only (CSI 3 J, xterm): scrollback without clearing the grid.
+            3 => {
+                if !self.grid.in_alt {
+                    self.grid.clear_scrollback();
+                }
+            }
             _ => {}
         }
     }
