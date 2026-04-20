@@ -49,7 +49,7 @@ enum UiStyle {
 const MAX_PANEL_GRID_ROWS: u8 = 8;
 
 const LINE_EDITOR_MAX_HISTORY: usize = 100;
-const CLOSED_WORKSPACE_HISTORY_MAX: usize = 32;
+const WORKSPACE_EDIT_HISTORY_MAX: usize = 64;
 
 /// A single snapshot of the line buffer: text content + cursor position.
 #[derive(Clone)]
@@ -965,8 +965,10 @@ struct MultermUi {
     prev_terminal_focus_key: Option<(usize, Option<usize>)>,
     /// Terminals popped out into their own native fullscreen window (double-click pane title).
     fullscreen_terminal_ids: HashSet<u64>,
-    closed_workspace_undo_stack: Vec<ClosedWorkspaceRecord>,
-    closed_workspace_redo_stack: Vec<ClosedWorkspaceRecord>,
+    workspace_edit_undo_stack: Vec<WorkspaceHistoryEntry>,
+    workspace_edit_redo_stack: Vec<WorkspaceHistoryEntry>,
+    workspace_history_current: Option<WorkspaceHistoryEntry>,
+    workspace_history_suspended: bool,
 }
 
 struct WorkspaceRuntime {
@@ -1054,9 +1056,10 @@ struct WorkspaceTabState {
 }
 
 #[derive(Clone)]
-struct ClosedWorkspaceRecord {
-    index: usize,
-    tab: WorkspaceTabState,
+struct WorkspaceHistoryEntry {
+    selected_workspace: usize,
+    next_terminal_id: u64,
+    workspaces: Vec<WorkspaceTabState>,
 }
 
 impl Default for MultermUi {
@@ -1134,8 +1137,10 @@ impl Default for MultermUi {
                 tab_drag: None,
                 prev_terminal_focus_key: None,
                 fullscreen_terminal_ids: HashSet::new(),
-                closed_workspace_undo_stack: Vec::new(),
-                closed_workspace_redo_stack: Vec::new(),
+                workspace_edit_undo_stack: Vec::new(),
+                workspace_edit_redo_stack: Vec::new(),
+                workspace_history_current: None,
+                workspace_history_suspended: false,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1179,6 +1184,7 @@ impl Default for MultermUi {
                     }
                 }
             }
+            app.workspace_history_current = Some(app.capture_workspace_history_snapshot());
             return app;
         }
 
@@ -1271,8 +1277,10 @@ impl Default for MultermUi {
             tab_drag: None,
             prev_terminal_focus_key: None,
             fullscreen_terminal_ids: HashSet::new(),
-            closed_workspace_undo_stack: Vec::new(),
-            closed_workspace_redo_stack: Vec::new(),
+            workspace_edit_undo_stack: Vec::new(),
+            workspace_edit_redo_stack: Vec::new(),
+            workspace_history_current: None,
+            workspace_history_suspended: false,
         }
     }
 }
@@ -1526,6 +1534,9 @@ fn new_terminal_context_menu(
 
 impl eframe::App for MultermUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.workspace_history_current.is_none() {
+            self.workspace_history_current = Some(self.capture_workspace_history_snapshot());
+        }
         // Keep refreshing so PTY output appears live without explicit wakeups.
         self.sync_all_workspace_runtime_buffers();
         let focus_key = self.active_workspace_runtime().map(|r| {
@@ -3440,18 +3451,14 @@ impl MultermUi {
                 continue;
             }
             if modifiers.shift {
-                if !self.closed_workspace_redo_stack.is_empty() {
-                    changed |= self.redo_close_workspace();
+                if !self.workspace_edit_redo_stack.is_empty() {
+                    changed |= self.redo_workspace_edit();
                 }
             } else {
-                if !self.closed_workspace_undo_stack.is_empty() {
-                    changed |= self.undo_close_workspace();
+                if !self.workspace_edit_undo_stack.is_empty() {
+                    changed |= self.undo_workspace_edit();
                 }
             }
-        }
-        if changed {
-            self.next_workspace_index = compute_next_workspace_index(&self.workspaces);
-            save_workspace_state(self);
         }
         changed
     }
@@ -5809,7 +5816,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
         ui.add_space(slack);
         let undo_close_btn = ui
             .add_enabled(
-                !app.closed_workspace_undo_stack.is_empty(),
+                !app.workspace_edit_undo_stack.is_empty(),
                 egui::Button::new(
                     RichText::new("↶")
                         .size(14.0)
@@ -5821,14 +5828,14 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 .min_size(Vec2::new(28.0, 28.0))
                 .corner_radius(3.0),
             )
-            .on_hover_text("Restore the most recently closed workspace (including its terminals)");
+            .on_hover_text("Undo workspace edit (close/add/move/resize terminals)");
         if undo_close_btn.clicked() {
-            changed |= app.undo_close_workspace();
+            changed |= app.undo_workspace_edit();
         }
 
         let redo_close_btn = ui
             .add_enabled(
-                !app.closed_workspace_redo_stack.is_empty(),
+                !app.workspace_edit_redo_stack.is_empty(),
                 egui::Button::new(
                     RichText::new("↷")
                         .size(14.0)
@@ -5840,9 +5847,9 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 .min_size(Vec2::new(28.0, 28.0))
                 .corner_radius(3.0),
             )
-            .on_hover_text("Close the workspace restored by Undo close");
+            .on_hover_text("Redo workspace edit");
         if redo_close_btn.clicked() {
-            changed |= app.redo_close_workspace();
+            changed |= app.redo_workspace_edit();
         }
 
         // ⚙ settings button.
@@ -6467,6 +6474,7 @@ fn workspace_state_path() -> PathBuf {
 
 fn save_workspace_state(app: &mut MultermUi) {
     app.ensure_workspace_runtime_slots();
+    app.sync_workspace_history_with_current_state();
     let state = WorkspaceState {
         ui_theme: app.ui_theme,
         ui_style: app.ui_style,
@@ -6699,7 +6707,11 @@ impl MultermUi {
     ) -> WorkspaceRuntime {
         let mut runtime = WorkspaceRuntime::default();
         for pane_state in &state.terminal_sessions {
-            let terminal_id = pane_state.id.max(self.next_terminal_id);
+            let terminal_id = if pane_state.id == 0 {
+                self.next_terminal_id
+            } else {
+                pane_state.id
+            };
             let tmux_session = pane_state
                 .tmux_session
                 .clone()
@@ -6710,7 +6722,7 @@ impl MultermUi {
                 state.working_dir.as_deref().unwrap_or(""),
                 &tmux_session,
             );
-            self.next_terminal_id = terminal_id + 1;
+            self.next_terminal_id = self.next_terminal_id.max(terminal_id + 1);
             pane.desired_size =
                 Vec2::new(pane_state.width.max(220.0), pane_state.height.max(120.0));
             pane.position = match (pane_state.x, pane_state.y) {
@@ -6731,27 +6743,85 @@ impl MultermUi {
         runtime
     }
 
-    fn push_closed_workspace_undo(&mut self, record: ClosedWorkspaceRecord) {
-        self.closed_workspace_undo_stack.push(record);
-        if self.closed_workspace_undo_stack.len() > CLOSED_WORKSPACE_HISTORY_MAX {
-            let overflow = self.closed_workspace_undo_stack.len() - CLOSED_WORKSPACE_HISTORY_MAX;
-            self.closed_workspace_undo_stack.drain(0..overflow);
+    fn capture_workspace_history_snapshot(&self) -> WorkspaceHistoryEntry {
+        WorkspaceHistoryEntry {
+            selected_workspace: self.selected_workspace,
+            next_terminal_id: self.next_terminal_id,
+            workspaces: self
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(idx, tab)| {
+                    Self::workspace_tab_state_from_runtime(tab, self.workspace_runtime.get(idx))
+                })
+                .collect(),
         }
+    }
+
+    fn workspace_history_signature(snapshot: &WorkspaceHistoryEntry) -> String {
+        serde_json::to_string(&(
+            snapshot.selected_workspace,
+            snapshot.next_terminal_id,
+            &snapshot.workspaces,
+        ))
+        .unwrap_or_default()
+    }
+
+    fn push_workspace_edit_undo(&mut self, snapshot: WorkspaceHistoryEntry) {
+        self.workspace_edit_undo_stack.push(snapshot);
+        if self.workspace_edit_undo_stack.len() > WORKSPACE_EDIT_HISTORY_MAX {
+            let overflow = self.workspace_edit_undo_stack.len() - WORKSPACE_EDIT_HISTORY_MAX;
+            self.workspace_edit_undo_stack.drain(0..overflow);
+        }
+    }
+
+    fn sync_workspace_history_with_current_state(&mut self) {
+        if self.workspace_history_suspended {
+            return;
+        }
+        let snapshot = self.capture_workspace_history_snapshot();
+        let Some(current) = self.workspace_history_current.clone() else {
+            self.workspace_history_current = Some(snapshot);
+            return;
+        };
+        if Self::workspace_history_signature(&current)
+            == Self::workspace_history_signature(&snapshot)
+        {
+            return;
+        }
+        self.push_workspace_edit_undo(current);
+        self.workspace_edit_redo_stack.clear();
+        self.workspace_history_current = Some(snapshot);
+    }
+
+    fn restore_workspace_history_snapshot(&mut self, snapshot: &WorkspaceHistoryEntry) {
+        self.next_terminal_id = 1;
+        self.workspaces = snapshot
+            .workspaces
+            .iter()
+            .map(Self::workspace_tab_from_state)
+            .collect();
+        self.workspace_runtime.clear();
+        for (idx, tab_state) in snapshot.workspaces.iter().enumerate() {
+            let runtime = self.runtime_from_workspace_state(idx, tab_state);
+            self.workspace_runtime.push(runtime);
+        }
+        self.next_terminal_id = self.next_terminal_id.max(snapshot.next_terminal_id);
+        if self.workspaces.is_empty() {
+            self.selected_workspace = 0;
+        } else {
+            self.selected_workspace = snapshot
+                .selected_workspace
+                .min(self.workspaces.len().saturating_sub(1));
+        }
+        self.next_workspace_index = compute_next_workspace_index(&self.workspaces);
+        self.ensure_workspace_runtime_slots();
     }
 
     fn close_workspace_at(&mut self, idx: usize) -> bool {
         if idx >= self.workspaces.len() {
             return false;
         }
-        let state = Self::workspace_tab_state_from_runtime(
-            &self.workspaces[idx],
-            self.workspace_runtime.get(idx),
-        );
-        self.push_closed_workspace_undo(ClosedWorkspaceRecord {
-            index: idx,
-            tab: state,
-        });
-        self.closed_workspace_redo_stack.clear();
 
         if self.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
             self.tab_drag = None;
@@ -6780,60 +6850,31 @@ impl MultermUi {
         true
     }
 
-    fn undo_close_workspace(&mut self) -> bool {
-        let Some(record) = self.closed_workspace_undo_stack.pop() else {
+    fn undo_workspace_edit(&mut self) -> bool {
+        let Some(snapshot) = self.workspace_edit_undo_stack.pop() else {
             return false;
         };
-        let insert_idx = record.index.min(self.workspaces.len());
-        let tab = Self::workspace_tab_from_state(&record.tab);
-        self.workspaces.insert(insert_idx, tab);
-        let runtime = self.runtime_from_workspace_state(insert_idx, &record.tab);
-        self.workspace_runtime.insert(insert_idx, runtime);
-        self.selected_workspace = insert_idx;
-        self.closed_workspace_redo_stack.push(record);
+        let current = self.capture_workspace_history_snapshot();
+        self.workspace_edit_redo_stack.push(current);
+        self.restore_workspace_history_snapshot(&snapshot);
+        self.workspace_history_current = Some(snapshot);
+        self.workspace_history_suspended = true;
+        save_workspace_state(self);
+        self.workspace_history_suspended = false;
         true
     }
 
-    fn redo_close_workspace(&mut self) -> bool {
-        let Some(record) = self.closed_workspace_redo_stack.pop() else {
+    fn redo_workspace_edit(&mut self) -> bool {
+        let Some(snapshot) = self.workspace_edit_redo_stack.pop() else {
             return false;
         };
-        if self.workspaces.is_empty() {
-            return false;
-        }
-        let idx = record.index.min(self.workspaces.len().saturating_sub(1));
-        let removed_state = Self::workspace_tab_state_from_runtime(
-            &self.workspaces[idx],
-            self.workspace_runtime.get(idx),
-        );
-        if self.tab_drag.as_ref().map(|d| d.source_idx) == Some(idx) {
-            self.tab_drag = None;
-        }
-        self.workspaces.remove(idx);
-        if idx < self.workspace_runtime.len() {
-            self.workspace_runtime.remove(idx);
-        }
-        if self.editing_workspace_idx == Some(idx) {
-            self.editing_workspace_idx = None;
-            self.editing_workspace_input.clear();
-        } else if let Some(ei) = self.editing_workspace_idx {
-            if ei > idx {
-                self.editing_workspace_idx = Some(ei - 1);
-            }
-        }
-        if self.workspaces.is_empty() {
-            self.selected_workspace = 0;
-        } else if self.selected_workspace > idx {
-            self.selected_workspace -= 1;
-        } else if self.selected_workspace == idx {
-            self.selected_workspace = self.selected_workspace.saturating_sub(1);
-        } else if self.selected_workspace >= self.workspaces.len() {
-            self.selected_workspace = self.workspaces.len().saturating_sub(1);
-        }
-        self.push_closed_workspace_undo(ClosedWorkspaceRecord {
-            index: idx,
-            tab: removed_state,
-        });
+        let current = self.capture_workspace_history_snapshot();
+        self.push_workspace_edit_undo(current);
+        self.restore_workspace_history_snapshot(&snapshot);
+        self.workspace_history_current = Some(snapshot);
+        self.workspace_history_suspended = true;
+        save_workspace_state(self);
+        self.workspace_history_suspended = false;
         true
     }
 
