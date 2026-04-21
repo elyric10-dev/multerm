@@ -933,7 +933,12 @@ fn main() -> eframe::Result<()> {
     }
 
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                // egui_winit logs an ERROR when clipboard has image-only data (no text).
+                // We handle that case ourselves, so suppress the noise.
+                .add_directive("egui_winit::clipboard=off".parse().unwrap()),
+        )
         .try_init();
 
     let options = eframe::NativeOptions {
@@ -4070,6 +4075,7 @@ impl MultermUi {
                     }
                     let clean = clipboard::sanitize_pasted_terminal_text(&text);
                     let had_sel = runtime.selections[active_idx].is_some_and(|r| r.active);
+                    let bracketed = runtime.terminals[active_idx].session.parser.bracketed_paste();
                     let delete_bytes = runtime.selections[active_idx]
                         .filter(|r| r.active)
                         .map(|range| {
@@ -4086,8 +4092,22 @@ impl MultermUi {
                             ed.push_paste(&clean);
                         }
                         let mut buf = delete_bytes;
-                        buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(&clean));
+                        buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes_with_mode(
+                            &clean, bracketed,
+                        ));
                         let _ = runtime.terminals[active_idx].backend.write_all(&buf);
+                    } else {
+                        #[cfg(target_os = "macos")]
+                        {
+                            if let Some(img_path) = clipboard::save_clipboard_image() {
+                                runtime.line_editors[active_idx].push_paste(&img_path);
+                                let bytes = clipboard::clipboard_text_to_pty_bytes_with_mode(
+                                    &img_path, bracketed,
+                                );
+                                let _ =
+                                    runtime.terminals[active_idx].backend.write_all(&bytes);
+                            }
+                        }
                     }
                 }
                 // egui-winit turns Cmd+C / Cmd+X into these and does not emit `Key::C` / `Key::X`.
@@ -4101,7 +4121,9 @@ impl MultermUi {
                         let text = if shift {
                             clipboard::selection_to_ansi_sgr_text(grid, range)
                         } else {
-                            clipboard::selection_to_plain_text(grid, range)
+                            clipboard::sanitize_pasted_terminal_text(
+                                &clipboard::selection_to_plain_text(grid, range),
+                            )
                         };
                         let _ = clipboard::set_clipboard_text(&text);
                     }
@@ -4112,7 +4134,9 @@ impl MultermUi {
                     }
                     if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
                         let grid = runtime.terminals[active_idx].session.parser.grid();
-                        let text = clipboard::selection_to_plain_text(grid, range);
+                        let text = clipboard::sanitize_pasted_terminal_text(
+                            &clipboard::selection_to_plain_text(grid, range),
+                        );
                         let _ = clipboard::set_clipboard_text(&text);
                         let bytes = selection_delete_bytes(grid, range, egui::Key::Backspace);
                         if !bytes.is_empty() {
@@ -4236,8 +4260,32 @@ impl MultermUi {
                     if is_copy_plain {
                         if let Some(range) = runtime.selections[active_idx].filter(|r| r.active) {
                             let grid = runtime.terminals[active_idx].session.parser.grid();
-                            let text = clipboard::selection_to_plain_text(grid, range);
+                            let text = clipboard::sanitize_pasted_terminal_text(
+                                &clipboard::selection_to_plain_text(grid, range),
+                            );
                             let _ = clipboard::set_clipboard_text(&text);
+                        }
+                        continue;
+                    }
+
+                    // Cmd+Shift+I — open file picker and paste the selected image path.
+                    let is_insert_image = cmd && shift && key == egui::Key::I;
+                    if is_insert_image && !search_focused {
+                        if let Some(file) = FileDialog::new()
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"],
+                            )
+                            .pick_file()
+                        {
+                            let path = file.to_string_lossy().into_owned();
+                            let bracketed =
+                                runtime.terminals[active_idx].session.parser.bracketed_paste();
+                            let ed = &mut runtime.line_editors[active_idx];
+                            ed.push_paste(&path);
+                            let bytes =
+                                clipboard::clipboard_text_to_pty_bytes_with_mode(&path, bracketed);
+                            let _ = runtime.terminals[active_idx].backend.write_all(&bytes);
                         }
                         continue;
                     }
@@ -4251,32 +4299,57 @@ impl MultermUi {
                         continue;
                     }
                     if is_paste {
-                        if let Ok(text) = clipboard::get_clipboard_text() {
-                            let clean = clipboard::sanitize_pasted_terminal_text(&text);
-                            let had_sel = runtime.selections[active_idx].is_some_and(|r| r.active);
+                        let clip_text = clipboard::get_clipboard_text().ok();
+                        let clean = clip_text
+                            .as_deref()
+                            .map(clipboard::sanitize_pasted_terminal_text)
+                            .unwrap_or_default();
+
+                        if !clean.is_empty() {
+                            let had_sel =
+                                runtime.selections[active_idx].is_some_and(|r| r.active);
+                            let bracketed =
+                                runtime.terminals[active_idx].session.parser.bracketed_paste();
                             let delete_bytes = runtime.selections[active_idx]
                                 .filter(|r| r.active)
                                 .map(|range| {
-                                    let grid = runtime.terminals[active_idx].session.parser.grid();
+                                    let grid =
+                                        runtime.terminals[active_idx].session.parser.grid();
                                     selection_delete_bytes(grid, range, egui::Key::Backspace)
                                 })
                                 .unwrap_or_default();
                             runtime.selections[active_idx] = None;
-                            if !clean.is_empty() {
-                                let ed = &mut runtime.line_editors[active_idx];
-                                if had_sel && !delete_bytes.is_empty() {
-                                    ed.replace_with_paste(&clean);
-                                } else {
-                                    ed.push_paste(&clean);
-                                }
-                                let mut buf = delete_bytes;
-                                buf.extend_from_slice(&clipboard::clipboard_text_to_pty_bytes(
-                                    &clean,
-                                ));
-                                let _ = runtime.terminals[active_idx].backend.write_all(&buf);
+                            let ed = &mut runtime.line_editors[active_idx];
+                            if had_sel && !delete_bytes.is_empty() {
+                                ed.replace_with_paste(&clean);
+                            } else {
+                                ed.push_paste(&clean);
                             }
+                            let mut buf = delete_bytes;
+                            buf.extend_from_slice(
+                                &clipboard::clipboard_text_to_pty_bytes_with_mode(
+                                    &clean, bracketed,
+                                ),
+                            );
+                            let _ = runtime.terminals[active_idx].backend.write_all(&buf);
                         } else {
                             runtime.selections[active_idx] = None;
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(img_path) = clipboard::save_clipboard_image() {
+                                    let bracketed = runtime.terminals[active_idx]
+                                        .session
+                                        .parser
+                                        .bracketed_paste();
+                                    runtime.line_editors[active_idx].push_paste(&img_path);
+                                    let bytes = clipboard::clipboard_text_to_pty_bytes_with_mode(
+                                        &img_path, bracketed,
+                                    );
+                                    let _ = runtime.terminals[active_idx]
+                                        .backend
+                                        .write_all(&bytes);
+                                }
+                            }
                         }
                         continue;
                     }

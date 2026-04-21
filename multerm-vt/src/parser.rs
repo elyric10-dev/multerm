@@ -28,6 +28,7 @@ struct VtePerformer {
     // Modes
     pub app_cursor_keys: bool,
     pub cursor_visible: bool,
+    pub bracketed_paste: bool,
 
     // Auto-wrap pending flag: set when last printed char reached last column.
     pending_wrap: bool,
@@ -58,6 +59,7 @@ impl VtePerformer {
             saved_attrs: CellAttrs::empty(),
             app_cursor_keys: false,
             cursor_visible: true,
+            bracketed_paste: false,
             pending_wrap: false,
             tab_stops,
         }
@@ -458,6 +460,7 @@ impl Perform for VtePerformer {
                         1 => self.app_cursor_keys = set,
                         7 => {} // auto-wrap (always on for us)
                         25 => self.cursor_visible = set,
+                        2004 => self.bracketed_paste = set,
                         1049 => {
                             if set {
                                 self.grid.enter_alternate();
@@ -614,5 +617,9 @@ impl TerminalParser {
 
     pub fn cursor_visible(&self) -> bool {
         self.performer.cursor_visible
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.performer.bracketed_paste
     }
 }

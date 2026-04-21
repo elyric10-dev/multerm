@@ -29,4 +29,6 @@ serde          = { workspace = true }
 serde_json     = { workspace = true }
 sysinfo        = { workspace = true }
 arboard        = { workspace = true }
+uuid           = { workspace = true }
+png            = { workspace = true }
 rfd = "0.17.2"

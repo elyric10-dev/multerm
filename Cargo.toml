@@ -1,3 +1,7 @@
+[patch.crates-io]
+# Patched to emit Event::Paste("") for image-only clipboard, enabling image paste in terminals.
+egui-winit = { path = "egui-winit-patched" }
+
 [workspace]
 members = [
     "multerm-app",
@@ -40,10 +44,11 @@ glam         = "0.29"
 # Utilities
 bitflags     = "2"
 uuid         = { version = "1", features = ["v4"] }
+png          = "0.17"
 anyhow       = "1"
 thiserror    = "2"
 tracing      = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 arboard      = "3"
 etagere      = "0.2"
 unicode-width = "0.2"

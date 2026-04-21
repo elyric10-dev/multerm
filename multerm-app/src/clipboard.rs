@@ -1,6 +1,7 @@
 use arboard::Clipboard;
 use multerm_render::SelectionRange;
 use multerm_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
+use std::io::BufWriter;
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,8 +321,20 @@ pub fn sanitize_pasted_terminal_text(s: &str) -> String {
     lines.join("\n")
 }
 
+
+#[allow(dead_code)]
 pub fn clipboard_text_to_pty_bytes(text: &str) -> Vec<u8> {
+    clipboard_text_to_pty_bytes_with_mode(text, false)
+}
+
+pub fn clipboard_text_to_pty_bytes_with_mode(text: &str, bracketed_paste: bool) -> Vec<u8> {
     let text = sanitize_pasted_terminal_text(text);
+    if bracketed_paste {
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        return bytes;
+    }
     let mut bytes = Vec::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -377,6 +390,84 @@ pub fn set_clipboard_text(text: &str) -> Result<(), anyhow::Error> {
     {
         anyhow::bail!("clipboard set failed (arboard unavailable and no pbcopy fallback)");
     }
+}
+
+/// Save clipboard image to /tmp/multerm_paste.png and return the path.
+/// Returns None if clipboard has no image.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub fn save_clipboard_image() -> Option<String> {
+    let path = "/tmp/multerm_paste.png".to_string();
+
+    // Primary: arboard uses NSPasteboard directly and handles all modern UTI types
+    // (public.png, public.tiff, screenshots, browser "Copy Image", etc.)
+    if let Ok(mut clipboard) = Clipboard::new() {
+        if let Ok(img) = clipboard.get_image() {
+            if img.width > 0 && img.height > 0 {
+                if let Ok(file) = std::fs::File::create(&path) {
+                    let mut encoder = png::Encoder::new(
+                        BufWriter::new(file),
+                        img.width as u32,
+                        img.height as u32,
+                    );
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    if let Ok(mut writer) = encoder.write_header() {
+                        if writer.write_image_data(&img.bytes).is_ok() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // Fallback: osascript PNG coercion
+    let tiff = "/tmp/multerm_paste.tiff";
+    let png_script = format!(
+        "set f to open for access POSIX file \"{path}\" with write permission\n\
+         set eof f to 0\n\
+         write (the clipboard as «class PNGf») to f\n\
+         close access f"
+    );
+    let ok = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&png_script)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if ok && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+        return Some(path);
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // Fallback: osascript TIFF then convert with sips
+    let tiff_script = format!(
+        "set f to open for access POSIX file \"{tiff}\" with write permission\n\
+         set eof f to 0\n\
+         write (the clipboard as «class TIFF») to f\n\
+         close access f"
+    );
+    let ok2 = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&tiff_script)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if ok2 {
+        let _ = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "png", tiff, "--out", &path])
+            .output();
+        let _ = std::fs::remove_file(tiff);
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+            return Some(path);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    None
 }
 
 pub fn get_clipboard_text() -> Result<String, anyhow::Error> {
