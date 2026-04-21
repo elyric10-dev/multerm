@@ -1,8 +1,8 @@
 use crossbeam_channel::unbounded;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Stroke,
-    TextEdit, Vec2, ViewportBuilder, ViewportClass, ViewportId,
+    self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Pos2, RichText, Sense, Shape,
+    Stroke, TextEdit, Vec2, ViewportBuilder, ViewportClass, ViewportId,
 };
 use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
 use multerm_render::color::ansi_indexed_to_rgb;
@@ -35,6 +35,7 @@ enum UiTheme {
     #[default]
     Dark,
     Light,
+    Cyberpunk,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -43,6 +44,70 @@ enum UiStyle {
     #[default]
     Normal,
     Glass,
+}
+
+fn default_true() -> bool { true }
+fn default_f32_1_5() -> f32 { 1.5 }
+fn default_f32_0_28() -> f32 { 0.28 }
+fn default_f32_1_0() -> f32 { 1.0 }
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct CyberpunkSettings {
+    /// Master toggle — hides all mouse-driven light effects when false.
+    #[serde(default = "default_true")]
+    show_light: bool,
+    /// Whether the light tracks the mouse at all.
+    #[serde(default = "default_true")]
+    follows_mouse: bool,
+    /// When true, every pane tracks the mouse; otherwise only the focused pane does.
+    #[serde(default)]
+    all_panes: bool,
+    /// Lerp speed toward the mouse (higher = snappier, lower = lazier).
+    #[serde(default = "default_f32_1_5")]
+    speed: f32,
+    /// Gaussian beam width as a fraction of the pane diagonal.
+    #[serde(default = "default_f32_0_28")]
+    sigma: f32,
+    /// Peak brightness multiplier (1.0 = default).
+    #[serde(default = "default_f32_1_0")]
+    brightness: f32,
+    /// Atmospheric shimmer — organic drift even when mouse is still.
+    #[serde(default = "default_true")]
+    shimmer: bool,
+    /// Shimmer amplitude multiplier (1.0 = default ~10 px max drift).
+    #[serde(default = "default_f32_1_0")]
+    shimmer_strength: f32,
+    /// Show the outer gradient glow rings around the active pane.
+    #[serde(default = "default_true")]
+    show_halos: bool,
+    /// Show the radial gradient blob that orbits the pane edge.
+    #[serde(default = "default_true")]
+    show_radial: bool,
+    /// Show the perimeter orbit dots that follow the light source.
+    #[serde(default = "default_true")]
+    show_dots: bool,
+    /// When true the radial glow sits directly at the cursor; when false it orbits the pane edge.
+    #[serde(default)]
+    follow_cursor: bool,
+}
+
+impl Default for CyberpunkSettings {
+    fn default() -> Self {
+        Self {
+            show_light: true,
+            follows_mouse: true,
+            all_panes: false,
+            speed: 1.5,
+            sigma: 0.28,
+            brightness: 1.0,
+            shimmer: true,
+            shimmer_strength: 1.0,
+            show_halos: true,
+            show_radial: true,
+            show_dots: true,
+            follow_cursor: false,
+        }
+    }
 }
 
 /// Upper bound on the row count in a fixed grid (default height hint for new panes).
@@ -466,58 +531,96 @@ struct UiPalette {
     resize_grip_cold: Color32,
     terminal_border_active: Color32,
     spawn_flash_rgb: [u8; 3],
+    /// Override color for the active-tab bottom indicator line. `None` = derive from fill.
+    tab_active_indicator: Option<Color32>,
+    /// Outer glow color painted around the active terminal border. `None` = no glow.
+    terminal_glow: Option<Color32>,
 }
 
 impl UiTheme {
     fn palette(self) -> UiPalette {
         match self {
+            // Dark — "Midnight Indigo": deep navy-black with a warm amber accent line
+            // and more saturated borders/actives for visual depth.
             UiTheme::Dark => UiPalette {
-                bg: Color32::from_rgb(7, 10, 16),
-                panel_bg: Color32::from_rgb(11, 17, 28),
-                border: Color32::from_rgb(33, 52, 84),
-                text: Color32::from_rgb(195, 213, 242),
-                muted: Color32::from_rgb(118, 137, 172),
-                tab_active_bg: Color32::from_rgb(30, 67, 116),
-                tab_inactive_bg: Color32::from_rgb(17, 27, 43),
-                tab_close: Color32::from_rgb(166, 180, 208),
-                tab_close_hover_bg: Color32::from_rgb(119, 44, 56),
-                tab_close_active_bg: Color32::from_rgb(146, 56, 70),
+                bg: Color32::from_rgb(6, 7, 15),
+                panel_bg: Color32::from_rgb(10, 13, 26),
+                border: Color32::from_rgb(44, 64, 108),
+                text: Color32::from_rgb(210, 222, 248),
+                muted: Color32::from_rgb(112, 128, 172),
+                tab_active_bg: Color32::from_rgb(28, 72, 148),
+                tab_inactive_bg: Color32::from_rgb(13, 18, 38),
+                tab_close: Color32::from_rgb(158, 176, 215),
+                tab_close_hover_bg: Color32::from_rgb(122, 42, 56),
+                tab_close_active_bg: Color32::from_rgb(150, 56, 72),
                 tab_close_hover_text: Color32::from_rgb(255, 241, 246),
-                path_bar_bg: Color32::from_rgb(13, 22, 36),
-                path_bar_border: Color32::from_rgb(29, 48, 76),
-                term_bg: Color32::from_rgb(5, 8, 12),
-                vt_default_fg: Color32::from_rgb(212, 212, 216),
-                header_strip: Color32::from_rgb(9, 13, 21),
-                popover_fill: Color32::from_rgb(8, 14, 24),
+                path_bar_bg: Color32::from_rgb(9, 12, 24),
+                path_bar_border: Color32::from_rgb(36, 54, 92),
+                term_bg: Color32::from_rgb(4, 5, 12),
+                vt_default_fg: Color32::from_rgb(215, 220, 238),
+                header_strip: Color32::from_rgb(7, 9, 20),
+                popover_fill: Color32::from_rgb(9, 12, 26),
                 tab_label_active: Color32::WHITE,
-                resize_grip_hot: Color32::from_rgb(160, 196, 245),
-                resize_grip_cold: Color32::from_rgb(96, 130, 184),
-                terminal_border_active: Color32::from_rgb(88, 142, 222),
+                resize_grip_hot: Color32::from_rgb(112, 170, 255),
+                resize_grip_cold: Color32::from_rgb(72, 116, 196),
+                terminal_border_active: Color32::from_rgb(92, 152, 255),
                 spawn_flash_rgb: [120, 180, 255],
+                tab_active_indicator: Some(Color32::from_rgb(255, 175, 80)),
+                terminal_glow: None,
             },
+            // Light — "Warm Canvas": cream-tinted backgrounds and a terracotta accent
+            // line instead of cold flat grey.
             UiTheme::Light => UiPalette {
-                bg: Color32::from_rgb(236, 239, 244),
-                panel_bg: Color32::from_rgb(224, 229, 237),
-                border: Color32::from_rgb(150, 165, 188),
-                text: Color32::from_rgb(28, 34, 48),
-                muted: Color32::from_rgb(88, 98, 118),
-                tab_active_bg: Color32::from_rgb(64, 120, 200),
-                tab_inactive_bg: Color32::from_rgb(206, 214, 228),
-                tab_close: Color32::from_rgb(90, 100, 120),
-                tab_close_hover_bg: Color32::from_rgb(200, 90, 100),
-                tab_close_active_bg: Color32::from_rgb(180, 60, 72),
+                bg: Color32::from_rgb(240, 238, 234),
+                panel_bg: Color32::from_rgb(228, 226, 221),
+                border: Color32::from_rgb(158, 162, 180),
+                text: Color32::from_rgb(22, 26, 42),
+                muted: Color32::from_rgb(90, 98, 124),
+                tab_active_bg: Color32::from_rgb(50, 100, 196),
+                tab_inactive_bg: Color32::from_rgb(210, 208, 203),
+                tab_close: Color32::from_rgb(86, 96, 118),
+                tab_close_hover_bg: Color32::from_rgb(196, 76, 88),
+                tab_close_active_bg: Color32::from_rgb(176, 56, 70),
                 tab_close_hover_text: Color32::from_rgb(255, 245, 247),
-                path_bar_bg: Color32::from_rgb(248, 249, 252),
-                path_bar_border: Color32::from_rgb(180, 190, 208),
-                term_bg: Color32::from_rgb(252, 252, 254),
-                vt_default_fg: Color32::from_rgb(36, 40, 52),
-                header_strip: Color32::from_rgb(226, 231, 240),
-                popover_fill: Color32::from_rgb(248, 250, 252),
+                path_bar_bg: Color32::from_rgb(248, 246, 241),
+                path_bar_border: Color32::from_rgb(178, 178, 194),
+                term_bg: Color32::from_rgb(250, 248, 244),
+                vt_default_fg: Color32::from_rgb(28, 32, 48),
+                header_strip: Color32::from_rgb(222, 220, 214),
+                popover_fill: Color32::from_rgb(246, 244, 239),
                 tab_label_active: Color32::WHITE,
-                resize_grip_hot: Color32::from_rgb(70, 120, 200),
-                resize_grip_cold: Color32::from_rgb(140, 160, 190),
-                terminal_border_active: Color32::from_rgb(50, 110, 200),
+                resize_grip_hot: Color32::from_rgb(58, 118, 212),
+                resize_grip_cold: Color32::from_rgb(128, 150, 196),
+                terminal_border_active: Color32::from_rgb(46, 106, 210),
                 spawn_flash_rgb: [70, 130, 220],
+                tab_active_indicator: Some(Color32::from_rgb(210, 90, 50)),
+                terminal_glow: None,
+            },
+            UiTheme::Cyberpunk => UiPalette {
+                bg: Color32::from_rgb(3, 6, 14),
+                panel_bg: Color32::from_rgb(6, 10, 22),
+                border: Color32::from_rgb(14, 48, 62),
+                text: Color32::from_rgb(200, 238, 248),
+                muted: Color32::from_rgb(78, 148, 170),
+                tab_active_bg: Color32::from_rgb(8, 50, 66),
+                tab_inactive_bg: Color32::from_rgb(4, 12, 22),
+                tab_close: Color32::from_rgb(88, 168, 190),
+                tab_close_hover_bg: Color32::from_rgb(110, 30, 50),
+                tab_close_active_bg: Color32::from_rgb(140, 40, 62),
+                tab_close_hover_text: Color32::from_rgb(255, 240, 248),
+                path_bar_bg: Color32::from_rgb(4, 8, 18),
+                path_bar_border: Color32::from_rgb(18, 58, 74),
+                term_bg: Color32::from_rgb(6, 16, 28),
+                vt_default_fg: Color32::from_rgb(208, 240, 248),
+                header_strip: Color32::from_rgb(3, 6, 15),
+                popover_fill: Color32::from_rgb(4, 9, 20),
+                tab_label_active: Color32::WHITE,
+                resize_grip_hot: Color32::from_rgb(0, 218, 240),
+                resize_grip_cold: Color32::from_rgb(0, 148, 172),
+                terminal_border_active: Color32::from_rgb(0, 224, 248),
+                spawn_flash_rgb: [0, 210, 235],
+                tab_active_indicator: Some(Color32::from_rgb(0, 224, 248)),
+                terminal_glow: Some(Color32::from_rgb(0, 224, 248)),
             },
         }
     }
@@ -578,7 +681,7 @@ fn tab_auto_text_color(bg: Color32) -> Color32 {
 
 fn apply_egui_visuals(ctx: &egui::Context, theme: UiTheme, p: UiPalette) {
     let mut visuals = match theme {
-        UiTheme::Dark => egui::Visuals::dark(),
+        UiTheme::Dark | UiTheme::Cyberpunk => egui::Visuals::dark(),
         UiTheme::Light => egui::Visuals::light(),
     };
     visuals.override_text_color = Some(p.text);
@@ -886,6 +989,8 @@ struct TerminalPane {
     position: Option<Pos2>,
     /// Last caret `(virtual_row, col)` we auto-scrolled to; `None` until first scroll this session.
     last_autoscroll_caret_v: Option<(usize, usize)>,
+    /// Per-pane animated border-light position; only updated while this pane is active.
+    border_light_pos: Option<Pos2>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -977,6 +1082,9 @@ struct MultermUi {
     fullscreen_terminal_ids: HashSet<u64>,
     workspace_edit_histories: Vec<WorkspaceEditHistory>,
     workspace_history_suspended: bool,
+    cyberpunk_settings: CyberpunkSettings,
+    /// Disables all continuous animations while keeping the visual style intact.
+    performance_mode: bool,
 }
 
 struct WorkspaceRuntime {
@@ -1039,6 +1147,10 @@ struct WorkspaceState {
     usage_panel_open_order: Vec<bool>,
     #[serde(default)]
     show_multerm_only_status: bool,
+    #[serde(default)]
+    cyberpunk_settings: CyberpunkSettings,
+    #[serde(default)]
+    performance_mode: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1159,6 +1271,8 @@ impl Default for MultermUi {
                     .map(|_| WorkspaceEditHistory::default())
                     .collect(),
                 workspace_history_suspended: false,
+                cyberpunk_settings: state.cyberpunk_settings,
+                performance_mode: state.performance_mode,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1297,6 +1411,8 @@ impl Default for MultermUi {
             fullscreen_terminal_ids: HashSet::new(),
             workspace_edit_histories: (0..5).map(|_| WorkspaceEditHistory::default()).collect(),
             workspace_history_suspended: false,
+            cyberpunk_settings: CyberpunkSettings::default(),
+            performance_mode: false,
         }
     }
 }
@@ -1319,7 +1435,7 @@ fn paint_workspace_terminal_spawn_notice_bar(ui: &mut egui::Ui, app: &mut Multer
         None => return,
     };
     let (fill, stroke, text) = match app.ui_theme {
-        UiTheme::Dark => (
+        UiTheme::Dark | UiTheme::Cyberpunk => (
             Color32::from_rgb(52, 28, 28),
             Color32::from_rgb(180, 90, 90),
             Color32::from_rgb(255, 200, 200),
@@ -1567,6 +1683,27 @@ impl eframe::App for MultermUi {
             self.prev_terminal_focus_key = focus_key;
         }
         ctx.request_repaint_after(Duration::from_millis(16));
+
+        // Per-pane light positions are updated inside the render loop (only for the active pane).
+        // Atmospheric shimmer constants are computed once here and used during rendering.
+        let light_dt = ctx.input(|i| i.stable_dt).min(0.1);
+        let light_target = ctx.input(|i| i.pointer.hover_pos());
+        let light_t_now = ctx.input(|i| i.time) as f32;
+        let cs = self.cyberpunk_settings;
+        let perf = self.performance_mode;
+        let (light_atmos_dx, light_atmos_dy) = if !perf && cs.show_light && cs.shimmer {
+            let s = cs.shimmer_strength;
+            let dx = s * (5.0 * (light_t_now * 0.71).sin()
+                        + 3.5 * (light_t_now * 1.47 + 1.1).sin()
+                        + 2.0 * (light_t_now * 2.83 + 0.4).cos());
+            let dy = s * (5.0 * (light_t_now * 0.89).cos()
+                        + 3.5 * (light_t_now * 1.73 + 0.7).cos()
+                        + 2.0 * (light_t_now * 3.07 + 1.9).sin());
+            (dx, dy)
+        } else {
+            (0.0, 0.0)
+        };
+
         self.drain_terminals();
         self.tick_workspace_terminal_spawn_notice();
         self.handle_keyboard_input(ctx);
@@ -1574,6 +1711,8 @@ impl eframe::App for MultermUi {
         self.refresh_system_status_if_due();
 
         let p = self.ui_theme.palette().with_style(self.ui_style);
+        let cyber = self.cyberpunk_settings;
+        let perf_mode = self.performance_mode;
         apply_egui_visuals(ctx, self.ui_theme, p);
 
         // Height follows content (PanelState). Avoid `exact_height`: it pins `height_range`
@@ -2578,12 +2717,129 @@ impl eframe::App for MultermUi {
                                     let pane_response =
                                         ui.allocate_rect(pane_body_rect, Sense::click());
                                     let mut clicked_cell_from_grid: Option<(usize, usize)> = None;
+
+                                    // Update this pane's light position when settings permit.
+                                    if cyber.show_light && cyber.follows_mouse && (is_active || cyber.all_panes) {
+                                        pane.border_light_pos = match (pane.border_light_pos, light_target) {
+                                            (Some(cur), Some(tgt)) => {
+                                                let alpha = if perf_mode { 1.0 } else {
+                                                    1.0 - (-cyber.speed * light_dt).exp()
+                                                };
+                                                Some(Pos2::new(cur.x + (tgt.x - cur.x) * alpha, cur.y + (tgt.y - cur.y) * alpha))
+                                            }
+                                            (None, Some(tgt)) => Some(tgt),
+                                            (cur, None) => cur,
+                                        };
+                                    }
+                                    // Apply atmospheric shimmer on top of this pane's stored position.
+                                    let border_light_pos = if cyber.show_light {
+                                        pane.border_light_pos
+                                            .map(|p| Pos2::new(p.x + light_atmos_dx, p.y + light_atmos_dy))
+                                    } else {
+                                        None
+                                    };
+
+                                    // Shared light-source helpers used by both the outer halo rings
+                                    // and the gradient border mesh below.
+                                    const PANE_CORNER_R: f32 = 6.0;
+                                    let light_sigma = pane_rect.size().length() * cyber.sigma;
+                                    let light_brightness = |pos: Pos2| -> f32 {
+                                        if let Some(mp) = border_light_pos {
+                                            let dx = pos.x - mp.x;
+                                            let dy = pos.y - mp.y;
+                                            (-(dx * dx + dy * dy) / (2.0 * light_sigma * light_sigma)).exp()
+                                        } else {
+                                            0.15
+                                        }
+                                    };
+                                    let light_n_arc = 8usize;
+                                    let light_path_pts = |rect: egui::Rect, r: f32| -> Vec<Pos2> {
+                                        let mut pts = Vec::with_capacity(4 * (light_n_arc + 1));
+                                        let corners = [
+                                            (rect.min.x + r, rect.min.y + r, 180.0_f32, 270.0_f32),
+                                            (rect.max.x - r, rect.min.y + r, 270.0_f32, 360.0_f32),
+                                            (rect.max.x - r, rect.max.y - r, 0.0_f32,   90.0_f32),
+                                            (rect.min.x + r, rect.max.y - r, 90.0_f32, 180.0_f32),
+                                        ];
+                                        let edge_ends = [
+                                            Pos2::new(rect.max.x - r, rect.min.y),
+                                            Pos2::new(rect.max.x, rect.max.y - r),
+                                            Pos2::new(rect.min.x + r, rect.max.y),
+                                            Pos2::new(rect.min.x, rect.min.y + r),
+                                        ];
+                                        for (ci, &(cx, cy, a0, a1)) in corners.iter().enumerate() {
+                                            for i in 0..light_n_arc {
+                                                let t = i as f32 / light_n_arc as f32;
+                                                let ang = (a0 + (a1 - a0) * t).to_radians();
+                                                if r > 0.0 {
+                                                    pts.push(Pos2::new(cx + r * ang.cos(), cy + r * ang.sin()));
+                                                } else {
+                                                    pts.push(Pos2::new(cx, cy));
+                                                }
+                                            }
+                                            pts.push(edge_ends[ci]);
+                                        }
+                                        pts
+                                    };
+
+                                    // Cyberpunk active: gradient border + outer glow
+                                    let use_gradient_border = is_active && p.terminal_glow.is_some() && stroke_w < 3.0 && cyber.show_light;
+                                    if is_active && cyber.show_light && cyber.show_halos {
+                                        if let Some(glow) = p.terminal_glow {
+                                            // Outer soft glow halos — gradient-lit by the animated light source.
+                                            let brt = cyber.brightness;
+                                            let paint_halo = |outer_rect: egui::Rect, outer_cr: f32,
+                                                               inner_rect: egui::Rect, inner_cr: f32,
+                                                               peak_alpha: f32| {
+                                                let outer_pts = light_path_pts(outer_rect, outer_cr);
+                                                let inner_pts = light_path_pts(inner_rect, inner_cr);
+                                                let n = outer_pts.len().min(inner_pts.len());
+                                                let mut m = egui::epaint::Mesh::default();
+                                                for i in 0..n {
+                                                    let t_o = light_brightness(outer_pts[i]);
+                                                    let t_i = light_brightness(inner_pts[i]);
+                                                    m.colored_vertex(outer_pts[i], Color32::from_rgba_unmultiplied(
+                                                        glow.r(), glow.g(), glow.b(), (peak_alpha * brt * t_o).min(255.0) as u8,
+                                                    ));
+                                                    m.colored_vertex(inner_pts[i], Color32::from_rgba_unmultiplied(
+                                                        glow.r(), glow.g(), glow.b(), (peak_alpha * brt * t_i).min(255.0) as u8,
+                                                    ));
+                                                }
+                                                for i in 0..n {
+                                                    let j = (i + 1) % n;
+                                                    let oi = (i * 2) as u32;
+                                                    let ii = (i * 2 + 1) as u32;
+                                                    let oj = (j * 2) as u32;
+                                                    let ij = (j * 2 + 1) as u32;
+                                                    m.add_triangle(oi, oj, ij);
+                                                    m.add_triangle(oi, ij, ii);
+                                                }
+                                                Shape::mesh(m)
+                                            };
+                                            ui.painter().add(paint_halo(
+                                                pane_rect.expand(10.0), PANE_CORNER_R + 10.0,
+                                                pane_rect.expand(5.0),  PANE_CORNER_R + 5.0,
+                                                90.0,
+                                            ));
+                                            ui.painter().add(paint_halo(
+                                                pane_rect.expand(5.5), PANE_CORNER_R + 5.5,
+                                                pane_rect.expand(2.5), PANE_CORNER_R + 2.5,
+                                                180.0,
+                                            ));
+                                        }
+                                    }
+                                    let frame_stroke = if use_gradient_border {
+                                        Stroke::NONE
+                                    } else {
+                                        Stroke::new(stroke_w, border)
+                                    };
                                     ui.scope_builder(
                                         egui::UiBuilder::new().max_rect(pane_rect),
                                         |ui| {
                                             egui::Frame::default()
                                                 .fill(p.term_bg)
-                                                .stroke(Stroke::new(stroke_w, border))
+                                                .stroke(frame_stroke)
+                                                .corner_radius(if p.terminal_glow.is_some() { PANE_CORNER_R } else { 0.0 })
                                                 .inner_margin(Margin::same(6))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
@@ -2595,6 +2851,16 @@ impl eframe::App for MultermUi {
                                                             ui.cursor().min,
                                                             Vec2::new(row_w, row_h),
                                                         );
+                                                        // Cyberpunk: subtle tinted header background
+                                                        if let Some(glow) = p.terminal_glow {
+                                                            ui.painter().rect_filled(
+                                                                row_rect,
+                                                                0.0,
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    glow.r(), glow.g(), glow.b(), 14,
+                                                                ),
+                                                            );
+                                                        }
                                                         // Background interact first (below); title + close
                                                         // painted after (above). Hover-only label lets
                                                         // double-clicks fall through to this layer.
@@ -2609,30 +2875,88 @@ impl eframe::App for MultermUi {
                                                             egui::UiBuilder::new().max_rect(row_rect),
                                                             |ui| {
                                                                 ui.horizontal(|ui| {
-                                                                    ui.add(
-                                                                        egui::Label::new(
-                                                                            RichText::new(&pane.title)
-                                                                                .family(
-                                                                                    FontFamily::Monospace,
-                                                                                )
-                                                                                .size(12.0)
-                                                                                .color(p.text),
-                                                                        )
-                                                                        .selectable(false)
-                                                                        .sense(Sense::hover()),
-                                                                    );
-                                                                    ui.with_layout(
-                                                                        egui::Layout::right_to_left(
-                                                                            egui::Align::Center,
-                                                                        ),
-                                                                        |ui| {
-                                                                            if ui.small_button("x")
-                                                                                .clicked()
-                                                                            {
-                                                                                close_idx = Some(idx);
-                                                                            }
-                                                                        },
-                                                                    );
+                                                                    if p.terminal_glow.is_some() {
+                                                                        // Cyberpunk header: ◉ icon + title + cyan pill
+                                                                        let accent = p.terminal_border_active;
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new("◉")
+                                                                                    .size(11.0)
+                                                                                    .color(accent),
+                                                                            )
+                                                                            .selectable(false)
+                                                                            .sense(Sense::hover()),
+                                                                        );
+                                                                        ui.add_space(5.0);
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(&pane.title)
+                                                                                    .family(FontFamily::Monospace)
+                                                                                    .size(11.0)
+                                                                                    .color(p.text),
+                                                                            )
+                                                                            .selectable(false)
+                                                                            .sense(Sense::hover()),
+                                                                        );
+                                                                        ui.add_space(6.0);
+                                                                        // Solid cyan pill badge
+                                                                        let pill_h = 14.0_f32;
+                                                                        let pill_w = 36.0_f32;
+                                                                        let (pill_alloc, _) = ui.allocate_exact_size(
+                                                                            Vec2::new(pill_w, pill_h),
+                                                                            Sense::hover(),
+                                                                        );
+                                                                        ui.painter().rect_filled(
+                                                                            pill_alloc.shrink2(Vec2::new(0.0, 1.0)),
+                                                                            pill_h * 0.5,
+                                                                            accent,
+                                                                        );
+                                                                        ui.painter().text(
+                                                                            pill_alloc.center(),
+                                                                            Align2::CENTER_CENTER,
+                                                                            "▶",
+                                                                            FontId::monospace(8.0),
+                                                                            p.term_bg,
+                                                                        );
+                                                                        ui.with_layout(
+                                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                                            |ui| {
+                                                                                if ui.add(egui::Label::new(
+                                                                                    RichText::new("×")
+                                                                                        .size(13.0)
+                                                                                        .color(p.muted),
+                                                                                ).sense(Sense::click())).clicked() {
+                                                                                    close_idx = Some(idx);
+                                                                                }
+                                                                                ui.add_space(4.0);
+                                                                                ui.add(egui::Label::new(
+                                                                                    RichText::new("─")
+                                                                                        .size(12.0)
+                                                                                        .color(p.muted),
+                                                                                ).sense(Sense::hover()));
+                                                                            },
+                                                                        );
+                                                                    } else {
+                                                                        // Standard header: title + close
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(&pane.title)
+                                                                                    .family(FontFamily::Monospace)
+                                                                                    .size(12.0)
+                                                                                    .color(p.text),
+                                                                            )
+                                                                            .selectable(false)
+                                                                            .sense(Sense::hover()),
+                                                                        );
+                                                                        ui.with_layout(
+                                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                                            |ui| {
+                                                                                if ui.small_button("x").clicked() {
+                                                                                    close_idx = Some(idx);
+                                                                                }
+                                                                            },
+                                                                        );
+                                                                    }
                                                                 });
                                                             },
                                                         );
@@ -2734,7 +3058,131 @@ impl eframe::App for MultermUi {
                                                             }
                                                         });
                                                     }
-                                                    ui.separator();
+                                                    // Cyberpunk: replace separator with a glowing cyan divider line
+                                                    if let Some(glow) = p.terminal_glow {
+                                                        let sep_h = 1.5_f32;
+                                                        let (sep_rect, _) = ui.allocate_exact_size(
+                                                            Vec2::new(ui.available_width(), sep_h + 4.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        let y = sep_rect.center().y;
+                                                        ui.painter().line_segment(
+                                                            [
+                                                                Pos2::new(sep_rect.min.x, y),
+                                                                Pos2::new(sep_rect.max.x, y),
+                                                            ],
+                                                            Stroke::new(sep_h, Color32::from_rgba_unmultiplied(
+                                                                glow.r(), glow.g(), glow.b(), 80,
+                                                            )),
+                                                        );
+                                                        ui.painter().line_segment(
+                                                            [
+                                                                Pos2::new(sep_rect.min.x + 2.0, y - 1.5),
+                                                                Pos2::new(sep_rect.max.x - 2.0, y - 1.5),
+                                                            ],
+                                                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(
+                                                                glow.r(), glow.g(), glow.b(), 35,
+                                                            )),
+                                                        );
+                                                    } else {
+                                                        ui.separator();
+                                                    }
+                                                    // Cyberpunk radial glow + noise dots — orbit the pane edge with the light source
+                                                    if let Some(glow) = p.terminal_glow {
+                                                        let body = ui.available_rect_before_wrap();
+                                                        let painter = ui.painter().with_clip_rect(pane_rect.expand(1.0));
+
+                                                        let rc = pane_rect;
+                                                        let center = rc.center();
+                                                        // Radial glow origin: free cursor mode sits at the cursor;
+                                                        // orbit mode projects the cursor onto the pane perimeter.
+                                                        let origin = if let Some(mp) = border_light_pos {
+                                                            if cyber.follow_cursor {
+                                                                mp
+                                                            } else {
+                                                                let dx = mp.x - center.x;
+                                                                let dy = mp.y - center.y;
+                                                                if dx.abs() + dy.abs() > 0.5 {
+                                                                    let sx = if dx != 0.0 { (rc.width() * 0.5) / dx.abs() } else { f32::INFINITY };
+                                                                    let sy = if dy != 0.0 { (rc.height() * 0.5) / dy.abs() } else { f32::INFINITY };
+                                                                    let s = sx.min(sy);
+                                                                    Pos2::new(center.x + dx * s, center.y + dy * s)
+                                                                } else {
+                                                                    Pos2::new(rc.min.x, rc.max.y)
+                                                                }
+                                                            }
+                                                        } else {
+                                                            Pos2::new(rc.min.x, rc.max.y)
+                                                        };
+
+                                                        if cyber.show_radial {
+                                                            const GLOW_RADIUS: f32 = 180.0;
+                                                            const SEGMENTS: usize = 48;
+                                                            let mut mesh = egui::epaint::Mesh::default();
+                                                            let a = (65.0 * cyber.brightness).min(255.0) as u8;
+                                                            let center_color = Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), a);
+                                                            let edge_color = Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), 0);
+                                                            mesh.colored_vertex(origin, center_color);
+                                                            for i in 0..=SEGMENTS {
+                                                                let angle = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+                                                                let pt = Pos2::new(
+                                                                    origin.x + GLOW_RADIUS * angle.cos(),
+                                                                    origin.y + GLOW_RADIUS * angle.sin(),
+                                                                );
+                                                                mesh.colored_vertex(pt, edge_color);
+                                                            }
+                                                            for i in 0..SEGMENTS {
+                                                                mesh.add_triangle(0, i as u32 + 1, i as u32 + 2);
+                                                            }
+                                                            painter.add(Shape::mesh(mesh));
+                                                        }
+
+                                                        if cyber.show_dots {
+                                                            // Perimeter orbit phase from mouse angle relative to pane center.
+                                                            let orbit_t = if let Some(mp) = border_light_pos {
+                                                                let angle = (mp.y - center.y).atan2(mp.x - center.x);
+                                                                (angle / std::f32::consts::TAU + 0.5).rem_euclid(1.0)
+                                                            } else { 0.0 };
+
+                                                            let pw = rc.width();
+                                                            let ph = rc.height();
+                                                            let perim = 2.0 * (pw + ph);
+                                                            let top_f = pw / perim;
+                                                            let right_f = ph / perim;
+                                                            let bot_f = pw / perim;
+                                                            let left_f = 1.0 - top_f - right_f - bot_f;
+                                                            let perim_pos = |t: f32| -> Pos2 {
+                                                                let t = t.rem_euclid(1.0);
+                                                                if t < top_f {
+                                                                    Pos2::new(rc.min.x + (t / top_f) * pw, rc.min.y)
+                                                                } else if t < top_f + right_f {
+                                                                    Pos2::new(rc.max.x, rc.min.y + ((t - top_f) / right_f) * ph)
+                                                                } else if t < top_f + right_f + bot_f {
+                                                                    Pos2::new(rc.max.x - ((t - top_f - right_f) / bot_f) * pw, rc.max.y)
+                                                                } else {
+                                                                    Pos2::new(rc.min.x, rc.max.y - ((t - top_f - right_f - bot_f) / left_f) * ph)
+                                                                }
+                                                            };
+
+                                                            let seed = pane.id;
+                                                            let _ = body;
+                                                            for i in 0u64..90 {
+                                                                let h1 = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(i.wrapping_mul(0x6c62272e07bb0142));
+                                                                let dot_t = (h1 & 0xffff) as f32 / 65535.0;
+                                                                let h2 = h1.wrapping_mul(0xbf58476d1ce4e5b9);
+                                                                let alpha_base = ((h2 >> 32) & 0x1f) as u8;
+                                                                if alpha_base > 8 {
+                                                                    let pos = perim_pos(dot_t + orbit_t);
+                                                                    let bt = light_brightness(pos);
+                                                                    let alpha = (alpha_base as f32 * cyber.brightness * (0.25 + 0.75 * bt)) as u8;
+                                                                    painter.circle_filled(
+                                                                        pos, 0.9,
+                                                                        Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), alpha),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     let terminal_height =
                                                         ui.available_height().max(120.0);
                                                     let terminal_size = Vec2::new(
@@ -2887,6 +3335,48 @@ impl eframe::App for MultermUi {
                                                 });
                                         },
                                     );
+                                    // Paint gradient border ON TOP of frame background (after scope_builder)
+                                    if use_gradient_border {
+                                        if let Some(glow) = p.terminal_glow {
+                                            let sw = stroke_w;
+                                            let cr = PANE_CORNER_R;
+                                            let cr_i = (cr - sw).max(0.0);
+
+                                            let color_at = |pos: Pos2| -> Color32 {
+                                                let t = light_brightness(pos);
+                                                let r_dim = glow.r() / 12;
+                                                let g_dim = glow.g() / 12;
+                                                let b_dim = glow.b() / 12;
+                                                let brt = cyber.brightness;
+                                                Color32::from_rgba_unmultiplied(
+                                                    (r_dim as f32 + (glow.r() - r_dim) as f32 * t).round() as u8,
+                                                    (g_dim as f32 + (glow.g() - g_dim) as f32 * t).round() as u8,
+                                                    (b_dim as f32 + (glow.b() - b_dim) as f32 * t).round() as u8,
+                                                    ((30.0 + 225.0 * t) * brt).min(255.0).round() as u8,
+                                                )
+                                            };
+
+                                            let outer = light_path_pts(pane_rect, cr);
+                                            let inner = light_path_pts(pane_rect.shrink(sw), cr_i);
+                                            let n = outer.len().min(inner.len());
+
+                                            let mut bm = egui::epaint::Mesh::default();
+                                            for i in 0..n {
+                                                bm.colored_vertex(outer[i], color_at(outer[i]));
+                                                bm.colored_vertex(inner[i], color_at(inner[i]));
+                                            }
+                                            for i in 0..n {
+                                                let j = (i + 1) % n;
+                                                let oi = (i * 2) as u32;
+                                                let ii = (i * 2 + 1) as u32;
+                                                let oj = (j * 2) as u32;
+                                                let ij = (j * 2 + 1) as u32;
+                                                bm.add_triangle(oi, oj, ij);
+                                                bm.add_triangle(oi, ij, ii);
+                                            }
+                                            ui.painter().add(Shape::mesh(bm));
+                                        }
+                                    }
 
                                     if pane_response.clicked() {
                                         runtime.active_terminal = Some(idx);
@@ -4147,6 +4637,7 @@ fn spawn_terminal_pane(
                                 desired_size: Vec2::new(520.0, 280.0),
                                 position: None,
                                 last_autoscroll_caret_v: None,
+                                border_light_pos: None,
                             };
                         }
                     }
@@ -4178,6 +4669,7 @@ fn spawn_terminal_pane(
         desired_size: Vec2::new(520.0, 280.0),
         position: None,
         last_autoscroll_caret_v: None,
+        border_light_pos: None,
     }
 }
 
@@ -5633,8 +6125,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 egui::StrokeKind::Inside,
             );
             if active {
-                let indicator_color = lighten_toward_white(fill, 0.52, 255);
-                let glow_color = lighten_toward_white(fill, 0.72, 205);
+                let indicator_color = p.tab_active_indicator
+                    .unwrap_or_else(|| lighten_toward_white(fill, 0.52, 255));
+                let glow_color = p.tab_active_indicator
+                    .map(|c| color_with_alpha(c, 180))
+                    .unwrap_or_else(|| lighten_toward_white(fill, 0.72, 205));
                 let y = tab_rect.max.y - 1.5;
                 painter.line_segment(
                     [
@@ -5911,23 +6406,129 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 }
 
 fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
-    ui.label("Appearance");
-    ui.horizontal(|ui| {
-        *changed |= ui
-            .selectable_value(&mut app.ui_theme, UiTheme::Dark, "Dark")
-            .clicked();
-        *changed |= ui
-            .selectable_value(&mut app.ui_theme, UiTheme::Light, "Light")
-            .clicked();
-    });
-    ui.separator();
-    ui.label("Theme style");
-    *changed |= ui
-        .selectable_value(&mut app.ui_style, UiStyle::Normal, "Normal")
-        .clicked();
-    *changed |= ui
-        .selectable_value(&mut app.ui_style, UiStyle::Glass, "Glass")
-        .clicked();
+    ui.set_width(200.0);
+    egui::ScrollArea::vertical()
+        .max_height(460.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            egui::Frame::none()
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+
+            // ── Theme ─────────────────────────────────────────────────────────
+            // "Theme" = color scheme (Dark / Light / Cyberpunk)
+            ui.label("Theme");
+            ui.horizontal(|ui| {
+                *changed |= ui
+                    .selectable_value(&mut app.ui_theme, UiTheme::Dark, "Dark")
+                    .clicked();
+                *changed |= ui
+                    .selectable_value(&mut app.ui_theme, UiTheme::Light, "Light")
+                    .clicked();
+                *changed |= ui
+                    .selectable_value(&mut app.ui_theme, UiTheme::Cyberpunk, "Cyberpunk")
+                    .clicked();
+            });
+
+            // ── Style ─────────────────────────────────────────────────────────
+            // "Style" = visual treatment applied on top of the theme (Normal / Glass)
+            ui.separator();
+            ui.label("Style");
+            ui.horizontal(|ui| {
+                *changed |= ui
+                    .selectable_value(&mut app.ui_style, UiStyle::Normal, "Normal")
+                    .clicked();
+                *changed |= ui
+                    .selectable_value(&mut app.ui_style, UiStyle::Glass, "Glass")
+                    .clicked();
+            });
+
+            // ── Performance ───────────────────────────────────────────────────
+            ui.separator();
+            *changed |= ui
+                .checkbox(&mut app.performance_mode, "Performance mode")
+                .on_hover_text("Disables animations; keeps all visual styles intact")
+                .changed();
+
+            // ── Cyberpunk-specific settings ───────────────────────────────────
+            if app.ui_theme == UiTheme::Cyberpunk {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Cyberpunk");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Reset").clicked() {
+                            app.cyberpunk_settings = CyberpunkSettings::default();
+                            *changed = true;
+                        }
+                    });
+                });
+
+                let cs = &mut app.cyberpunk_settings;
+
+                egui::CollapsingHeader::new("Light")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        *changed |= ui.checkbox(&mut cs.show_light, "Show light").changed();
+                        ui.add_enabled_ui(cs.show_light, |ui| {
+                            *changed |= ui.checkbox(&mut cs.follows_mouse, "Follow mouse").changed();
+                            ui.add_enabled_ui(cs.follows_mouse, |ui| {
+                                *changed |= ui.checkbox(&mut cs.all_panes, "All panes").changed();
+                                ui.add_enabled_ui(!app.performance_mode, |ui| {
+                                    *changed |= ui
+                                        .add(egui::Slider::new(&mut cs.speed, 0.3..=8.0)
+                                            .text("Speed").step_by(0.1))
+                                        .changed();
+                                });
+                            });
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut cs.sigma, 0.10..=0.70)
+                                    .text("Beam width").step_by(0.01))
+                                .changed();
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut cs.brightness, 0.1..=2.0)
+                                    .text("Brightness").step_by(0.05))
+                                .changed();
+                        });
+                    });
+
+                egui::CollapsingHeader::new("Atmosphere")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!app.performance_mode, |ui| {
+                            *changed |= ui.checkbox(&mut cs.shimmer, "Shimmer drift").changed();
+                            ui.add_enabled_ui(cs.shimmer, |ui| {
+                                *changed |= ui
+                                    .add(egui::Slider::new(&mut cs.shimmer_strength, 0.0..=3.0)
+                                        .text("Strength").step_by(0.05))
+                                    .changed();
+                            });
+                        });
+                        if app.performance_mode {
+                            ui.label(egui::RichText::new("Disabled in performance mode").italics().weak());
+                        }
+                    });
+
+                egui::CollapsingHeader::new("Radial glow")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        *changed |= ui.checkbox(&mut cs.show_radial, "Show radial glow").changed();
+                        ui.add_enabled_ui(cs.show_radial, |ui| {
+                            *changed |= ui
+                                .checkbox(&mut cs.follow_cursor, "Follow cursor freely")
+                                .on_hover_text("Glow sits at cursor — unchecked = orbits the pane edge")
+                                .changed();
+                        });
+                    });
+
+                egui::CollapsingHeader::new("Decoration")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        *changed |= ui.checkbox(&mut cs.show_halos, "Glow halos").changed();
+                        *changed |= ui.checkbox(&mut cs.show_dots, "Orbit dots").changed();
+                    });
+            }
+            }); // Frame
+        });
 }
 
 fn workspace_tab_context_menu(
@@ -6561,6 +7162,8 @@ fn save_workspace_state(app: &mut MultermUi) {
         usage_panel_pinned_scope: app.usage_panel_open_order.last().copied(),
         usage_panel_open_order: app.usage_panel_open_order.clone(),
         show_multerm_only_status: app.show_multerm_only_status,
+        cyberpunk_settings: app.cyberpunk_settings,
+        performance_mode: app.performance_mode,
     };
 
     let path = workspace_state_path();
