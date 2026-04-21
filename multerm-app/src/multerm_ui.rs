@@ -5768,7 +5768,7 @@ fn build_restore_bytes(total_chars: usize, state: &LineState) -> Vec<u8> {
 
 fn key_to_ansi_bytes(key: egui::Key, shift: bool, ctrl: bool) -> Option<Vec<u8>> {
     match key {
-        egui::Key::Enter => Some(vec![b'\r']),
+        egui::Key::Enter => Some(vec![if shift { b'\n' } else { b'\r' }]),
         egui::Key::Tab => Some(if shift {
             vec![0x1b, b'[', b'Z']
         } else {
