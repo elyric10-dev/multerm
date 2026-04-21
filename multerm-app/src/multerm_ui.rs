@@ -684,14 +684,48 @@ fn apply_egui_visuals(ctx: &egui::Context, theme: UiTheme, p: UiPalette) {
         UiTheme::Dark | UiTheme::Cyberpunk => egui::Visuals::dark(),
         UiTheme::Light => egui::Visuals::light(),
     };
+
+    // Global fills
     visuals.override_text_color = Some(p.text);
     visuals.panel_fill = p.bg;
-    visuals.window_fill = p.bg;
+    visuals.window_fill = p.popover_fill;   // popups use a distinct layered fill
+    visuals.window_stroke = Stroke::new(1.0, p.border);
+    visuals.faint_bg_color = p.panel_bg;
+    visuals.hyperlink_color = p.terminal_border_active;
+
+    // Text selection
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(
+        p.terminal_border_active.r(),
+        p.terminal_border_active.g(),
+        p.terminal_border_active.b(),
+        72,
+    );
+
+    // Noninteractive (labels, separators, read-only)
     visuals.widgets.noninteractive.bg_fill = p.panel_bg;
+    visuals.widgets.noninteractive.weak_bg_fill = p.panel_bg;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+
+    // Inactive — buttons / checkboxes at rest
+    visuals.widgets.inactive.bg_fill = p.tab_inactive_bg;
+    visuals.widgets.inactive.weak_bg_fill = p.panel_bg;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+
+    // Hovered — use border color as a mid-tone highlight
+    visuals.widgets.hovered.bg_fill = p.border;
+    visuals.widgets.hovered.weak_bg_fill = p.panel_bg;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border);
+
+    // Active / pressed
+    visuals.widgets.active.bg_fill = p.tab_active_bg;
+    visuals.widgets.active.weak_bg_fill = p.tab_active_bg;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, p.terminal_border_active);
+
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
         style.interaction.tooltip_delay = 0.0;
+        style.spacing.item_spacing = Vec2::new(8.0, 5.0);
+        style.spacing.button_padding = Vec2::new(8.0, 4.0);
     });
 }
 const CELL_W: f32 = 9.0;
@@ -2839,7 +2873,7 @@ impl eframe::App for MultermUi {
                                             egui::Frame::default()
                                                 .fill(p.term_bg)
                                                 .stroke(frame_stroke)
-                                                .corner_radius(if p.terminal_glow.is_some() { PANE_CORNER_R } else { 0.0 })
+                                                .corner_radius(if p.terminal_glow.is_some() { PANE_CORNER_R } else { 4.0 })
                                                 .inner_margin(Margin::same(6))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
@@ -6119,7 +6153,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             // Background + border.
             painter.rect(
                 tab_rect,
-                2.0,
+                5.0,
                 fill,
                 Stroke::new(1.0, p.border),
                 egui::StrokeKind::Inside,
@@ -6408,7 +6442,7 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
     ui.set_width(200.0);
     egui::ScrollArea::vertical()
-        .max_height(460.0)
+        .max_height(720.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Frame::none()
