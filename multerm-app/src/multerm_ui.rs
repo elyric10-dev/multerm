@@ -6039,7 +6039,14 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             let title = app.workspaces[idx].title.clone();
             let display_title = truncate_with_ellipsis(&title, max_tab_label_chars);
             let badge = app.workspaces[idx].badge;
-            let tc = tab_auto_text_color(fill);
+            let tc = if active
+                && app.workspaces[idx].color_rgba.is_none()
+                && app.color_picker_target_idx != Some(idx)
+            {
+                p.tab_label_active
+            } else {
+                tab_auto_text_color(fill)
+            };
             let is_editing = app.editing_workspace_idx == Some(idx);
             let is_drag_src = src_idx == Some(idx);
 
@@ -6445,7 +6452,7 @@ fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
         .max_height(720.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
 
