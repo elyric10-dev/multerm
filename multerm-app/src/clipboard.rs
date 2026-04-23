@@ -1,8 +1,11 @@
 use arboard::Clipboard;
 use multerm_render::SelectionRange;
 use multerm_vt::{cell::CellAttrs, Color, TerminalGrid, WideKind};
+use std::borrow::Cow;
 use std::io::BufWriter;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SgrProps {
@@ -392,12 +395,45 @@ pub fn set_clipboard_text(text: &str) -> Result<(), anyhow::Error> {
     }
 }
 
-/// Save clipboard image to /tmp/multerm_paste.png and return the path.
+/// Copy an image file to the system clipboard as image data (not as a path/text).
+#[allow(dead_code)]
+pub fn set_clipboard_image_from_path(path: &str) -> Result<(), anyhow::Error> {
+    let dyn_img = image::ImageReader::open(path)
+        .map_err(|e| anyhow::anyhow!("open image failed: {e}"))?
+        .decode()
+        .map_err(|e| anyhow::anyhow!("decode image failed: {e}"))?;
+    let rgba = dyn_img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let bytes = rgba.into_raw();
+
+    if let Ok(mut clipboard) = Clipboard::new() {
+        clipboard
+            .set_image(arboard::ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: Cow::Owned(bytes),
+            })
+            .map_err(|e| anyhow::anyhow!("clipboard image set failed: {e}"))?;
+        return Ok(());
+    }
+
+    anyhow::bail!("clipboard image set failed (arboard unavailable)");
+}
+
+/// Save clipboard image to a unique temp PNG and return the path.
 /// Returns None if clipboard has no image.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub fn save_clipboard_image() -> Option<String> {
-    let path = "/tmp/multerm_paste.png".to_string();
+    fn unique_clipboard_image_path() -> Option<PathBuf> {
+        let mut base = std::env::temp_dir();
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis();
+        base.push(format!("multerm_paste_{}_{}.png", std::process::id(), ts));
+        Some(base)
+    }
+
+    let path = unique_clipboard_image_path()?;
+    let path_str = path.to_string_lossy().to_string();
 
     // Primary: arboard uses NSPasteboard directly and handles all modern UTI types
     // (public.png, public.tiff, screenshots, browser "Copy Image", etc.)
@@ -414,7 +450,7 @@ pub fn save_clipboard_image() -> Option<String> {
                     encoder.set_depth(png::BitDepth::Eight);
                     if let Ok(mut writer) = encoder.write_header() {
                         if writer.write_image_data(&img.bytes).is_ok() {
-                            return Some(path);
+                            return Some(path_str);
                         }
                     }
                 }
@@ -424,12 +460,16 @@ pub fn save_clipboard_image() -> Option<String> {
     let _ = std::fs::remove_file(&path);
 
     // Fallback: osascript PNG coercion
-    let tiff = "/tmp/multerm_paste.tiff";
+    let mut tiff_path = path.clone();
+    tiff_path.set_extension("tiff");
+    let tiff = tiff_path.to_string_lossy().to_string();
     let png_script = format!(
         "set f to open for access POSIX file \"{path}\" with write permission\n\
          set eof f to 0\n\
          write (the clipboard as «class PNGf») to f\n\
          close access f"
+        ,
+        path = path_str
     );
     let ok = std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
@@ -439,7 +479,7 @@ pub fn save_clipboard_image() -> Option<String> {
         .unwrap_or(false);
 
     if ok && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
-        return Some(path);
+        return Some(path_str.clone());
     }
     let _ = std::fs::remove_file(&path);
 
@@ -448,7 +488,8 @@ pub fn save_clipboard_image() -> Option<String> {
         "set f to open for access POSIX file \"{tiff}\" with write permission\n\
          set eof f to 0\n\
          write (the clipboard as «class TIFF») to f\n\
-         close access f"
+         close access f",
+        tiff = tiff
     );
     let ok2 = std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
@@ -459,11 +500,11 @@ pub fn save_clipboard_image() -> Option<String> {
 
     if ok2 {
         let _ = std::process::Command::new("/usr/bin/sips")
-            .args(["-s", "format", "png", tiff, "--out", &path])
+            .args(["-s", "format", "png", &tiff, "--out", &path_str])
             .output();
-        let _ = std::fs::remove_file(tiff);
+        let _ = std::fs::remove_file(&tiff);
         if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
-            return Some(path);
+            return Some(path_str);
         }
     }
     let _ = std::fs::remove_file(&path);

@@ -32,3 +32,4 @@ arboard        = { workspace = true }
 uuid           = { workspace = true }
 png            = { workspace = true }
 rfd = "0.17.2"
+image = "0.25.10"

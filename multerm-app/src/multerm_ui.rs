@@ -8,12 +8,14 @@ use multerm_core::{pty::spawn_pty, session::TerminalSession, PaneId, PtyHandle};
 use multerm_render::color::ansi_indexed_to_rgb;
 use multerm_render::SelectionRange;
 use multerm_vt::cell::{Cell, CellAttrs, Color, WideKind};
-use multerm_vt::TerminalGrid;
+use multerm_vt::{TerminalGrid, TerminalParser};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::hash_map::DefaultHasher,
     collections::HashSet,
     fs,
+    hash::Hasher,
     io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
@@ -649,6 +651,45 @@ fn color_with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+/// Dimmed overlay behind the uploaded-images modal (theme-aware).
+fn image_gallery_modal_scrim(theme: UiTheme, p: UiPalette) -> Color32 {
+    match theme {
+        UiTheme::Light => Color32::from_rgba_unmultiplied(
+            p.text.r(),
+            p.text.g(),
+            p.text.b(),
+            96,
+        ),
+        UiTheme::Dark => Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+        UiTheme::Cyberpunk => Color32::from_rgba_unmultiplied(
+            p.bg.r(),
+            p.bg.g().saturating_add(6),
+            (p.bg.b() as u16 + 22).min(255) as u8,
+            188,
+        ),
+    }
+}
+
+fn image_content_fingerprint(path: &str) -> Option<(u64, u64)> {
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&bytes);
+    Some((bytes.len() as u64, hasher.finish()))
+}
+
+fn uploaded_images_contains_same_content(uploaded_images: &[String], candidate: &str) -> bool {
+    if uploaded_images.iter().any(|p| p == candidate) {
+        return true;
+    }
+    let Some((candidate_len, candidate_hash)) = image_content_fingerprint(candidate) else {
+        return false;
+    };
+    uploaded_images.iter().any(|path| {
+        image_content_fingerprint(path)
+            .is_some_and(|(len, hash)| len == candidate_len && hash == candidate_hash)
+    })
+}
+
 fn lighten_toward_white(c: Color32, mix: f32, alpha: u8) -> Color32 {
     let t = mix.clamp(0.0, 1.0);
     let lerp = |v: u8| -> u8 {
@@ -1103,6 +1144,8 @@ struct MultermUi {
     /// Live CPU / RAM / load readings (`sysinfo`).
     system: System,
     system_last_sample: Instant,
+    /// Smoothed UI repaint rate from egui frame delta (shown in Multerm usage panel).
+    ui_fps_smoothed: f32,
     /// Open usage panels, ordered from oldest click to newest click.
     /// `true` => multerm panel, `false` => system panel.
     usage_panel_open_order: Vec<bool>,
@@ -1124,6 +1167,12 @@ struct MultermUi {
     cyberpunk_settings: CyberpunkSettings,
     /// Disables all continuous animations while keeping the visual style intact.
     performance_mode: bool,
+    /// Cached egui textures for image gallery thumbnails, keyed by file path.
+    image_gallery_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    /// In-app fullscreen preview from the gallery “View” action (`load_image_thumbnail` …, `view`).
+    image_gallery_view: Option<(String, egui::TextureHandle)>,
+    /// Ephemeral “focus a terminal first” bubble above the footer Uploaded Images control.
+    uploaded_images_no_terminal_hint_until: Option<Instant>,
 }
 
 struct WorkspaceRuntime {
@@ -1135,6 +1184,11 @@ struct WorkspaceRuntime {
     scrollback_searches: Vec<ScrollbackSearchPaneState>,
     /// After Ctrl/Cmd+F, focus the search field once (uses `Cell` for nested UI borrows).
     scrollback_search_focus_pane: std::cell::Cell<Option<u64>>,
+    /// Image paths for the gallery (persisted per workspace in workspace state JSON).
+    uploaded_images: Vec<String>,
+    show_image_gallery: bool,
+    /// Screen rect of the active terminal pane, captured each render frame.
+    active_terminal_rect: Option<egui::Rect>,
 }
 
 impl Default for WorkspaceRuntime {
@@ -1147,6 +1201,9 @@ impl Default for WorkspaceRuntime {
             line_editors: Vec::new(),
             scrollback_searches: Vec::new(),
             scrollback_search_focus_pane: std::cell::Cell::new(None),
+            uploaded_images: Vec::new(),
+            show_image_gallery: false,
+            active_terminal_rect: None,
         }
     }
 }
@@ -1212,6 +1269,8 @@ struct WorkspaceTabState {
     active_terminal: Option<usize>,
     #[serde(default)]
     equal_size_source_terminal_id: Option<u64>,
+    #[serde(default)]
+    uploaded_images: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1292,6 +1351,7 @@ impl Default for MultermUi {
                 workspace_terminal_spawn_notice_until: None,
                 system: system_status_probe_new(),
                 system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
+                ui_fps_smoothed: 0.0,
                 usage_panel_open_order: if state.usage_panel_open_order.is_empty() {
                     state.usage_panel_pinned_scope.into_iter().collect()
                 } else {
@@ -1312,6 +1372,9 @@ impl Default for MultermUi {
                 workspace_history_suspended: false,
                 cyberpunk_settings: state.cyberpunk_settings,
                 performance_mode: state.performance_mode,
+                image_gallery_textures: std::collections::HashMap::new(),
+                image_gallery_view: None,
+                uploaded_images_no_terminal_hint_until: None,
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1352,6 +1415,7 @@ impl Default for MultermUi {
                         });
                         runtime.equal_size_source_terminal_id =
                             saved_tab.equal_size_source_terminal_id;
+                        runtime.uploaded_images = saved_tab.uploaded_images.clone();
                     }
                 }
             }
@@ -1438,6 +1502,7 @@ impl Default for MultermUi {
             workspace_terminal_spawn_notice_until: None,
             system: system_status_probe_new(),
             system_last_sample: Instant::now() - SYSTEM_STATUS_SAMPLE_INTERVAL,
+            ui_fps_smoothed: 0.0,
             usage_panel_open_order: Vec::new(),
             show_multerm_only_status: false,
             equal_size_picker_open: false,
@@ -1452,6 +1517,9 @@ impl Default for MultermUi {
             workspace_history_suspended: false,
             cyberpunk_settings: CyberpunkSettings::default(),
             performance_mode: false,
+            image_gallery_textures: std::collections::HashMap::new(),
+            image_gallery_view: None,
+            uploaded_images_no_terminal_hint_until: None,
         }
     }
 }
@@ -1723,6 +1791,17 @@ impl eframe::App for MultermUi {
         }
         ctx.request_repaint_after(Duration::from_millis(16));
 
+        let dt = ctx.input(|i| i.stable_dt);
+        if dt > 0.0 {
+            let instant_fps = 1.0 / dt;
+            const FPS_SMOOTH: f32 = 0.12;
+            self.ui_fps_smoothed = if self.ui_fps_smoothed <= 0.0 {
+                instant_fps
+            } else {
+                self.ui_fps_smoothed + FPS_SMOOTH * (instant_fps - self.ui_fps_smoothed)
+            };
+        }
+
         // Per-pane light positions are updated inside the render loop (only for the active pane).
         // Atmospheric shimmer constants are computed once here and used during rendering.
         let light_dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -1743,13 +1822,16 @@ impl eframe::App for MultermUi {
             (0.0, 0.0)
         };
 
+        let p = self.ui_theme.palette().with_style(self.ui_style);
+
         self.drain_terminals();
         self.tick_workspace_terminal_spawn_notice();
+        self.tick_uploaded_images_no_terminal_hint();
         self.handle_keyboard_input(ctx);
+        self.render_image_gallery(ctx, p);
         self.color_picker_rendered_this_frame = false;
         self.refresh_system_status_if_due();
 
-        let p = self.ui_theme.palette().with_style(self.ui_style);
         let cyber = self.cyberpunk_settings;
         let perf_mode = self.performance_mode;
         apply_egui_visuals(ctx, self.ui_theme, p);
@@ -1780,6 +1862,63 @@ impl eframe::App for MultermUi {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Left side: uploaded images gallery button
+                    let ws = self
+                        .selected_workspace
+                        .min(self.workspaces.len().saturating_sub(1));
+                    if let Some(runtime) = self.workspace_runtime.get(ws) {
+                        if !runtime.uploaded_images.is_empty() {
+                            let has_focused_terminal = runtime.active_terminal.is_some_and(
+                                |idx| idx < runtime.terminals.len(),
+                            );
+                            let label = format!(
+                                "\u{1f5bc} Uploaded Images ({})",
+                                runtime.uploaded_images.len()
+                            );
+                            let is_open = runtime.show_image_gallery;
+                            let accent = p
+                                .tab_active_indicator
+                                .unwrap_or(p.resize_grip_hot);
+                            let btn_color = if is_open {
+                                accent
+                            } else {
+                                p.muted
+                            };
+                            let btn = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(label).size(11.0).color(btn_color),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            if btn.clicked() {
+                                if has_focused_terminal {
+                                    self.uploaded_images_no_terminal_hint_until = None;
+                                    if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                                        rt.show_image_gallery = !rt.show_image_gallery;
+                                        if !rt.show_image_gallery {
+                                            self.image_gallery_view = None;
+                                        }
+                                    }
+                                } else {
+                                    if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                                        rt.show_image_gallery = false;
+                                    }
+                                    self.image_gallery_view = None;
+                                    self.uploaded_images_no_terminal_hint_until = Some(
+                                        Instant::now() + std::time::Duration::from_secs(5),
+                                    );
+                                }
+                            }
+                            if self.uploaded_images_no_terminal_hint_until.is_some_and(|until| {
+                                Instant::now() < until
+                            }) {
+                                self.render_uploaded_images_no_terminal_hint(ctx, btn.rect, p);
+                            }
+                        }
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let term_resp = ui
                             .add(
@@ -2686,6 +2825,9 @@ impl eframe::App for MultermUi {
                                     }
 
                                     let is_active = runtime.active_terminal == Some(idx);
+                                    if is_active {
+                                        runtime.active_terminal_rect = Some(pane_rect);
+                                    }
                                     let mut border = if is_active {
                                         p.terminal_border_active
                                     } else {
@@ -3278,12 +3420,11 @@ impl eframe::App for MultermUi {
                                                         } else {
                                                             None
                                                         };
-                                                        let show_caret = pane
-                                                            .session
-                                                            .parser
-                                                            .cursor_visible()
-                                                            || pane.session.parser.app_cursor_keys()
-                                                            || grid.in_alt;
+                                                        let synthetic_cursor_overlay =
+                                                            use_synthetic_cursor_overlay(
+                                                                &pane.session.parser,
+                                                                grid,
+                                                            );
                                                         clicked_cell_from_grid =
                                                             render_terminal_grid(
                                                                 ui,
@@ -3292,7 +3433,7 @@ impl eframe::App for MultermUi {
                                                                 p,
                                                                 selection,
                                                                 is_active,
-                                                                show_caret,
+                                                                synthetic_cursor_overlay,
                                                                 search_highlight,
                                                                 &mut pane.last_autoscroll_caret_v,
                                                             );
@@ -3701,7 +3842,10 @@ impl MultermUi {
             };
 
             let total_mem = self.system.total_memory().max(1);
-            let proc_cpu = proc_.cpu_usage().max(0.0);
+            // `Process::cpu_usage` is summed across cores (can exceed 100%); `global_cpu_usage` is
+            // the average across CPUs (0–100%). Scale so Multerm matches the system panel.
+            let n_cpus = self.system.cpus().len().max(1) as f32;
+            let proc_cpu = (proc_.cpu_usage().max(0.0) / n_cpus).clamp(0.0, 100.0);
             let proc_ram_ratio = (proc_.memory() as f32 / total_mem as f32).clamp(0.0, 1.0);
 
             usage_meter_row(
@@ -3720,6 +3864,22 @@ impl MultermUi {
                 Color32::from_rgb(91, 189, 122),
                 p,
             );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("FPS")
+                        .size(10.0)
+                        .family(FontFamily::Monospace)
+                        .color(p.muted),
+                );
+                // Match `usage_meter_row` progress bar width so the value lines up with CPU/RAM.
+                ui.add_space(126.0);
+                ui.label(
+                    RichText::new(format!("{:.0}", self.ui_fps_smoothed.max(0.0)))
+                        .size(10.0)
+                        .family(FontFamily::Monospace)
+                        .color(p.text),
+                );
+            });
             ui.add_space(2.0);
             ui.label(
                 RichText::new(format!("PID {}", proc_.pid().as_u32()))
@@ -3944,6 +4104,763 @@ impl MultermUi {
         }
     }
 
+    fn tick_uploaded_images_no_terminal_hint(&mut self) {
+        if self
+            .uploaded_images_no_terminal_hint_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.uploaded_images_no_terminal_hint_until = None;
+        }
+    }
+
+    /// Small popover above the footer “Uploaded Images” control (not a full-window modal).
+    fn render_uploaded_images_no_terminal_hint(
+        &self,
+        ctx: &egui::Context,
+        anchor: egui::Rect,
+        p: UiPalette,
+    ) {
+        let Some(until) = self.uploaded_images_no_terminal_hint_until else {
+            return;
+        };
+        if Instant::now() >= until {
+            return;
+        }
+
+        let cyber_shell = p.terminal_glow.is_some();
+        let fill = if cyber_shell { p.panel_bg } else { p.popover_fill };
+        let border = if cyber_shell {
+            p.terminal_border_active
+        } else {
+            p.border
+        };
+        let corner_r = if cyber_shell { 6.0 } else { 6.0 };
+        let stroke_w = if cyber_shell { 1.25 } else { 1.0 };
+
+        const GAP: f32 = 6.0;
+        const MAX_W: f32 = 300.0;
+        let viewport = ctx.viewport_rect();
+        let hint_id = egui::Id::new("uploaded_images_no_terminal_hint_popover");
+        // Anchor the bubble’s bottom edge just above the button (`pivot` + `fixed_pos`).
+        let pivot_pos = egui::pos2(anchor.left(), anchor.top() - GAP);
+
+        egui::Area::new(hint_id)
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(pivot_pos)
+            .constrain_to(viewport)
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(fill)
+                    .stroke(Stroke::new(stroke_w, border))
+                    .corner_radius(corner_r)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_max_width(MAX_W);
+                        let hint_rt = RichText::new(
+                            "Focus a terminal pane first, then open Uploaded Images to paste a path.",
+                        )
+                        .size(11.0)
+                        .color(p.text);
+                        let hint_rt = if cyber_shell {
+                            hint_rt.family(FontFamily::Monospace)
+                        } else {
+                            hint_rt
+                        };
+                        ui.label(hint_rt);
+                    });
+            });
+    }
+
+    fn render_image_gallery(&mut self, ctx: &egui::Context, p: UiPalette) {
+        let ws = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        let Some(runtime) = self.workspace_runtime.get(ws) else {
+            self.image_gallery_view = None;
+            return;
+        };
+        if !runtime.show_image_gallery || runtime.uploaded_images.is_empty() {
+            self.image_gallery_view = None;
+            return;
+        }
+
+        let has_focused_terminal = runtime
+            .active_terminal
+            .is_some_and(|idx| idx < runtime.terminals.len());
+        if !has_focused_terminal {
+            self.image_gallery_view = None;
+            if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.show_image_gallery = false;
+            }
+            return;
+        }
+
+        let images: Vec<String> = runtime.uploaded_images.clone();
+        let active_idx = runtime.active_terminal;
+
+        // Lazily load textures for images not yet in the cache.
+        for path in &images {
+            if !self.image_gallery_textures.contains_key(path) {
+                if let Some(tex) = load_image_thumbnail(path, ctx, 256, "thumb") {
+                    self.image_gallery_textures.insert(path.clone(), tex);
+                }
+            }
+        }
+
+        let cyber_shell = p.terminal_glow.is_some();
+        let rim = p.terminal_border_active;
+        let accent = p.tab_active_indicator.unwrap_or(rim);
+        let panel_bg = if cyber_shell {
+            p.panel_bg
+        } else {
+            p.popover_fill
+        };
+        let thumb_bg = p.term_bg;
+        let thumb_border = p.border;
+        let muted_color = p.muted;
+        let backdrop_scrim = image_gallery_modal_scrim(self.ui_theme, p);
+        let corner_r = if cyber_shell { 6.0 } else { 8.0 };
+        let outer_stroke = Stroke::new(if cyber_shell { 1.25 } else { 1.5 }, rim);
+
+        // Centered modal over the full viewport so the gallery stays usable regardless of
+        // which terminal pane is active (e.g. Claude Code, Codex, or a shell).
+        let viewport = ctx.viewport_rect();
+        let margin = 40.0;
+        let avail = (viewport.size() - egui::vec2(margin * 2.0, margin * 2.0)).max(egui::vec2(280.0, 220.0));
+        let modal_size = egui::vec2(avail.x.min(720.0), avail.y.min(560.0));
+        let modal_rect = egui::Rect::from_center_size(viewport.center(), modal_size);
+
+        // Full-viewport dimmed backdrop — click outside the panel to close.
+        let backdrop_id = egui::Id::new("gallery_backdrop");
+        let backdrop_resp = egui::Area::new(backdrop_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(viewport.min)
+            .show(ctx, |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(viewport.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, backdrop_scrim);
+                resp
+            });
+        if backdrop_resp.inner.clicked() {
+            self.image_gallery_view = None;
+            if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.show_image_gallery = false;
+            }
+            return;
+        }
+
+        let gallery_id = egui::Id::new("image_gallery_panel");
+        let mut close_gallery = false;
+        let mut reuse_path: Option<String> = None;
+        let mut copy_image_path: Option<String> = None;
+        let mut delete_path: Option<String> = None;
+        let mut open_view_path: Option<String> = None;
+
+        egui::Area::new(gallery_id)
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_rect.min)
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(panel_bg)
+                    .stroke(outer_stroke)
+                    .corner_radius(corner_r)
+                    .inner_margin(Margin {
+                        left: 14,
+                        right: 14,
+                        top: 12,
+                        bottom: 18,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_size(modal_size);
+                        ui.set_max_size(modal_size);
+                        let outer = ui.max_rect();
+
+                        /// Space above the cyber double-line footer (scroll ends here).
+                        const CYBER_BOTTOM_STRIP: f32 = 9.0;
+                        /// Inset for header chrome only (does not change the outer modal `Frame` margin).
+                        const CYBER_HEADER_PAD_X: f32 = 10.0;
+                        const CYBER_HEADER_PAD_TOP: f32 = 8.0;
+                        const CYBER_HEADER_PAD_BOTTOM: f32 = 6.0;
+                        /// Row for title + close; must be ≥ close diameter so the pill is not clipped.
+                        const CYBER_HEADER_ROW_H: f32 = 22.0;
+
+                        if cyber_shell {
+                            let glow = p.terminal_glow.unwrap();
+                            let inner_w = outer.width();
+                            let header_h =
+                                CYBER_HEADER_ROW_H + CYBER_HEADER_PAD_TOP + CYBER_HEADER_PAD_BOTTOM;
+                            let (_, hdr_resp) = ui.allocate_exact_size(
+                                Vec2::new(inner_w, header_h),
+                                Sense::hover(),
+                            );
+                            let header_rect = hdr_resp.rect;
+                            ui.painter().rect_filled(
+                                header_rect,
+                                0.0,
+                                Color32::from_rgba_unmultiplied(
+                                    glow.r(),
+                                    glow.g(),
+                                    glow.b(),
+                                    14,
+                                ),
+                            );
+                            let header_content = egui::Rect::from_min_max(
+                                Pos2::new(
+                                    header_rect.left() + CYBER_HEADER_PAD_X,
+                                    header_rect.top() + CYBER_HEADER_PAD_TOP,
+                                ),
+                                Pos2::new(
+                                    header_rect.right() - CYBER_HEADER_PAD_X,
+                                    header_rect.bottom() - CYBER_HEADER_PAD_BOTTOM,
+                                ),
+                            );
+                            let mut cyber_close = false;
+                            ui.scope_builder(
+                                egui::UiBuilder::new().max_rect(header_content),
+                                |ui| {
+                                // Title centered in the bar; close pinned to the far right.
+                                const CLOSE_DIAM: f32 = 18.0;
+                                const CLOSE_RIGHT_PAD: f32 = 2.0;
+                                const CLOSE_TITLE_GAP: f32 = 4.0;
+
+                                let full = ui.max_rect();
+                                let close_left =
+                                    full.right() - CLOSE_RIGHT_PAD - CLOSE_DIAM - CLOSE_TITLE_GAP;
+                                let title_rect = egui::Rect::from_min_max(
+                                    full.min,
+                                    Pos2::new(close_left.max(full.min.x), full.max.y),
+                                );
+                                ui.scope_builder(
+                                    egui::UiBuilder::new().max_rect(title_rect),
+                                    |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Uploaded images - {}",
+                                                    images.len()
+                                                ))
+                                                .family(FontFamily::Monospace)
+                                                .size(14.0)
+                                                .color(p.text),
+                                            );
+                                        });
+                                    },
+                                );
+
+                                let close_center = Pos2::new(
+                                    full.right() - CLOSE_RIGHT_PAD - CLOSE_DIAM * 0.5,
+                                    full.center().y,
+                                );
+                                let close_rect =
+                                    egui::Rect::from_center_size(close_center, Vec2::splat(CLOSE_DIAM));
+                                let close_resp = ui.allocate_rect(close_rect, Sense::click());
+                                let cr = CLOSE_DIAM * 0.5;
+                                ui.painter().rect_filled(close_rect, cr, rim);
+                                ui.painter().text(
+                                    close_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "×",
+                                    FontId::monospace(10.0),
+                                    p.term_bg,
+                                );
+                                if close_resp.clicked() {
+                                    cyber_close = true;
+                                }
+                                close_resp.on_hover_cursor(CursorIcon::PointingHand);
+                            });
+                            if cyber_close {
+                                close_gallery = true;
+                            }
+                            let sep_y = header_rect.bottom() - 0.75;
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(outer.left(), sep_y),
+                                    Pos2::new(outer.right(), sep_y),
+                                ],
+                                Stroke::new(
+                                    1.5,
+                                    Color32::from_rgba_unmultiplied(
+                                        glow.r(),
+                                        glow.g(),
+                                        glow.b(),
+                                        80,
+                                    ),
+                                ),
+                            );
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Uploaded images  \u{2022}  {}",
+                                        images.len()
+                                    ))
+                                    .size(12.5)
+                                    .color(accent)
+                                    .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(10.0);
+                                        let x_resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(" \u{2715} ")
+                                                        .size(13.0)
+                                                        .color(p.tab_close),
+                                                )
+                                                .sense(Sense::click()),
+                                            )
+                                            .on_hover_cursor(CursorIcon::PointingHand);
+                                        if x_resp.clicked() {
+                                            close_gallery = true;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.painter().hline(
+                                outer.left()..=outer.right(),
+                                ui.cursor().min.y,
+                                Stroke::new(1.0, p.border),
+                            );
+                            ui.add_space(1.0);
+                        }
+
+                        ui.add_space(6.0);
+
+                        // Use remaining content height so the grid doesn't get clipped by
+                        // stale cursor/min-rect math after header/layout changes.
+                        let scroll_h = (ui.available_height()
+                            - if cyber_shell { CYBER_BOTTOM_STRIP } else { 0.0 })
+                            .max(120.0);
+
+                        let thumb_corner = 4.0_f32;
+                        let ph_font = if cyber_shell {
+                            FontId::monospace(18.0)
+                        } else {
+                            FontId::proportional(24.0)
+                        };
+                        let ph_glyph = if cyber_shell { "▢" } else { "\u{1f5bc}" };
+
+                        // ── Image grid ───────────────────────────────────────────
+                        let cols = 3usize;
+                        let padding = 10.0;
+
+                        egui::ScrollArea::vertical()
+                            .max_height(scroll_h)
+                            .show(ui, |ui| {
+                                ui.add_space(4.0);
+                                let content_w = ui.available_width().max(1.0);
+                                let cell_w =
+                                    ((content_w - padding * (cols as f32 - 1.0)) / cols as f32)
+                                        .max(80.0);
+                                // Tall enough for four stacked hover actions (View / Select / Copy / Delete).
+                                const HOVER_ACTION_STACK_H: f32 = 26.0 * 4.0 + 7.0 * 3.0 + 10.0;
+                                let cell_h = cell_w.max(HOVER_ACTION_STACK_H);
+                                ui.spacing_mut().item_spacing = egui::vec2(padding, padding);
+                                for row in images.chunks(cols) {
+                                    ui.horizontal(|ui| {
+                                        for path in row {
+                                        ui.vertical(|ui| {
+                                            ui.set_width(cell_w);
+                                            let (thumb_rect, thumb_resp) =
+                                                ui.allocate_exact_size(
+                                                    egui::vec2(cell_w, cell_h),
+                                                    Sense::hover(),
+                                                );
+                                            // Keep hover overlay stable while interacting with
+                                            // overlay buttons inside the thumbnail rect.
+                                            let is_hovered = ui.rect_contains_pointer(thumb_rect);
+                                            let border_col = if is_hovered {
+                                                rim
+                                            } else {
+                                                thumb_border
+                                            };
+                                            ui.painter().rect_filled(
+                                                thumb_rect,
+                                                thumb_corner,
+                                                thumb_bg,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                thumb_rect,
+                                                thumb_corner,
+                                                Stroke::new(
+                                                    if is_hovered { 1.5 } else { 1.0 },
+                                                    border_col,
+                                                ),
+                                                egui::StrokeKind::Middle,
+                                            );
+
+                                            if let Some(tex) =
+                                                self.image_gallery_textures.get(path)
+                                            {
+                                                let img_corner = (thumb_corner - 1.0).max(1.0);
+                                                let img = egui::Image::from_texture(
+                                                    egui::load::SizedTexture::new(
+                                                        tex.id(),
+                                                        egui::vec2(
+                                                            tex.size()[0] as f32,
+                                                            tex.size()[1] as f32,
+                                                        ),
+                                                    ),
+                                                )
+                                                .fit_to_exact_size(egui::vec2(
+                                                    cell_w - 4.0,
+                                                    cell_h - 4.0,
+                                                ))
+                                                .corner_radius(img_corner);
+                                                img.paint_at(
+                                                    ui,
+                                                    thumb_rect.shrink(2.0),
+                                                );
+                                            } else {
+                                                ui.painter().text(
+                                                    thumb_rect.center(),
+                                                    Align2::CENTER_CENTER,
+                                                    ph_glyph,
+                                                    ph_font.clone(),
+                                                    muted_color,
+                                                );
+                                            }
+
+                                            if is_hovered {
+                                                ui.painter().rect_filled(
+                                                    thumb_rect,
+                                                    thumb_corner,
+                                                    color_with_alpha(rim, 38),
+                                                );
+
+                                                let btn_h = 26.0;
+                                                let btn_gap = 7.0;
+                                                let btn_w =
+                                                    (thumb_rect.width() - 20.0).clamp(86.0, 140.0);
+                                                let stack_h = btn_h * 4.0 + btn_gap * 3.0;
+                                                let btn_y = thumb_rect.center().y - stack_h * 0.5;
+                                                let view_rect = egui::Rect::from_min_size(
+                                                    Pos2::new(
+                                                        thumb_rect.center().x - btn_w * 0.5,
+                                                        btn_y,
+                                                    ),
+                                                    Vec2::new(btn_w, btn_h),
+                                                );
+                                                let select_rect = egui::Rect::from_min_size(
+                                                    Pos2::new(
+                                                        thumb_rect.center().x - btn_w * 0.5,
+                                                        view_rect.bottom() + btn_gap,
+                                                    ),
+                                                    Vec2::new(btn_w, btn_h),
+                                                );
+                                                let copy_rect = egui::Rect::from_min_size(
+                                                    Pos2::new(
+                                                        thumb_rect.center().x - btn_w * 0.5,
+                                                        select_rect.bottom() + btn_gap,
+                                                    ),
+                                                    Vec2::new(btn_w, btn_h),
+                                                );
+                                                let delete_rect = egui::Rect::from_min_size(
+                                                    Pos2::new(
+                                                        thumb_rect.center().x - btn_w * 0.5,
+                                                        copy_rect.bottom() + btn_gap,
+                                                    ),
+                                                    Vec2::new(btn_w, btn_h),
+                                                );
+
+                                                let view_resp = ui.put(
+                                                    view_rect,
+                                                    egui::Button::new(
+                                                        RichText::new("View")
+                                                            .italics()
+                                                            .family(FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(p.term_bg),
+                                                    )
+                                                    .fill(color_with_alpha(rim, 230))
+                                                    .stroke(Stroke::new(1.0, rim))
+                                                    .corner_radius(8.0),
+                                                );
+                                                let select_resp = ui.put(
+                                                    select_rect,
+                                                    egui::Button::new(
+                                                        RichText::new("Select")
+                                                            .italics()
+                                                            .family(FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(p.term_bg),
+                                                    )
+                                                    .fill(color_with_alpha(rim, 230))
+                                                    .stroke(Stroke::new(1.0, rim))
+                                                    .corner_radius(8.0),
+                                                );
+                                                let copy_resp = ui.put(
+                                                    copy_rect,
+                                                    egui::Button::new(
+                                                        RichText::new("Copy")
+                                                            .italics()
+                                                            .family(FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(p.term_bg),
+                                                    )
+                                                    .fill(color_with_alpha(rim, 230))
+                                                    .stroke(Stroke::new(1.0, rim))
+                                                    .corner_radius(8.0),
+                                                );
+                                                let delete_resp = ui.put(
+                                                    delete_rect,
+                                                    egui::Button::new(
+                                                        RichText::new("Delete")
+                                                            .italics()
+                                                            .family(FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(p.text),
+                                                    )
+                                                    .fill(color_with_alpha(p.tab_close, 212))
+                                                    .stroke(Stroke::new(1.0, p.tab_close))
+                                                    .corner_radius(8.0),
+                                                );
+                                                if view_resp.hovered()
+                                                    || select_resp.hovered()
+                                                    || copy_resp.hovered()
+                                                    || delete_resp.hovered()
+                                                {
+                                                    ui.ctx().set_cursor_icon(
+                                                        CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                                if view_resp.clicked() {
+                                                    open_view_path = Some(path.clone());
+                                                }
+                                                if select_resp.clicked() {
+                                                    reuse_path = Some(path.clone());
+                                                }
+                                                if copy_resp.clicked() {
+                                                    copy_image_path = Some(path.clone());
+                                                }
+                                                if delete_resp.clicked() {
+                                                    delete_path = Some(path.clone());
+                                                }
+                                            } else if thumb_resp.hovered() {
+                                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                            }
+                                        });
+
+                                        }
+                                    });
+                                }
+                                ui.add_space(8.0);
+                            });
+
+                        if cyber_shell {
+                            let _ = ui.allocate_space(Vec2::new(
+                                outer.width(),
+                                CYBER_BOTTOM_STRIP,
+                            ));
+                        }
+                    });
+            });
+
+        // Apply deferred mutations after borrowing ctx.
+        if close_gallery {
+            self.image_gallery_view = None;
+            if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.show_image_gallery = false;
+            }
+        }
+        if let Some(path) = reuse_path {
+            self.image_gallery_view = None;
+            if let Some(idx) = active_idx {
+                if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                    if idx < rt.terminals.len() {
+                        let bracketed =
+                            rt.terminals[idx].session.parser.bracketed_paste();
+                        rt.line_editors[idx].push_paste(&path);
+                        let bytes = clipboard::clipboard_text_to_pty_bytes_with_mode(
+                            &path, bracketed,
+                        );
+                        let _ = rt.terminals[idx].backend.write_all(&bytes);
+                    }
+                }
+            }
+            if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.show_image_gallery = false;
+            }
+        }
+        if let Some(path) = copy_image_path {
+            let _ = clipboard::set_clipboard_image_from_path(&path);
+        }
+        if let Some(path) = delete_path {
+            if self
+                .image_gallery_view
+                .as_ref()
+                .is_some_and(|(vp, _)| vp == &path)
+            {
+                self.image_gallery_view = None;
+            }
+            self.image_gallery_textures.remove(&path);
+            if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.uploaded_images.retain(|p| p != &path);
+                if rt.uploaded_images.is_empty() {
+                    rt.show_image_gallery = false;
+                    self.image_gallery_view = None;
+                }
+            }
+        }
+        if let Some(path) = open_view_path {
+            self.image_gallery_view = None;
+            if let Some(tex) = load_image_thumbnail(&path, ctx, 2048, "view") {
+                self.image_gallery_view = Some((path, tex));
+            }
+        }
+
+        self.paint_image_gallery_viewer(ctx, p);
+    }
+
+    /// Full-window preview on top of the gallery (backdrop click, ×, or Escape closes).
+    fn paint_image_gallery_viewer(&mut self, ctx: &egui::Context, p: UiPalette) {
+        let (path, tex) = match self.image_gallery_view.clone() {
+            Some(v) => v,
+            None => return,
+        };
+        let cyber_shell = p.terminal_glow.is_some();
+        let rim = p.terminal_border_active;
+        let viewport = ctx.viewport_rect();
+        let mut close_view = false;
+
+        // Use `Debug` so this UI is always above the gallery panel (`Tooltip`). Otherwise the
+        // gallery and viewer layers compete and the full-screen scrim can paint over the image
+        // after reopening a different preview.
+        let backdrop_id = egui::Id::new("image_gallery_view_backdrop");
+        egui::Area::new(backdrop_id)
+            .order(egui::Order::Debug)
+            .fixed_pos(viewport.min)
+            .show(ctx, |ui| {
+                let (_, resp) =
+                    ui.allocate_exact_size(viewport.size(), Sense::click());
+                // No extra dimming: the gallery modal already has a viewport scrim. A second
+                // opaque layer here stacked too dark; clicks still close the preview.
+                if resp.clicked() {
+                    close_view = true;
+                }
+            });
+
+        let tex_sz = tex.size_vec2().max(Vec2::splat(1.0));
+        let max_img = (viewport.size() - Vec2::splat(48.0)).max(Vec2::splat(80.0)) * 0.92;
+        let scale = (max_img.x / tex_sz.x)
+            .min(max_img.y / tex_sz.y)
+            .min(1.0)
+            .max(0.0);
+        let display_sz = (tex_sz * scale).max(Vec2::splat(1.0));
+        // Frame uses `inner_margin(16)` on all sides: outer size must include title row + gap +
+        // image plus vertical margins (otherwise the image is clipped against dark panel fill).
+        let frame_pad = 16.0_f32;
+        let title_row_h = 28.0_f32;
+        let title_to_img_gap = 6.0_f32;
+        let mut panel_size = egui::vec2(
+            display_sz.x + frame_pad * 2.0,
+            title_row_h + title_to_img_gap + display_sz.y + frame_pad * 2.0,
+        );
+        panel_size = panel_size.min(viewport.size() - Vec2::splat(24.0));
+        let panel_rect =
+            egui::Rect::from_center_size(viewport.center(), panel_size);
+        let panel_bg = if cyber_shell { p.panel_bg } else { p.popover_fill };
+
+        egui::Area::new(egui::Id::new("image_gallery_view_panel"))
+            .order(egui::Order::Debug)
+            .fixed_pos(panel_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(panel_size);
+                ui.set_max_size(panel_size);
+                egui::Frame::default()
+                    .fill(panel_bg)
+                    .stroke(Stroke::new(
+                        if cyber_shell { 1.25 } else { 1.5 },
+                        rim,
+                    ))
+                    .corner_radius(if cyber_shell { 6.0 } else { 8.0 })
+                    .inner_margin(Margin::same(frame_pad as i8))
+                    .show(ui, |ui| {
+                        let full = ui.max_rect();
+                        let close_d = 22.0_f32;
+                        let close_pad = 6.0_f32;
+                        let close_rect = egui::Rect::from_min_size(
+                            Pos2::new(
+                                full.right() - close_pad - close_d,
+                                full.top() + close_pad,
+                            ),
+                            Vec2::splat(close_d),
+                        );
+                        let title_rect = egui::Rect::from_min_max(
+                            Pos2::new(full.left() + 8.0, full.top() + close_pad),
+                            Pos2::new(close_rect.left() - 4.0, close_rect.bottom()),
+                        );
+                        let close_resp = ui.allocate_rect(close_rect, Sense::click());
+                        let cr = close_d * 0.5;
+                        ui.painter().rect_filled(close_rect, cr, rim);
+                        ui.painter().text(
+                            close_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "×",
+                            FontId::monospace(12.0),
+                            p.term_bg,
+                        );
+                        if close_resp.clicked() {
+                            close_view = true;
+                        }
+                        close_resp.on_hover_cursor(CursorIcon::PointingHand);
+
+                        let stem = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path.as_str());
+                        ui.scope_builder(
+                            egui::UiBuilder::new().max_rect(title_rect),
+                            |ui| {
+                                ui.set_width(title_rect.width());
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(stem)
+                                                .family(FontFamily::Monospace)
+                                                .size(11.0)
+                                                .color(p.text),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            },
+                        );
+
+                        let img_top = title_rect.bottom() + title_to_img_gap;
+                        let avail = Vec2::new(
+                            full.width(),
+                            (full.bottom() - img_top).max(1.0),
+                        )
+                        .max(Vec2::splat(1.0));
+                        let fit = (avail.x / display_sz.x)
+                            .min(avail.y / display_sz.y)
+                            .min(1.0)
+                            .max(0.0);
+                        let img_wh = (display_sz * fit).max(Vec2::splat(1.0));
+                        let img_rect = egui::Rect::from_center_size(
+                            Pos2::new(full.center().x, img_top + img_wh.y * 0.5),
+                            img_wh,
+                        );
+                        let st = egui::load::SizedTexture::new(tex.id(), tex_sz);
+                        egui::widgets::paint_texture_at(
+                            ui.painter(),
+                            img_rect,
+                            &egui::widgets::ImageOptions::default(),
+                            &st,
+                        );
+                    });
+            });
+
+        if close_view {
+            self.image_gallery_view = None;
+        }
+    }
+
     fn drain_terminals(&mut self) {
         for runtime in &mut self.workspace_runtime {
             for pane in &mut runtime.terminals {
@@ -3960,6 +4877,24 @@ impl MultermUi {
         let ws = self
             .selected_workspace
             .min(self.workspaces.len().saturating_sub(1));
+        if self
+            .uploaded_images_no_terminal_hint_until
+            .is_some_and(|until| Instant::now() < until)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.uploaded_images_no_terminal_hint_until = None;
+            return;
+        }
+        if self.workspace_runtime.get(ws).is_some_and(|rt| {
+            rt.show_image_gallery && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        }) {
+            if self.image_gallery_view.is_some() {
+                self.image_gallery_view = None;
+            } else if let Some(rt) = self.workspace_runtime.get_mut(ws) {
+                rt.show_image_gallery = false;
+            }
+            return;
+        }
         let Some(runtime) = self.workspace_runtime.get(ws) else {
             return;
         };
@@ -4100,6 +5035,12 @@ impl MultermUi {
                         #[cfg(target_os = "macos")]
                         {
                             if let Some(img_path) = clipboard::save_clipboard_image() {
+                                if !uploaded_images_contains_same_content(
+                                    &runtime.uploaded_images,
+                                    &img_path,
+                                ) {
+                                    runtime.uploaded_images.push(img_path.clone());
+                                }
                                 runtime.line_editors[active_idx].push_paste(&img_path);
                                 let bytes = clipboard::clipboard_text_to_pty_bytes_with_mode(
                                     &img_path, bracketed,
@@ -4279,6 +5220,12 @@ impl MultermUi {
                             .pick_file()
                         {
                             let path = file.to_string_lossy().into_owned();
+                            if !uploaded_images_contains_same_content(
+                                &runtime.uploaded_images,
+                                &path,
+                            ) {
+                                runtime.uploaded_images.push(path.clone());
+                            }
                             let bracketed =
                                 runtime.terminals[active_idx].session.parser.bracketed_paste();
                             let ed = &mut runtime.line_editors[active_idx];
@@ -4337,6 +5284,12 @@ impl MultermUi {
                             #[cfg(target_os = "macos")]
                             {
                                 if let Some(img_path) = clipboard::save_clipboard_image() {
+                                    if !uploaded_images_contains_same_content(
+                                        &runtime.uploaded_images,
+                                        &img_path,
+                                    ) {
+                                        runtime.uploaded_images.push(img_path.clone());
+                                    }
                                     let bracketed = runtime.terminals[active_idx]
                                         .session
                                         .parser
@@ -4515,9 +5468,8 @@ impl MultermUi {
             let pane = &mut runtime.terminals[pane_idx];
             resize_terminal_for_size(pane, terminal_size);
             let grid = pane.session.parser.grid();
-            let show_caret = pane.session.parser.cursor_visible()
-                || pane.session.parser.app_cursor_keys()
-                || grid.in_alt;
+            let synthetic_cursor_overlay =
+                use_synthetic_cursor_overlay(&pane.session.parser, grid);
             let selection = &mut runtime.selections[pane_idx];
             ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                 render_terminal_grid(
@@ -4527,7 +5479,7 @@ impl MultermUi {
                     p,
                     selection,
                     true,
-                    show_caret,
+                    synthetic_cursor_overlay,
                     search_highlight,
                     &mut pane.last_autoscroll_caret_v,
                 )
@@ -5530,6 +6482,17 @@ fn next_char_start_after_end_col_v(
 }
 
 /// Virtual row (`0..total_rows`) for combined scrollback + live buffer.
+/// Draw Multerm's VT-cursor follower (baked block + white overlay).
+///
+/// On the **alternate screen**, many TUIs hide the DEC cursor (`ESC [ ? 25 l`) and paint
+/// the caret in-grid (reverse video). The PTY cursor is then often left on a junk row
+/// (e.g. bottom), so following it misaligns with the real input. In that case we only
+/// render the grid and rely on the app's in-buffer caret.
+#[inline]
+fn use_synthetic_cursor_overlay(parser: &TerminalParser, grid: &TerminalGrid) -> bool {
+    !grid.in_alt || parser.cursor_visible() || parser.app_cursor_keys()
+}
+
 fn terminal_word_selection_span_v(
     grid: &TerminalGrid,
     vrow: usize,
@@ -5565,7 +6528,7 @@ fn render_terminal_grid(
     p: UiPalette,
     selection: &mut Option<SelectionRange>,
     is_focused_terminal: bool,
-    _show_caret: bool,
+    synthetic_cursor_overlay: bool,
     search_highlight: Option<SelectionRange>,
     caret_autoscroll: &mut Option<(usize, usize)>,
 ) -> Option<(usize, usize)> {
@@ -5586,9 +6549,11 @@ fn render_terminal_grid(
     let blink_visible = ui
         .ctx()
         .input(|i| ((i.time / 0.5).floor() as i64).rem_euclid(2) == 0);
-    // Some apps (including Claude Code) can report cursor visibility in ways
-    // that don't map cleanly to VT cursor state, so keep blink tied to focus.
-    let show_block_cursor = is_focused_terminal && blink_visible;
+    // Blink is tied to focus; whether we draw a VT-cursor follower at all is gated
+    // separately (`synthetic_cursor_overlay`) so alternate-screen TUIs that hide the
+    // DEC cursor and paint the caret in-grid are not overlaid at a stale PTY position.
+    let show_block_cursor =
+        is_focused_terminal && blink_visible && synthetic_cursor_overlay;
     let cursor_row = grid.cursor.row.min(grid.rows.saturating_sub(1));
     let cursor_col = grid.cursor.col.min(grid.cols.saturating_sub(1));
     let cursor_row_v = grid.scrollback_len() + cursor_row;
@@ -7269,6 +8234,11 @@ fn save_workspace_state(app: &mut MultermUi) {
                     .workspace_runtime
                     .get(idx)
                     .and_then(|runtime| runtime.equal_size_source_terminal_id),
+                uploaded_images: app
+                    .workspace_runtime
+                    .get(idx)
+                    .map(|runtime| runtime.uploaded_images.clone())
+                    .unwrap_or_default(),
             })
             .collect(),
         next_workspace_index: app.next_workspace_index,
@@ -7433,6 +8403,9 @@ impl MultermUi {
                 .unwrap_or_default(),
             active_terminal: runtime.and_then(|rt| rt.active_terminal),
             equal_size_source_terminal_id: runtime.and_then(|rt| rt.equal_size_source_terminal_id),
+            uploaded_images: runtime
+                .map(|rt| rt.uploaded_images.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -7490,6 +8463,7 @@ impl MultermUi {
             }
         });
         runtime.equal_size_source_terminal_id = state.equal_size_source_terminal_id;
+        runtime.uploaded_images = state.uploaded_images.clone();
         Self::sync_workspace_runtime_buffers(&mut runtime);
         runtime
     }
@@ -8579,4 +9553,52 @@ fn parse_hex_color(input: &str) -> Option<Color32> {
 
 fn color_to_hex_string(color: Color32) -> String {
     format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
+}
+
+/// Load an image file as an egui texture, downscaling to `max_dim` pixels on the longest side.
+fn load_image_thumbnail(
+    path: &str,
+    ctx: &egui::Context,
+    max_dim: u32,
+    texture_key: &str,
+) -> Option<egui::TextureHandle> {
+    let dyn_img = image::ImageReader::open(path).ok()?.decode().ok()?;
+    let rgba_image = dyn_img.to_rgba8();
+    let (w0, h0) = rgba_image.dimensions();
+    let w = w0 as usize;
+    let h = h0 as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let rgba = rgba_image.as_raw();
+
+    // Nearest-neighbour downscale if larger than max_dim.
+    let scale = (max_dim as f32 / w.max(h) as f32).min(1.0);
+    let (tw, th) = (
+        ((w as f32 * scale) as usize).max(1),
+        ((h as f32 * scale) as usize).max(1),
+    );
+
+    let scaled: Vec<u8> = if scale < 1.0 {
+        let inv = 1.0 / scale;
+        let mut out = Vec::with_capacity(tw * th * 4);
+        for ty in 0..th {
+            for tx in 0..tw {
+                let sx = ((tx as f32 * inv) as usize).min(w - 1);
+                let sy = ((ty as f32 * inv) as usize).min(h - 1);
+                let base = (sy * w + sx) * 4;
+                out.extend_from_slice(&rgba[base..base + 4]);
+            }
+        }
+        out
+    } else {
+        rgba.to_vec()
+    };
+
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([tw, th], &scaled);
+    Some(ctx.load_texture(
+        format!("gallery_{texture_key}:{path}"),
+        color_image,
+        egui::TextureOptions::default(),
+    ))
 }
