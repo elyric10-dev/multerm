@@ -117,6 +117,9 @@ const MAX_PANEL_GRID_ROWS: u8 = 8;
 
 const LINE_EDITOR_MAX_HISTORY: usize = 100;
 const WORKSPACE_EDIT_HISTORY_MAX: usize = 64;
+const WORKSPACE_HISTORY_PANEL_MAX_ITEMS: usize = 8;
+const WORKSPACE_HISTORY_PANEL_HOLD: Duration = Duration::from_secs(10);
+const WORKSPACE_HISTORY_PANEL_FADE: Duration = Duration::from_millis(900);
 
 /// A single snapshot of the line buffer: text content + cursor position.
 #[derive(Clone)]
@@ -1173,6 +1176,8 @@ struct MultermUi {
     image_gallery_view: Option<(String, egui::TextureHandle)>,
     /// Ephemeral “focus a terminal first” bubble above the footer Uploaded Images control.
     uploaded_images_no_terminal_hint_until: Option<Instant>,
+    /// Transient Photoshop-like feed that shows recent undo/redo hits.
+    workspace_history_overlay_entries: Vec<WorkspaceHistoryOverlayEntry>,
 }
 
 struct WorkspaceRuntime {
@@ -1280,6 +1285,20 @@ struct WorkspaceEditHistory {
     current: Option<WorkspaceTabState>,
 }
 
+#[derive(Clone, Copy)]
+enum WorkspaceHistoryOverlayAction {
+    Undo,
+    Redo,
+}
+
+#[derive(Clone)]
+struct WorkspaceHistoryOverlayEntry {
+    label: String,
+    prev_label: Option<String>,
+    next_label: Option<String>,
+    at: Instant,
+}
+
 impl Default for WorkspaceEditHistory {
     fn default() -> Self {
         Self {
@@ -1375,6 +1394,7 @@ impl Default for MultermUi {
                 image_gallery_textures: std::collections::HashMap::new(),
                 image_gallery_view: None,
                 uploaded_images_no_terminal_hint_until: None,
+                workspace_history_overlay_entries: Vec::new(),
             };
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
@@ -1520,6 +1540,7 @@ impl Default for MultermUi {
             image_gallery_textures: std::collections::HashMap::new(),
             image_gallery_view: None,
             uploaded_images_no_terminal_hint_until: None,
+            workspace_history_overlay_entries: Vec::new(),
         }
     }
 }
@@ -1827,6 +1848,7 @@ impl eframe::App for MultermUi {
         self.drain_terminals();
         self.tick_workspace_terminal_spawn_notice();
         self.tick_uploaded_images_no_terminal_hint();
+        self.tick_workspace_history_overlay();
         self.handle_keyboard_input(ctx);
         self.render_image_gallery(ctx, p);
         self.color_picker_rendered_this_frame = false;
@@ -3767,6 +3789,7 @@ impl eframe::App for MultermUi {
             self.workspace_autosave_deadline = now + WORKSPACE_AUTOSAVE_INTERVAL;
         }
 
+        self.render_workspace_history_overlay(ctx, p);
         self.draw_equal_size_picker(ctx, p);
         self.cleanup_stale_color_picker();
     }
@@ -4113,6 +4136,133 @@ impl MultermUi {
         }
     }
 
+    fn tick_workspace_history_overlay(&mut self) {
+        let ttl = WORKSPACE_HISTORY_PANEL_HOLD + WORKSPACE_HISTORY_PANEL_FADE;
+        self.workspace_history_overlay_entries
+            .retain(|entry| entry.at.elapsed() <= ttl);
+    }
+
+    fn push_workspace_history_overlay_entry(
+        &mut self,
+        action: WorkspaceHistoryOverlayAction,
+        detail: impl Into<String>,
+    ) {
+        let ws = self
+            .selected_workspace
+            .min(self.workspaces.len().saturating_sub(1));
+        let workspace_name = self
+            .workspaces
+            .get(ws)
+            .map(|w| w.title.as_str())
+            .unwrap_or("Workspace");
+        let prefix = match action {
+            WorkspaceHistoryOverlayAction::Undo => "Undo",
+            WorkspaceHistoryOverlayAction::Redo => "Redo",
+        };
+        let detail = detail.into();
+        let (prev_label, next_label) = self.workspace_history_neighbor_labels(ws);
+        self.workspace_history_overlay_entries
+            .push(WorkspaceHistoryOverlayEntry {
+                label: format!("{prefix}: {detail} ({workspace_name})"),
+                prev_label,
+                next_label,
+                at: Instant::now(),
+            });
+        if self.workspace_history_overlay_entries.len() > WORKSPACE_HISTORY_PANEL_MAX_ITEMS {
+            let overflow =
+                self.workspace_history_overlay_entries.len() - WORKSPACE_HISTORY_PANEL_MAX_ITEMS;
+            self.workspace_history_overlay_entries.drain(0..overflow);
+        }
+    }
+
+    fn render_workspace_history_overlay(&self, ctx: &egui::Context, p: UiPalette) {
+        let Some(last_at) = self.workspace_history_overlay_entries.last().map(|e| e.at) else {
+            return;
+        };
+        let age = last_at.elapsed();
+        let panel_alpha = if age <= WORKSPACE_HISTORY_PANEL_HOLD {
+            1.0
+        } else {
+            let fade_t = ((age - WORKSPACE_HISTORY_PANEL_HOLD).as_secs_f32()
+                / WORKSPACE_HISTORY_PANEL_FADE.as_secs_f32())
+            .clamp(0.0, 1.0);
+            1.0 - fade_t
+        };
+        if panel_alpha <= 0.0 {
+            return;
+        }
+
+        let alpha_color = |c: Color32, factor: f32| {
+            Color32::from_rgba_unmultiplied(
+                c.r(),
+                c.g(),
+                c.b(),
+                (255.0 * panel_alpha * factor).clamp(0.0, 255.0) as u8,
+            )
+        };
+
+        egui::Area::new(egui::Id::new("workspace_history_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_TOP, egui::vec2(-12.0, 104.0))
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(alpha_color(p.popover_fill, 0.96))
+                    .stroke(Stroke::new(1.0, alpha_color(p.border, 0.95)))
+                    .corner_radius(6.0)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        ui.label(
+                            RichText::new("History")
+                                .size(11.0)
+                                .family(FontFamily::Monospace)
+                                .color(alpha_color(p.muted, 0.95)),
+                        );
+                        ui.add_space(2.0);
+                        if let Some(entry) = self.workspace_history_overlay_entries.last() {
+                            let item_age = entry.at.elapsed().as_secs_f32();
+                            let item_fade = (1.0
+                                - item_age
+                                    / (WORKSPACE_HISTORY_PANEL_HOLD + WORKSPACE_HISTORY_PANEL_FADE)
+                                        .as_secs_f32())
+                            .clamp(0.35, 1.0);
+                            let prev = entry.prev_label.as_deref().unwrap_or("—");
+                            let next = entry.next_label.as_deref().unwrap_or("—");
+                            ui.label(
+                                RichText::new("Previous:")
+                                    .size(11.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(alpha_color(p.muted, item_fade * 0.95)),
+                            );
+                            ui.label(
+                                RichText::new(prev)
+                                    .size(12.0)
+                                    .color(alpha_color(p.text, item_fade)),
+                            );
+                            ui.add_space(1.0);
+                            ui.label(
+                                RichText::new(&entry.label)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(alpha_color(p.text, item_fade)),
+                            );
+                            ui.add_space(1.0);
+                            ui.label(
+                                RichText::new("Next:")
+                                    .size(11.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(alpha_color(p.muted, item_fade * 0.95)),
+                            );
+                            ui.label(
+                                RichText::new(next)
+                                    .size(12.0)
+                                    .color(alpha_color(p.text, item_fade)),
+                            );
+                        }
+                    });
+            });
+    }
+
     /// Small popover above the footer “Uploaded Images” control (not a full-window modal).
     fn render_uploaded_images_no_terminal_hint(
         &self,
@@ -4196,7 +4346,7 @@ impl MultermUi {
             return;
         }
 
-        let images: Vec<String> = runtime.uploaded_images.clone();
+        let images: Vec<String> = runtime.uploaded_images.iter().rev().cloned().collect();
         let active_idx = runtime.active_terminal;
 
         // Lazily load textures for images not yet in the cache.
@@ -8424,12 +8574,27 @@ impl MultermUi {
         }
     }
 
-    fn runtime_from_workspace_state(
+    /// Reconcile an existing workspace runtime against a persisted snapshot in place.
+    ///
+    /// Used for both initial restore and undo/redo. Terminal panes that already exist
+    /// (matched by `id`, falling back to `tmux_session`) are reused and just get their
+    /// title/size/position updated, so undo/redo doesn't tear down live PTYs or do
+    /// a synchronous `connect_daemon()` round trip per pane (which blocked the UI
+    /// thread and showed a spinning cursor while terminals briefly went blank).
+    fn reconcile_workspace_runtime_with_snapshot(
         &mut self,
         workspace_idx: usize,
         state: &WorkspaceTabState,
-    ) -> WorkspaceRuntime {
-        let mut runtime = WorkspaceRuntime::default();
+    ) {
+        while self.workspace_runtime.len() <= workspace_idx {
+            self.workspace_runtime.push(WorkspaceRuntime::default());
+        }
+
+        let mut existing: Vec<TerminalPane> =
+            std::mem::take(&mut self.workspace_runtime[workspace_idx].terminals);
+        let mut new_terminals: Vec<TerminalPane> =
+            Vec::with_capacity(state.terminal_sessions.len());
+
         for pane_state in &state.terminal_sessions {
             let terminal_id = if pane_state.id == 0 {
                 self.next_terminal_id
@@ -8440,21 +8605,43 @@ impl MultermUi {
                 .tmux_session
                 .clone()
                 .unwrap_or_else(|| tmux_session_name(workspace_idx, terminal_id));
-            let mut pane = spawn_terminal_pane(
-                pane_state.title.clone(),
-                terminal_id,
-                state.working_dir.as_deref().unwrap_or(""),
-                &tmux_session,
-            );
-            self.next_terminal_id = self.next_terminal_id.max(terminal_id + 1);
+
+            let match_idx = existing
+                .iter()
+                .position(|p| p.id == terminal_id)
+                .or_else(|| existing.iter().position(|p| p.tmux_session == tmux_session));
+
+            let mut pane = if let Some(i) = match_idx {
+                existing.remove(i)
+            } else {
+                spawn_terminal_pane(
+                    pane_state.title.clone(),
+                    terminal_id,
+                    state.working_dir.as_deref().unwrap_or(""),
+                    &tmux_session,
+                )
+            };
+
+            pane.id = terminal_id;
+            pane.title = pane_state.title.clone();
+            pane.tmux_session = tmux_session;
             pane.desired_size =
                 Vec2::new(pane_state.width.max(220.0), pane_state.height.max(120.0));
             pane.position = match (pane_state.x, pane_state.y) {
                 (Some(x), Some(y)) => Some(Pos2::new(x, y)),
                 _ => None,
             };
-            runtime.terminals.push(pane);
+
+            self.next_terminal_id = self.next_terminal_id.max(terminal_id + 1);
+            new_terminals.push(pane);
         }
+
+        // Any pane left in `existing` is no longer in the snapshot; dropping it
+        // closes its daemon / PTY connection.
+        drop(existing);
+
+        let runtime = &mut self.workspace_runtime[workspace_idx];
+        runtime.terminals = new_terminals;
         runtime.active_terminal = state.active_terminal.and_then(|i| {
             if i < runtime.terminals.len() {
                 Some(i)
@@ -8464,8 +8651,7 @@ impl MultermUi {
         });
         runtime.equal_size_source_terminal_id = state.equal_size_source_terminal_id;
         runtime.uploaded_images = state.uploaded_images.clone();
-        Self::sync_workspace_runtime_buffers(&mut runtime);
-        runtime
+        Self::sync_workspace_runtime_buffers(runtime);
     }
 
     fn capture_workspace_history_snapshot_for_idx(&self, idx: usize) -> Option<WorkspaceTabState> {
@@ -8478,6 +8664,142 @@ impl MultermUi {
 
     fn workspace_tab_state_signature(state: &WorkspaceTabState) -> String {
         serde_json::to_string(state).unwrap_or_default()
+    }
+
+    fn describe_workspace_history_change(
+        from: &WorkspaceTabState,
+        to: &WorkspaceTabState,
+    ) -> String {
+        if from.title != to.title {
+            return "Rename workspace".to_string();
+        }
+        if from.working_dir != to.working_dir {
+            return "Change workspace folder".to_string();
+        }
+        if from.panel_layout.sanitized() != to.panel_layout.sanitized() {
+            return "Change workspace layout".to_string();
+        }
+        if from.sync_terminals_to_columns != to.sync_terminals_to_columns {
+            return "Toggle auto-fit width".to_string();
+        }
+        if from.uniform_equal_terminals != to.uniform_equal_terminals {
+            return "Toggle equal-size terminals".to_string();
+        }
+        if from.color_rgba != to.color_rgba || from.badge != to.badge {
+            return "Change workspace style".to_string();
+        }
+
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut moved = 0usize;
+        let mut resized = 0usize;
+        let mut renamed_terminal = 0usize;
+
+        let pane_key = |pane: &TerminalPaneState| -> String {
+            if pane.id != 0 {
+                format!("id:{}", pane.id)
+            } else if let Some(sess) = &pane.tmux_session {
+                format!("session:{sess}")
+            } else {
+                format!("title:{}", pane.title)
+            }
+        };
+        let near = |a: f32, b: f32| (a - b).abs() <= 0.5;
+        let pos_near = |a: Option<f32>, b: Option<f32>| match (a, b) {
+            (Some(ax), Some(bx)) => near(ax, bx),
+            (None, None) => true,
+            _ => false,
+        };
+
+        for pane in &to.terminal_sessions {
+            if from
+                .terminal_sessions
+                .iter()
+                .any(|old| pane_key(old) == pane_key(pane))
+            {
+                continue;
+            }
+            added += 1;
+        }
+        for pane in &from.terminal_sessions {
+            if to
+                .terminal_sessions
+                .iter()
+                .any(|now| pane_key(now) == pane_key(pane))
+            {
+                continue;
+            }
+            removed += 1;
+        }
+
+        if added > 0 || removed > 0 {
+            return match (added, removed) {
+                (1, 0) => "Add terminal".to_string(),
+                (0, 1) => "Close terminal".to_string(),
+                _ => format!("Change terminals (+{added}/-{removed})"),
+            };
+        }
+
+        for before in &from.terminal_sessions {
+            let key = pane_key(before);
+            let Some(after) = to.terminal_sessions.iter().find(|pane| pane_key(pane) == key) else {
+                continue;
+            };
+            if before.title != after.title {
+                renamed_terminal += 1;
+            }
+            let did_move =
+                !pos_near(before.x, after.x) || !pos_near(before.y, after.y);
+            let did_resize = !near(before.width, after.width) || !near(before.height, after.height);
+            if did_move {
+                moved += 1;
+            }
+            if did_resize {
+                resized += 1;
+            }
+        }
+
+        if renamed_terminal > 0 {
+            return "Rename terminal".to_string();
+        }
+        if moved > 0 && resized > 0 {
+            return "Move/resize terminal".to_string();
+        }
+        if moved > 0 {
+            return "Move terminal".to_string();
+        }
+        if resized > 0 {
+            return "Resize terminal".to_string();
+        }
+        if from.active_terminal != to.active_terminal {
+            return "Change active terminal".to_string();
+        }
+        if from.equal_size_source_terminal_id != to.equal_size_source_terminal_id {
+            return "Change equal-size template".to_string();
+        }
+        if from.uploaded_images.len() != to.uploaded_images.len() {
+            return "Update uploaded images".to_string();
+        }
+
+        "Edit workspace".to_string()
+    }
+
+    fn workspace_history_neighbor_labels(&self, workspace_idx: usize) -> (Option<String>, Option<String>) {
+        let Some(history) = self.workspace_edit_histories.get(workspace_idx) else {
+            return (None, None);
+        };
+        let Some(current) = history.current.as_ref() else {
+            return (None, None);
+        };
+        let prev_label = history
+            .undo_stack
+            .last()
+            .map(|prev| Self::describe_workspace_history_change(prev, current));
+        let next_label = history
+            .redo_stack
+            .last()
+            .map(|next| Self::describe_workspace_history_change(current, next));
+        (prev_label, next_label)
     }
 
     fn sync_all_workspace_history_snapshots(&mut self) {
@@ -8514,12 +8836,8 @@ impl MultermUi {
             return;
         }
         self.workspaces[idx] = Self::workspace_tab_from_state(snapshot);
-        let runtime = self.runtime_from_workspace_state(idx, snapshot);
-        if idx < self.workspace_runtime.len() {
-            self.workspace_runtime[idx] = runtime;
-        } else {
-            self.workspace_runtime.push(runtime);
-        }
+        self.ensure_workspace_runtime_slots();
+        self.reconcile_workspace_runtime_with_snapshot(idx, snapshot);
         self.selected_workspace = idx;
         self.next_workspace_index = compute_next_workspace_index(&self.workspaces);
         self.ensure_workspace_runtime_slots();
@@ -8584,6 +8902,10 @@ impl MultermUi {
         let Some(snapshot) = history.undo_stack.pop() else {
             return false;
         };
+        let detail = current_snapshot
+            .as_ref()
+            .map(|current| Self::describe_workspace_history_change(&snapshot, current))
+            .unwrap_or_else(|| "Edit workspace".to_string());
         if let Some(current) = current_snapshot {
             history.redo_stack.push(current);
         }
@@ -8591,6 +8913,7 @@ impl MultermUi {
         if let Some(h) = self.workspace_edit_histories.get_mut(idx) {
             h.current = Some(snapshot);
         }
+        self.push_workspace_history_overlay_entry(WorkspaceHistoryOverlayAction::Undo, detail);
         self.workspace_history_suspended = true;
         save_workspace_state(self);
         self.workspace_history_suspended = false;
@@ -8609,6 +8932,10 @@ impl MultermUi {
         let Some(snapshot) = history.redo_stack.pop() else {
             return false;
         };
+        let detail = current_snapshot
+            .as_ref()
+            .map(|current| Self::describe_workspace_history_change(current, &snapshot))
+            .unwrap_or_else(|| "Edit workspace".to_string());
         if let Some(current) = current_snapshot {
             history.undo_stack.push(current);
             if history.undo_stack.len() > WORKSPACE_EDIT_HISTORY_MAX {
@@ -8620,6 +8947,7 @@ impl MultermUi {
         if let Some(h) = self.workspace_edit_histories.get_mut(idx) {
             h.current = Some(snapshot);
         }
+        self.push_workspace_history_overlay_entry(WorkspaceHistoryOverlayAction::Redo, detail);
         self.workspace_history_suspended = true;
         save_workspace_state(self);
         self.workspace_history_suspended = false;
