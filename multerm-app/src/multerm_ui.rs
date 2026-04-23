@@ -5043,6 +5043,10 @@ impl MultermUi {
         for runtime in &mut self.workspace_runtime {
             for pane in &mut runtime.terminals {
                 let _ = pane.session.drain_and_parse();
+                // Flush any terminal responses (DA, DSR, etc.) back to the PTY.
+                for response in pane.session.parser.drain_responses() {
+                    let _ = pane.backend.write_all(&response);
+                }
             }
         }
     }
@@ -6773,142 +6777,203 @@ fn render_terminal_grid(
     let cursor_row_v = grid.scrollback_len() + cursor_row;
     let total_rows = grid.total_rows();
 
-    let mut job = LayoutJob::default();
-    for vrow in 0..total_rows {
-        let mut trim_end = row_render_end_virtual(grid, vrow);
-        if show_block_cursor && vrow == cursor_row_v && cursor_col < grid.cols {
-            trim_end = trim_end.max(cursor_col + 1);
-        }
-        let mut col = 0;
-        while col < trim_end {
-            let cell = grid.virtual_cell(vrow, col);
-            if cell.wide == WideKind::Trailing {
-                col += 1;
-                continue;
-            }
-
-            let base_fmt_start =
-                cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
-            let mut fmt = base_fmt_start.clone();
-            let is_selected =
-                selection.map_or(false, |sel| sel.contains(vrow, col, total_rows, grid.cols));
-            let in_search =
-                search_highlight.is_some_and(|r| r.contains(vrow, col, total_rows, grid.cols));
-            if is_selected {
-                // Invert the displayed fg/bg to highlight selection.
-                let normal_fg = fmt.color;
-                let normal_bg = if fmt.background == Color32::TRANSPARENT {
-                    p.term_bg
-                } else {
-                    fmt.background
-                };
-                fmt.color = normal_bg;
-                fmt.background = normal_fg;
-            } else if in_search {
-                let normal_fg = fmt.color;
-                fmt.background = Color32::from_rgb(210, 165, 45);
-                fmt.color = normal_fg;
-            }
-            if is_focused_terminal
-                && !show_block_cursor
-                && vrow == cursor_row_v
-                && col == cursor_col
-                && cell.attrs.contains(CellAttrs::REVERSE)
-            {
-                let effective_bg = if fmt.background == Color32::TRANSPARENT {
-                    p.term_bg
-                } else {
-                    fmt.background
-                };
-                let effective_fg = fmt.color;
-                fmt.color = effective_bg;
-                fmt.background = effective_fg;
-            }
-            if show_block_cursor && vrow == cursor_row_v && col == cursor_col {
-                let effective_bg = if fmt.background == Color32::TRANSPARENT {
-                    p.term_bg
-                } else {
-                    fmt.background
-                };
-                fmt.background = fmt.color;
-                fmt.color = effective_bg;
-            }
-            let mut chunk = String::new();
-            chunk.push(cell.ch);
-
-            let mut next = col + 1;
-            if cell.wide == WideKind::Leading {
-                next = col + 2;
-            }
-
-            while next < trim_end {
-                if show_block_cursor && vrow == cursor_row_v && next == cursor_col {
-                    break;
-                }
-                let c2 = grid.virtual_cell(vrow, next);
-                if c2.wide == WideKind::Trailing {
-                    next += 1;
-                    continue;
-                }
-                let fmt2_base = cell_text_format(c2, font_id.clone(), p.term_bg, p.vt_default_fg);
-                let is_sel2 =
-                    selection.map_or(false, |sel| sel.contains(vrow, next, total_rows, grid.cols));
-                let in_srch2 =
-                    search_highlight.is_some_and(|r| r.contains(vrow, next, total_rows, grid.cols));
-                if is_selected != is_sel2
-                    || in_search != in_srch2
-                    || !formats_match(&base_fmt_start, &fmt2_base)
-                {
-                    break;
-                }
-                chunk.push(c2.ch);
-                if c2.wide == WideKind::Leading {
-                    next += 2;
-                } else {
-                    next += 1;
-                }
-            }
-
-            job.append(&chunk, 0.0, fmt);
-            col = next;
-        }
-        if vrow + 1 < total_rows {
-            job.append("\n", 0.0, newline_fmt.clone());
-        }
-    }
-
     let mut clicked_cell: Option<(usize, usize)> = None;
+    // Virtualized: only build a `LayoutJob` for rows in the visible scroll window,
+    // while pinning the full scroll extent up-front so resize / undo-redo / auto-fit
+    // / layout never see the content geometry jitter as the visible window shifts.
+    //
+    // We use `show_viewport` (not `show_rows`) so we can explicitly:
+    //   * reserve the total content rect via `ui.set_min_size`,
+    //   * place the LayoutJob label at the correct Y offset for the visible window,
+    //   * keep a single full-extent `ui.interact` rect for click/drag hit-testing
+    //     (so clicking blank rows below the visible text still registers, matching
+    //     the previous behaviour where the Label itself spanned the full grid).
     egui::ScrollArea::both()
         .id_salt(("term-scroll", pane_id))
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // Match [`CELL_H`] / PTY sizing and `TextFormat::line_height` so caret,
-            // search highlights, and hit-testing align with the laid-out galley.
+        .show_viewport(ui, |ui, viewport| {
             let row_h = CELL_H;
             let glyph_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'W')).max(1.0);
-            // `selectable(false)` — otherwise Cmd+A selects the entire label galley (all scrollback).
-            let response = ui
-                .add(
-                    egui::Label::new(job)
-                        .selectable(false)
-                        .sense(Sense::click_and_drag())
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                )
-                .on_hover_cursor(CursorIcon::Text);
+            let content_w = grid.cols as f32 * glyph_w;
+            let content_h = (total_rows as f32 * row_h).max(row_h);
+
+            // Pin the full content extent so the scroll area's total scrollable
+            // region is stable regardless of which rows we actually render.
+            ui.set_min_size(Vec2::new(content_w, content_h));
+
+            // Virtual origin = top-left of virtual content in screen coords.
+            // Shifts with the scroll offset; using it lets us address any vrow
+            // (including ones outside the visible window) in a scroll-stable way.
+            let virtual_origin = ui.max_rect().min;
+
+            // Visible vrow window. +1 padding on `max` to cover a partial row;
+            // clamp to `total_rows` to avoid reading past the grid.
+            let vrow_start = if total_rows == 0 {
+                0
+            } else {
+                ((viewport.min.y / row_h).floor().max(0.0) as usize)
+                    .min(total_rows.saturating_sub(1))
+            };
+            let vrow_end = (((viewport.max.y / row_h).ceil() as usize) + 1).min(total_rows);
+
+            // Full-content hit-test rect (used for clicks/drags over visible text
+            // and the blank space below it). A separate `ui.interact` keeps the
+            // response geometry independent of the Label's intrinsic width, which
+            // would otherwise fluctuate as the visible rows change.
+            let full_rect = egui::Rect::from_min_size(
+                virtual_origin,
+                Vec2::new(content_w.max(viewport.width()), content_h),
+            );
+            let response = ui.interact(
+                full_rect,
+                ui.id().with(("term-grid-sense", pane_id)),
+                Sense::click_and_drag(),
+            );
             if response.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::Text);
             }
 
+            if vrow_end > vrow_start {
+                let mut job = LayoutJob::default();
+                for vrow in vrow_start..vrow_end {
+                    let mut trim_end = row_render_end_virtual(grid, vrow);
+                    if show_block_cursor && vrow == cursor_row_v && cursor_col < grid.cols {
+                        trim_end = trim_end.max(cursor_col + 1);
+                    }
+                    let mut col = 0;
+                    while col < trim_end {
+                        let cell = grid.virtual_cell(vrow, col);
+                        if cell.wide == WideKind::Trailing {
+                            col += 1;
+                            continue;
+                        }
+
+                        let base_fmt_start =
+                            cell_text_format(cell, font_id.clone(), p.term_bg, p.vt_default_fg);
+                        let mut fmt = base_fmt_start.clone();
+                        let is_selected = selection
+                            .map_or(false, |sel| sel.contains(vrow, col, total_rows, grid.cols));
+                        let in_search = search_highlight
+                            .is_some_and(|r| r.contains(vrow, col, total_rows, grid.cols));
+                        if is_selected {
+                            let normal_fg = fmt.color;
+                            let normal_bg = if fmt.background == Color32::TRANSPARENT {
+                                p.term_bg
+                            } else {
+                                fmt.background
+                            };
+                            fmt.color = normal_bg;
+                            fmt.background = normal_fg;
+                        } else if in_search {
+                            let normal_fg = fmt.color;
+                            fmt.background = Color32::from_rgb(210, 165, 45);
+                            fmt.color = normal_fg;
+                        }
+                        if is_focused_terminal
+                            && !show_block_cursor
+                            && vrow == cursor_row_v
+                            && col == cursor_col
+                            && cell.attrs.contains(CellAttrs::REVERSE)
+                        {
+                            let effective_bg = if fmt.background == Color32::TRANSPARENT {
+                                p.term_bg
+                            } else {
+                                fmt.background
+                            };
+                            let effective_fg = fmt.color;
+                            fmt.color = effective_bg;
+                            fmt.background = effective_fg;
+                        }
+                        if show_block_cursor && vrow == cursor_row_v && col == cursor_col {
+                            let effective_bg = if fmt.background == Color32::TRANSPARENT {
+                                p.term_bg
+                            } else {
+                                fmt.background
+                            };
+                            fmt.background = fmt.color;
+                            fmt.color = effective_bg;
+                        }
+                        let mut chunk = String::new();
+                        chunk.push(cell.ch);
+
+                        let mut next = col + 1;
+                        if cell.wide == WideKind::Leading {
+                            next = col + 2;
+                        }
+
+                        while next < trim_end {
+                            if show_block_cursor && vrow == cursor_row_v && next == cursor_col {
+                                break;
+                            }
+                            let c2 = grid.virtual_cell(vrow, next);
+                            if c2.wide == WideKind::Trailing {
+                                next += 1;
+                                continue;
+                            }
+                            let fmt2_base =
+                                cell_text_format(c2, font_id.clone(), p.term_bg, p.vt_default_fg);
+                            let is_sel2 = selection.map_or(false, |sel| {
+                                sel.contains(vrow, next, total_rows, grid.cols)
+                            });
+                            let in_srch2 = search_highlight
+                                .is_some_and(|r| r.contains(vrow, next, total_rows, grid.cols));
+                            if is_selected != is_sel2
+                                || in_search != in_srch2
+                                || !formats_match(&base_fmt_start, &fmt2_base)
+                            {
+                                break;
+                            }
+                            chunk.push(c2.ch);
+                            if c2.wide == WideKind::Leading {
+                                next += 2;
+                            } else {
+                                next += 1;
+                            }
+                        }
+
+                        job.append(&chunk, 0.0, fmt);
+                        col = next;
+                    }
+                    if vrow + 1 < vrow_end {
+                        job.append("\n", 0.0, newline_fmt.clone());
+                    }
+                }
+
+                // Place the Label at the correct Y offset in virtual content space,
+                // so it aligns with the interaction/overlay coordinates below.
+                let label_rect = egui::Rect::from_min_size(
+                    Pos2::new(
+                        virtual_origin.x,
+                        virtual_origin.y + vrow_start as f32 * row_h,
+                    ),
+                    Vec2::new(content_w, (vrow_end - vrow_start) as f32 * row_h),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect), |ui| {
+                    // `selectable(false)` — otherwise Cmd+A would select every section.
+                    ui.add(
+                        egui::Label::new(job)
+                            .selectable(false)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            }
+
+            let virtual_origin_x = virtual_origin.x;
+            let virtual_origin_y = virtual_origin.y;
+
             let pointer_to_cell = |pointer: Pos2| -> (usize, usize) {
-                let local = pointer - response.rect.min;
-                let row = (local.y / row_h)
+                let lx = pointer.x - virtual_origin_x;
+                let ly = pointer.y - virtual_origin_y;
+                let row = (ly / row_h)
                     .floor()
                     .max(0.0)
-                    .min(total_rows.saturating_sub(1) as f32) as usize;
-                let col = (local.x / glyph_w)
+                    .min(total_rows.saturating_sub(1) as f32)
+                    as usize;
+                let col = (lx / glyph_w)
                     .floor()
                     .max(0.0)
-                    .min(grid.cols.saturating_sub(1) as f32) as usize;
+                    .min(grid.cols.saturating_sub(1) as f32)
+                    as usize;
                 (row, col)
             };
 
@@ -6957,21 +7022,25 @@ fn render_terminal_grid(
             if show_block_cursor && total_rows > 0 && grid.cols > 0 {
                 let caret_row_v = cursor_row_v.min(total_rows.saturating_sub(1));
                 let caret_col = cursor_col.min(grid.cols.saturating_sub(1));
-                let caret_x = response.rect.min.x + caret_col as f32 * glyph_w;
-                let caret_y = response.rect.min.y
+                let caret_x = virtual_origin_x + caret_col as f32 * glyph_w;
+                let caret_y = virtual_origin_y
                     + caret_row_v as f32 * row_h
                     + TERMINAL_CELL_OVERLAY_Y_NUDGE;
                 let caret_rect = egui::Rect::from_min_size(
                     Pos2::new(caret_x, caret_y),
                     Vec2::new(glyph_w.clamp(6.0, 12.0), row_h.max(10.0)),
                 );
-                ui.painter().rect_filled(caret_rect, 0.0, Color32::WHITE);
-                ui.painter().rect_stroke(
-                    caret_rect,
-                    0.0,
-                    Stroke::new(1.0, Color32::BLACK),
-                    egui::StrokeKind::Outside,
-                );
+                // Only paint when within the visible window; when off-screen the
+                // caret auto-scroll below will bring it back into view.
+                if caret_row_v >= vrow_start && caret_row_v < vrow_end {
+                    ui.painter().rect_filled(caret_rect, 0.0, Color32::WHITE);
+                    ui.painter().rect_stroke(
+                        caret_rect,
+                        0.0,
+                        Stroke::new(1.0, Color32::BLACK),
+                        egui::StrokeKind::Outside,
+                    );
+                }
                 let caret_key = (caret_row_v, caret_col);
                 if search_highlight.is_none() && (*caret_autoscroll != Some(caret_key)) {
                     ui.scroll_to_rect(caret_rect, Some(egui::Align::Center));
@@ -6982,9 +7051,9 @@ fn render_terminal_grid(
                 let ((sr, sc), _) = range.normalized_start_end();
                 let sr = sr.min(total_rows.saturating_sub(1));
                 let sc = sc.min(grid.cols.saturating_sub(1));
-                let match_x = response.rect.min.x + sc as f32 * glyph_w;
+                let match_x = virtual_origin_x + sc as f32 * glyph_w;
                 let match_y =
-                    response.rect.min.y + sr as f32 * row_h + TERMINAL_CELL_OVERLAY_Y_NUDGE;
+                    virtual_origin_y + sr as f32 * row_h + TERMINAL_CELL_OVERLAY_Y_NUDGE;
                 let match_rect = egui::Rect::from_min_size(
                     Pos2::new(match_x, match_y),
                     Vec2::new(glyph_w.max(8.0), row_h.max(10.0)),

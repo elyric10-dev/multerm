@@ -35,6 +35,9 @@ struct VtePerformer {
 
     // Tab stops (true = stop exists at that column index)
     tab_stops: Vec<bool>,
+
+    // Responses to write back to the PTY (e.g. DA, DSR replies).
+    pub pending_responses: Vec<Vec<u8>>,
 }
 
 impl VtePerformer {
@@ -62,6 +65,7 @@ impl VtePerformer {
             bracketed_paste: false,
             pending_wrap: false,
             tab_stops,
+            pending_responses: Vec::new(),
         }
     }
 
@@ -142,12 +146,29 @@ impl VtePerformer {
     // ── SGR ──────────────────────────────────────────────────────────────────
 
     fn process_sgr(&mut self, params: &Params) {
-        // Flatten params into a Vec<u16> for easy indexed parsing.
-        let flat: Vec<u16> = params.iter().map(|sub| sub[0]).collect();
-        if flat.is_empty() {
+        // Build a flat list of (value, sub_params) so we can handle both the
+        // semicolon form  `38;5;N`  (each param is its own sub-array [N])
+        // and the colon form  `38:5:N`  (one param, sub-array [38,5,N]).
+        // Only `sub[0]` is used for the normal flattened value; the full
+        // sub-array is inspected for extended-color params (38/48).
+        let raw: Vec<&[u16]> = params.iter().collect();
+        if raw.is_empty() {
             self.reset_sgr();
             return;
         }
+
+        // Expand colon-form sub-params into the flat stream so the rest of the
+        // parser sees a uniform semicolon-style sequence.
+        let mut flat: Vec<u16> = Vec::with_capacity(raw.len());
+        for sub in &raw {
+            if sub.len() > 1 {
+                // Colon-separated: `38:5:214` or `38:2:r:g:b` — expand inline.
+                flat.extend_from_slice(sub);
+            } else {
+                flat.push(sub[0]);
+            }
+        }
+
         let mut i = 0usize;
         while i < flat.len() {
             match flat[i] {
@@ -170,10 +191,10 @@ impl VtePerformer {
                 // Foreground: 30-37 ANSI, 39 default
                 n @ 30..=37 => self.fg = Color::Indexed(n as u8 - 30),
                 38 => {
-                    if i + 2 < flat.len() && flat[i + 1] == 5 {
+                    if i + 2 <= flat.len().saturating_sub(1) && flat[i + 1] == 5 {
                         self.fg = Color::Indexed(flat[i + 2] as u8);
                         i += 2;
-                    } else if i + 4 < flat.len() && flat[i + 1] == 2 {
+                    } else if i + 4 <= flat.len().saturating_sub(1) && flat[i + 1] == 2 {
                         self.fg =
                             Color::Rgb(flat[i + 2] as u8, flat[i + 3] as u8, flat[i + 4] as u8);
                         i += 4;
@@ -181,12 +202,12 @@ impl VtePerformer {
                 }
                 39 => self.fg = Color::Default,
                 // Background: 40-47 ANSI, 49 default
-                n @ 40..=47 => self.bg = Color::Indexed(n as u8 - 40 + 8 + 8),
+                n @ 40..=47 => self.bg = Color::Indexed(n as u8 - 40),
                 48 => {
-                    if i + 2 < flat.len() && flat[i + 1] == 5 {
+                    if i + 2 <= flat.len().saturating_sub(1) && flat[i + 1] == 5 {
                         self.bg = Color::Indexed(flat[i + 2] as u8);
                         i += 2;
-                    } else if i + 4 < flat.len() && flat[i + 1] == 2 {
+                    } else if i + 4 <= flat.len().saturating_sub(1) && flat[i + 1] == 2 {
                         self.bg =
                             Color::Rgb(flat[i + 2] as u8, flat[i + 3] as u8, flat[i + 4] as u8);
                         i += 4;
@@ -481,9 +502,37 @@ impl Perform for VtePerformer {
             }
             // SGR
             (false, 'm') => self.process_sgr(params),
-            // Device Status Report — send cursor position
+            // Primary Device Attributes — `CSI c` / `CSI 0 c` (no intermediates).
+            // Respond as a VT220-class terminal with ANSI color support.
+            // Claude Code (2.1+) and other modern TUIs fall back to *no-color*
+            // output if the terminal does not answer this query.
+            (false, 'c') if intermediates.is_empty() && p0 == 0 => {
+                self.pending_responses.push(b"\x1b[?62;22c".to_vec());
+            }
+            // Secondary Device Attributes — `CSI > c` / `CSI > 0 c`.
+            // Identify as xterm (Pp=41 → VT420), firmware 0, keyboard 0.
+            (false, 'c') if intermediates.first() == Some(&b'>') => {
+                self.pending_responses.push(b"\x1b[>41;0;0c".to_vec());
+            }
+            // XTVERSION — `CSI > q` / `CSI > 0 q`. Respond with a DCS-framed
+            // name string: `DCS > | multerm ST`. Many modern CLIs (Claude Code,
+            // kitty-aware tools) use this as the canonical "is this a real,
+            // modern terminal?" probe.
+            (false, 'q') if intermediates.first() == Some(&b'>') => {
+                self.pending_responses
+                    .push(b"\x1bP>|multerm\x1b\\".to_vec());
+            }
+            // Device Status Report
+            (false, 'n') if p0 == 5 => {
+                // DSR status: OK
+                self.pending_responses.push(b"\x1b[0n".to_vec());
+            }
             (false, 'n') if p0 == 6 => {
-                // We can't send a response here without write access; ignore for now.
+                // DSR cursor position report (CPR).
+                let row = self.grid.cursor.row + 1;
+                let col = self.grid.cursor.col + 1;
+                let resp = format!("\x1b[{};{}R", row, col);
+                self.pending_responses.push(resp.into_bytes());
             }
             // ANSI cursor save (same semantics as ESC 7 / DECSC)
             (false, 's') => {
@@ -621,5 +670,11 @@ impl TerminalParser {
 
     pub fn bracketed_paste(&self) -> bool {
         self.performer.bracketed_paste
+    }
+
+    /// Drain any terminal responses that need to be written back to the PTY
+    /// (e.g. replies to DA, DSR queries from the running application).
+    pub fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.performer.pending_responses)
     }
 }

@@ -75,6 +75,10 @@ pub fn spawn_pty(
         cmd.arg(command);
     }
     cmd.env("TERM", "xterm-256color");
+    // Advertise 24-bit color support so Node's `supports-color`, Python's rich,
+    // and other CLIs (e.g. Claude Code) don't fall back to a monochrome path
+    // when they can't infer truecolor from TERM alone.
+    cmd.env("COLORTERM", "truecolor");
     if let Some(dir) = working_dir {
         cmd.cwd(dir);
     }
