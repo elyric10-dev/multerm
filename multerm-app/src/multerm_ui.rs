@@ -985,6 +985,30 @@ fn main() -> eframe::Result<()> {
         )
         .try_init();
 
+    // Kick the daemon off in a background thread immediately so it's up and
+    // accepting connections by the time Default::default() runs during window
+    // creation.  This overlaps daemon startup with GPU/window init instead of
+    // serialising them.
+    if std::env::var("MULTERM_DAEMON_DISABLED").ok().as_deref() != Some("1") {
+        if let Ok(exe) = std::env::current_exe() {
+            // Only spawn if the daemon isn't already running.
+            let already_up = daemon::daemon_port_file_path()
+                .ok()
+                .and_then(|p| fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .and_then(|port| TcpStream::connect(("127.0.0.1", port)).ok())
+                .is_some();
+            if !already_up {
+                let _ = Command::new(exe)
+                    .arg("--daemon")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 860.0])
@@ -1396,6 +1420,10 @@ impl Default for MultermUi {
                 uploaded_images_no_terminal_hint_until: None,
                 workspace_history_overlay_entries: Vec::new(),
             };
+            // Pre-warm the daemon once before the restore loop so each pane's
+            // connect_daemon() call finds it already running instead of blocking
+            // serially on the 100 ms × 30 retry loop per pane.
+            warm_up_daemon();
             // Restore terminal sessions per workspace from persisted metadata.
             for idx in 0..app.workspaces.len() {
                 if let Some(saved_tab) = tab_states.get(idx) {
@@ -5766,6 +5794,42 @@ fn write_frame_tcp(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> st
         stream.write_all(payload)?;
     }
     Ok(())
+}
+
+/// Ensure the daemon is running and reachable before the startup restore loop.
+/// Called once at init so that every subsequent `connect_daemon()` call during
+/// pane restoration finds the daemon already up and connects immediately,
+/// instead of each pane paying the full 100 ms × 30 retry wait independently.
+fn warm_up_daemon() {
+    if std::env::var("MULTERM_DAEMON_DISABLED").ok().as_deref() == Some("1") {
+        return;
+    }
+    // Spawn the daemon if needed, then wait until it's reachable (same budget
+    // as connect_daemon uses).
+    let mut spawned = false;
+    for _attempt in 0..30 {
+        if let Ok(port_file) = daemon::daemon_port_file_path() {
+            if let Ok(port_s) = fs::read_to_string(&port_file) {
+                if let Ok(port) = port_s.trim().parse::<u16>() {
+                    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                        return;
+                    }
+                }
+            }
+        }
+        if !spawned {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = Command::new(exe)
+                    .arg("--daemon")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+            spawned = true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn connect_daemon() -> Option<TcpStream> {

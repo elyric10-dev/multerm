@@ -1,0 +1,2 @@
+# Fast dev builds: cargo +nightly run -p multerm-app --bin multerm-ui
+# Stable builds:   cargo run -p multerm-app --bin multerm-ui  (no cranelift, works as-is)
