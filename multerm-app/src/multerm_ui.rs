@@ -4442,6 +4442,16 @@ impl MultermUi {
                 egui::Frame::default()
                     .fill(panel_bg)
                     .stroke(outer_stroke)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 22,
+                        spread: 0,
+                        color: if cyber_shell {
+                            Color32::from_rgba_unmultiplied(rim.r(), rim.g(), rim.b(), 64)
+                        } else {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 88)
+                        },
+                    })
                     .corner_radius(corner_r)
                     .inner_margin(Margin {
                         left: 14,
@@ -4955,9 +4965,25 @@ impl MultermUi {
                         if cyber_shell { 1.25 } else { 1.5 },
                         rim,
                     ))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 22,
+                        spread: 0,
+                        color: if cyber_shell {
+                            Color32::from_rgba_unmultiplied(rim.r(), rim.g(), rim.b(), 72)
+                        } else {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 96)
+                        },
+                    })
                     .corner_radius(if cyber_shell { 6.0 } else { 8.0 })
                     .inner_margin(Margin::same(frame_pad as i8))
                     .show(ui, |ui| {
+                        // Reserve full body height; image is painted manually and won't
+                        // contribute to egui layout size by itself.
+                        ui.set_min_size(egui::vec2(
+                            (panel_size.x - frame_pad * 2.0).max(1.0),
+                            (panel_size.y - frame_pad * 2.0).max(1.0),
+                        ));
                         let full = ui.max_rect();
                         let close_d = 22.0_f32;
                         let close_pad = 6.0_f32;
