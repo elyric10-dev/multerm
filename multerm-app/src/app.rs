@@ -22,7 +22,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::{clipboard, user_event::UserEvent};
+use crate::{clipboard, icon::load_winit_window_icon, user_event::UserEvent};
 
 const FONT_SIZE: f32 = 15.0;
 const WINDOW_W: f64 = 900.0;
@@ -541,7 +541,8 @@ impl ApplicationHandler<UserEvent> for MultermApp {
         // ── Create window ─────────────────────────────────────────────────────
         let attrs = Window::default_attributes()
             .with_title("Multerm")
-            .with_inner_size(LogicalSize::new(WINDOW_W, WINDOW_H));
+            .with_inner_size(LogicalSize::new(WINDOW_W, WINDOW_H))
+            .with_window_icon(load_winit_window_icon());
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.window = Some(Arc::clone(&window));

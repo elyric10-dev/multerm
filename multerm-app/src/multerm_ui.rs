@@ -30,6 +30,7 @@ use sysinfo::{
 
 mod clipboard;
 mod daemon;
+mod icon;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1009,11 +1010,15 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1440.0, 860.0])
+        .with_min_inner_size([1100.0, 700.0])
+        .with_title("Multerm");
+    if let Some(icon) = icon::load_egui_icon_data() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 860.0])
-            .with_min_inner_size([1100.0, 700.0])
-            .with_title("Multerm"),
+        viewport,
         ..Default::default()
     };
 

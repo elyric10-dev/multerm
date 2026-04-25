@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod daemon;
+mod icon;
 mod user_event;
 
 use app::MultermApp;
