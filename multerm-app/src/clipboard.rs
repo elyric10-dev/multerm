@@ -324,7 +324,6 @@ pub fn sanitize_pasted_terminal_text(s: &str) -> String {
     lines.join("\n")
 }
 
-
 #[allow(dead_code)]
 pub fn clipboard_text_to_pty_bytes(text: &str) -> Vec<u8> {
     clipboard_text_to_pty_bytes_with_mode(text, false)
@@ -427,7 +426,10 @@ pub fn set_clipboard_image_from_path(path: &str) -> Result<(), anyhow::Error> {
 pub fn save_clipboard_image() -> Option<String> {
     fn unique_clipboard_image_path() -> Option<PathBuf> {
         let mut base = std::env::temp_dir();
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis();
         base.push(format!("multerm_paste_{}_{}.png", std::process::id(), ts));
         Some(base)
     }
@@ -467,8 +469,7 @@ pub fn save_clipboard_image() -> Option<String> {
         "set f to open for access POSIX file \"{path}\" with write permission\n\
          set eof f to 0\n\
          write (the clipboard as «class PNGf») to f\n\
-         close access f"
-        ,
+         close access f",
         path = path_str
     );
     let ok = std::process::Command::new("/usr/bin/osascript")
