@@ -49,6 +49,24 @@ enum UiStyle {
     Glass,
 }
 
+/// Where the workspace switcher lives — either the horizontal tab strip on top
+/// (default) or a vertical sidebar on the left.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum WorkspacePlacement {
+    #[default]
+    Tabbed,
+    Sidebar,
+}
+
+const WORKSPACE_SIDEBAR_MIN_WIDTH: f32 = 150.0;
+const WORKSPACE_SIDEBAR_MAX_WIDTH: f32 = 480.0;
+const WORKSPACE_SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
+
+fn default_sidebar_width() -> f32 {
+    WORKSPACE_SIDEBAR_DEFAULT_WIDTH
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1366,6 +1384,16 @@ struct MultermUi {
     uploaded_images_no_terminal_hint_until: Option<Instant>,
     /// Transient Photoshop-like feed that shows recent undo/redo hits.
     workspace_history_overlay_entries: Vec<WorkspaceHistoryOverlayEntry>,
+    /// Where the workspace switcher lives (top tab strip vs. left sidebar).
+    workspace_placement: WorkspacePlacement,
+    /// In sidebar mode, whether the sidebar is currently expanded.
+    workspace_sidebar_visible: bool,
+    /// Persisted sidebar width (clamped to [`WORKSPACE_SIDEBAR_MIN_WIDTH`,
+    /// `WORKSPACE_SIDEBAR_MAX_WIDTH`]). Updated each frame from the actual
+    /// rendered SidePanel width so user resizes survive restart.
+    workspace_sidebar_width: f32,
+    /// Sidebar search input (currently visual only — does not filter the list).
+    workspace_sidebar_search: String,
 }
 
 struct WorkspaceRuntime {
@@ -1440,6 +1468,12 @@ struct WorkspaceState {
     cyberpunk_settings: CyberpunkSettings,
     #[serde(default)]
     performance_mode: bool,
+    #[serde(default)]
+    workspace_placement: WorkspacePlacement,
+    #[serde(default = "default_true")]
+    workspace_sidebar_visible: bool,
+    #[serde(default = "default_sidebar_width")]
+    workspace_sidebar_width: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1591,6 +1625,12 @@ impl Default for MultermUi {
                 image_gallery_last_clicked: None,
                 uploaded_images_no_terminal_hint_until: None,
                 workspace_history_overlay_entries: Vec::new(),
+                workspace_placement: state.workspace_placement,
+                workspace_sidebar_visible: state.workspace_sidebar_visible,
+                workspace_sidebar_width: state
+                    .workspace_sidebar_width
+                    .clamp(WORKSPACE_SIDEBAR_MIN_WIDTH, WORKSPACE_SIDEBAR_MAX_WIDTH),
+                workspace_sidebar_search: String::new(),
             };
             // Pre-warm the daemon once before the restore loop so each pane's
             // connect_daemon() call finds it already running instead of blocking
@@ -1750,6 +1790,10 @@ impl Default for MultermUi {
             image_gallery_last_clicked: None,
             uploaded_images_no_terminal_hint_until: None,
             workspace_history_overlay_entries: Vec::new(),
+            workspace_placement: WorkspacePlacement::default(),
+            workspace_sidebar_visible: true,
+            workspace_sidebar_width: WORKSPACE_SIDEBAR_DEFAULT_WIDTH,
+            workspace_sidebar_search: String::new(),
         }
     }
 }
@@ -2192,6 +2236,14 @@ impl eframe::App for MultermUi {
                     });
                 });
             });
+
+        // Sidebar workspace switcher (Sidebar mode only). Visibility is
+        // animated inside `render_workspace_sidebar` via `show_animated`, so
+        // we always call it while in Sidebar mode — even mid-hide, so the
+        // collapse animation runs to completion.
+        if self.workspace_placement == WorkspacePlacement::Sidebar {
+            render_workspace_sidebar(ctx, self, p);
+        }
 
         if !self.usage_panel_open_order.is_empty() {
             const USAGE_PANEL_STEP: f32 = 118.0;
@@ -7806,6 +7858,10 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     let mut changed = false;
     let mut close_idx: Option<usize> = None;
 
+    // In sidebar mode the workspace switcher lives in the left side panel, so
+    // the horizontal tab strip in this header is suppressed. The +/undo/redo/⚙
+    // cluster on the right keeps rendering.
+    let sidebar_mode = app.workspace_placement == WorkspacePlacement::Sidebar;
     let n_tabs = app.workspaces.len();
     let tab_h = 36.0_f32;
     let inner_x = 6.0_f32;
@@ -7815,7 +7871,11 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 
     // Keep workspace tabs at a fixed width so labels don't resize the strip.
     let tab_widths: Vec<f32> = (0..n_tabs).map(|_| fixed_tab_width).collect();
-    let total_tab_w: f32 = tab_widths.iter().sum();
+    let total_tab_w: f32 = if sidebar_mode {
+        0.0
+    } else {
+        tab_widths.iter().sum()
+    };
 
     // Determine where each tab wants to be in the "after-drop" layout so that
     // non-dragged tabs can smoothly slide to make room.
@@ -7852,6 +7912,32 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
         .collect();
 
     ui.horizontal(|ui| {
+        if sidebar_mode {
+            // Sidebar-mode header: show / hide toggle on the far left so it
+            // remains reachable even when the sidebar is collapsed.
+            let label = if app.workspace_sidebar_visible {
+                "Hide sidebar"
+            } else {
+                "Show sidebar"
+            };
+            let toggle = egui::Button::new(
+                RichText::new("\u{25E7}")
+                    .size(14.0)
+                    .family(FontFamily::Monospace)
+                    .color(p.muted),
+            )
+            .fill(p.tab_inactive_bg)
+            .stroke(Stroke::new(1.0, p.border))
+            .min_size(Vec2::new(28.0, 28.0))
+            .corner_radius(3.0);
+            if ui.add(toggle).on_hover_text(label).clicked() {
+                app.workspace_sidebar_visible = !app.workspace_sidebar_visible;
+                changed = true;
+            }
+            // Vertical filler so the toggle row still occupies the same height
+            // as a tab strip — keeps the directory bar below from shifting.
+            let _ = ui.allocate_exact_size(Vec2::new(0.0, tab_h), Sense::hover());
+        } else {
         // Reserve the full tab strip as one block so the + / ⚙ buttons stay to the right.
         let (strip, _) = ui.allocate_exact_size(Vec2::new(total_tab_w, tab_h), Sense::hover());
         let rx = strip.min.x;
@@ -7864,7 +7950,13 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
             let fill = app.workspace_tab_fill_color(idx, active, p);
             let title = app.workspaces[idx].title.clone();
             let display_title = truncate_with_ellipsis(&title, max_tab_label_chars);
-            let badge = app.workspaces[idx].badge;
+            // Live terminal count for this workspace, shown next to the close
+            // button. Hidden at zero so empty workspaces stay uncluttered.
+            let badge = app
+                .workspace_runtime
+                .get(idx)
+                .map(|rt| rt.terminals.len())
+                .filter(|&n| n > 0);
             let tc = if active
                 && app.workspaces[idx].color_rgba.is_none()
                 && app.color_picker_target_idx != Some(idx)
@@ -8182,51 +8274,25 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
                 Stroke::new(2.5, p.tab_active_bg),
             );
         }
+        } // !sidebar_mode
 
-        // "+" new workspace button.
-        let plus_btn = egui::Button::new(
-            RichText::new("+")
-                .size(14.0)
-                .family(FontFamily::Monospace)
-                .color(p.muted),
-        )
-        .fill(p.tab_inactive_bg)
-        .stroke(Stroke::new(1.0, p.border))
-        .min_size(Vec2::new(26.0, 28.0))
-        .corner_radius(3.0);
-        if ui.add(plus_btn).on_hover_text("New workspace").clicked() {
-            let title = format!("Workspace {}", app.next_workspace_index);
-            let inherit_dir = app
-                .workspaces
-                .get(app.selected_workspace)
-                .map(|w| w.working_dir.clone())
-                .unwrap_or_else(default_working_dir);
-            let inherit_layout = app
-                .workspaces
-                .get(app.selected_workspace)
-                .map(|w| w.panel_layout)
-                .unwrap_or_default();
-            app.next_workspace_index += 1;
-            app.workspaces.push(WorkspaceTab {
-                title,
-                badge: None,
-                color_rgba: None,
-                working_dir: inherit_dir,
-                panel_layout: inherit_layout,
-                sync_terminals_to_columns: app
-                    .workspaces
-                    .get(app.selected_workspace)
-                    .map(|w| w.sync_terminals_to_columns)
-                    .unwrap_or(false),
-                uniform_equal_terminals: app
-                    .workspaces
-                    .get(app.selected_workspace)
-                    .map(|w| w.uniform_equal_terminals)
-                    .unwrap_or(false),
-            });
-            app.workspace_runtime.push(WorkspaceRuntime::default());
-            app.selected_workspace = app.workspaces.len() - 1;
-            changed = true;
+        // "+" new workspace button — only rendered in tabbed mode. In sidebar
+        // mode the sidebar's own header "+" creates new workspaces.
+        if !sidebar_mode {
+            let plus_btn = egui::Button::new(
+                RichText::new("+")
+                    .size(14.0)
+                    .family(FontFamily::Monospace)
+                    .color(p.muted),
+            )
+            .fill(p.tab_inactive_bg)
+            .stroke(Stroke::new(1.0, p.border))
+            .min_size(Vec2::new(26.0, 28.0))
+            .corner_radius(3.0);
+            if ui.add(plus_btn).on_hover_text("New workspace").clicked() {
+                app.add_workspace_inherit_selected();
+                changed = true;
+            }
         }
 
         // Keep undo/redo/settings grouped at the right side of the header.
@@ -8295,6 +8361,445 @@ fn header_tabs(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
     }
 }
 
+/// Replace the user's home directory prefix with `~` for compact display in
+/// sidebar rows. Returns the original string unchanged when no match.
+fn shorten_home_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().to_string();
+        if !home.is_empty() {
+            if path == home {
+                return "~".to_string();
+            }
+            if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+                return format!("~/{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Renders a single sidebar row representing one workspace tab.
+fn workspace_sidebar_row(
+    ui: &mut egui::Ui,
+    app: &mut MultermUi,
+    idx: usize,
+    p: UiPalette,
+    changed: &mut bool,
+    close_idx: &mut Option<usize>,
+) {
+    let active = idx == app.selected_workspace;
+    let tab = &app.workspaces[idx];
+    let title = tab.title.clone();
+    let cwd_display = shorten_home_path(&tab.working_dir);
+    let row_h = 52.0_f32;
+    let icon_diameter = 28.0_f32;
+    let inner_pad = 10.0_f32;
+    let close_w = 18.0_f32;
+
+    // Match tabbed-mode coloring: workspace color shows only when the row is
+    // focused (active). Inactive rows use the neutral inactive fill regardless
+    // of any custom workspace color.
+    let bg = app.workspace_tab_fill_color(idx, active, p);
+
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
+
+    let painter = ui.painter().clone();
+
+    // Theme accent: cyberpunk uses its terminal-glow cyan; dark/light use the
+    // tab-active-indicator (amber / terracotta). Falls back to the panel border
+    // color if a theme defines neither.
+    let cyber_glow = p.terminal_glow;
+    let accent = cyber_glow
+        .or(p.tab_active_indicator)
+        .unwrap_or(p.border);
+
+    // Cyberpunk: soft cyan halo behind the active row. Dark/Light skip the halo
+    // (it would look out of place outside the neon aesthetic).
+    if let Some(glow) = cyber_glow {
+        if active {
+            for (expand, alpha) in [(8.0_f32, 22u8), (4.0_f32, 50u8)] {
+                painter.rect_filled(
+                    rect.expand(expand),
+                    8.0 + expand,
+                    Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), alpha),
+                );
+            }
+        }
+    }
+
+    // Row outline: brighter when active, faint on hover, none otherwise.
+    // Cyberpunk uses a stronger active outline because the halo demands it;
+    // the dark/light themes use the same accent at a softer weight.
+    let row_stroke = if active {
+        let alpha = if cyber_glow.is_some() { 200 } else { 150 };
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha),
+        )
+    } else if response.hovered() {
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70),
+        )
+    } else {
+        Stroke::NONE
+    };
+    painter.rect(rect, 6.0, bg, row_stroke, egui::StrokeKind::Inside);
+
+    // Active-row left-edge accent bar — anchors the selection visually. Skipped
+    // for cyberpunk because the outer halo already saturates that role.
+    if active && cyber_glow.is_none() {
+        let bar_w = 3.0_f32;
+        let bar_inset = 4.0_f32;
+        let bar_rect = egui::Rect::from_min_max(
+            Pos2::new(rect.min.x + 2.0, rect.min.y + bar_inset),
+            Pos2::new(rect.min.x + 2.0 + bar_w, rect.max.y - bar_inset),
+        );
+        painter.rect_filled(bar_rect, 1.5, accent);
+    }
+
+    // Round icon on the left containing the generic terminal glyph. Disc fill
+    // is tinted with the theme accent so the same code reads correctly on both
+    // dark and light backgrounds. Cyberpunk gets a brighter ring; dark/light
+    // get a subtler one.
+    let icon_center = Pos2::new(rect.min.x + inner_pad + icon_diameter * 0.5, rect.center().y);
+    let icon_rect = egui::Rect::from_center_size(icon_center, Vec2::splat(icon_diameter));
+    let icon_fill_alpha = if active { 60 } else { 30 };
+    let icon_ring_alpha = match (cyber_glow.is_some(), active) {
+        (true, true) => 210,
+        (true, false) => 130,
+        (false, true) => 170,
+        (false, false) => 90,
+    };
+    painter.circle_filled(
+        icon_center,
+        icon_diameter * 0.5,
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), icon_fill_alpha),
+    );
+    painter.circle_stroke(
+        icon_center,
+        icon_diameter * 0.5 - 0.5,
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), icon_ring_alpha),
+        ),
+    );
+    let fg = if active { p.tab_label_active } else { p.text };
+    // Glyph color: cyberpunk wants the cyan accent; dark/light want plain
+    // foreground so the icon doesn't muddy against tinted backgrounds.
+    let icon_fg = if cyber_glow.is_some() { accent } else { fg };
+    // The sidebar represents terminal workspaces, so always paint the generic
+    // terminal glyph here regardless of which agent kind is currently focused.
+    paint_terminal_agent_icon(&painter, icon_rect.shrink(4.0), TerminalAgentKind::Terminal, icon_fg);
+
+    // Close button rect — right-aligned. The row click handler ignores clicks
+    // that land inside this rect so removing a workspace doesn't also select
+    // it on the way down.
+    let close_rect = egui::Rect::from_min_size(
+        Pos2::new(rect.max.x - inner_pad - close_w, rect.center().y - close_w * 0.5),
+        Vec2::splat(close_w),
+    );
+    // Live terminal count for this workspace — drawn just left of the close
+    // button. Skipped at zero so the row stays clean for fresh workspaces.
+    let terminal_count = app
+        .workspace_runtime
+        .get(idx)
+        .map(|rt| rt.terminals.len())
+        .filter(|&n| n > 0);
+
+    // Title + cwd path stacked to the right of the icon. Right edge stops
+    // before the count badge / close button so long titles don't run under
+    // them.
+    let text_x = rect.min.x + inner_pad + icon_diameter + 10.0;
+    let count_reservation = if terminal_count.is_some() { 22.0 } else { 0.0 };
+    let text_right_limit = close_rect.min.x - 6.0 - count_reservation;
+    let title_galley = painter.layout_no_wrap(title.clone(), FontId::proportional(13.0), fg);
+    let title_pos = Pos2::new(text_x, rect.center().y - 8.0 - title_galley.size().y * 0.5);
+    let title_clip = egui::Rect::from_min_max(
+        Pos2::new(text_x, rect.min.y),
+        Pos2::new(text_right_limit, rect.max.y),
+    );
+    painter
+        .with_clip_rect(title_clip)
+        .galley(title_pos, title_galley, fg);
+    let cwd_galley = painter.layout_no_wrap(cwd_display, FontId::monospace(11.0), p.muted);
+    let cwd_pos = Pos2::new(text_x, rect.center().y + 9.0 - cwd_galley.size().y * 0.5);
+    painter
+        .with_clip_rect(title_clip)
+        .galley(cwd_pos, cwd_galley, p.muted);
+
+    if let Some(count) = terminal_count {
+        // Cyberpunk wants the neon glow; dark/light themes use a brighter
+        // accent on the active row and stay muted on inactive rows so the
+        // badge doesn't compete with the title.
+        let count_fg = if cyber_glow.is_some() {
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 230)
+        } else if active {
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 220)
+        } else {
+            p.muted
+        };
+        painter.text(
+            Pos2::new(close_rect.min.x - 6.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            count.to_string(),
+            FontId::monospace(11.0),
+            count_fg,
+        );
+    }
+
+    // Close button — always visible, slightly higher contrast on hover.
+    let close_resp = ui.interact(
+        close_rect,
+        egui::Id::new("sidebar_close").with(idx),
+        Sense::click(),
+    );
+    let close_hover = close_resp.hovered() || close_resp.is_pointer_button_down_on();
+    let close_fg = if close_hover {
+        p.tab_close_hover_text
+    } else {
+        p.tab_close
+    };
+    if close_hover {
+        let bg = if close_resp.is_pointer_button_down_on() {
+            p.tab_close_active_bg
+        } else {
+            p.tab_close_hover_bg
+        };
+        painter.rect_filled(close_rect, 3.0, bg);
+    }
+    painter.text(
+        close_rect.center(),
+        Align2::CENTER_CENTER,
+        "x",
+        FontId::monospace(11.0),
+        close_fg,
+    );
+    if close_resp.clicked() {
+        *close_idx = Some(idx);
+    }
+
+    // Suppress row-level click when the pointer is over the close button so
+    // closing a row doesn't first select it.
+    let pointer_on_close = ui
+        .ctx()
+        .input(|i| i.pointer.interact_pos())
+        .is_some_and(|pos| close_rect.contains(pos));
+    if response.clicked() && !pointer_on_close {
+        app.selected_workspace = idx;
+        *changed = true;
+    }
+    if response.double_clicked() && !pointer_on_close {
+        app.selected_workspace = idx;
+        begin_workspace_tab_rename(app, idx);
+        *changed = true;
+    }
+
+    // Right-click → reuse existing tab context menu (rename/colors/etc.).
+    response.context_menu(|ui| {
+        workspace_tab_context_menu(ui, app, idx, changed, p);
+        ui.separator();
+        if ui.button("Close workspace").clicked() {
+            *close_idx = Some(idx);
+            ui.close();
+        }
+    });
+}
+
+/// Renders the workspace switcher as a left-side panel. Always called when
+/// the placement is Sidebar — visibility is driven through `show_animated`
+/// so hide/show interpolates smoothly instead of snapping.
+fn render_workspace_sidebar(ctx: &egui::Context, app: &mut MultermUi, p: UiPalette) {
+    let mut changed = false;
+    let mut close_idx: Option<usize> = None;
+    let target_width = app
+        .workspace_sidebar_width
+        .clamp(WORKSPACE_SIDEBAR_MIN_WIDTH, WORKSPACE_SIDEBAR_MAX_WIDTH);
+
+    // Captured before the panel renders so a row click that switches workspaces
+    // still unfocuses the terminal of the workspace that *was* active at click
+    // time, rather than the newly selected one.
+    let prev_active_ws = app.selected_workspace;
+
+    // No frame stroke on the right edge — it would paint over the SidePanel's
+    // resize grip and make it visually unclear that the panel is draggable.
+    let resp = egui::SidePanel::left("workspace_sidebar")
+        .resizable(true)
+        .default_width(target_width)
+        .min_width(WORKSPACE_SIDEBAR_MIN_WIDTH)
+        .max_width(WORKSPACE_SIDEBAR_MAX_WIDTH)
+        .frame(
+            egui::Frame::default()
+                .fill(p.header_strip)
+                .inner_margin(Margin::same(0)),
+        )
+        .show_animated(ctx, app.workspace_sidebar_visible, |ui| {
+            ui.add_space(8.0);
+            // Cyberpunk theme borrows the terminal-glow cyan for accents.
+            let cyber_glow = p.terminal_glow;
+            // ── Search + filter + new (search/filter visual only) ──────────
+            egui::Frame::default()
+                .inner_margin(Margin::symmetric(8, 0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let avail = ui.available_width();
+                        let trailing_w = 28.0 + 28.0 + 8.0;
+                        let search_w = (avail - trailing_w).max(60.0);
+                        let btn_stroke_color = match cyber_glow {
+                            Some(glow) => Color32::from_rgba_unmultiplied(
+                                glow.r(), glow.g(), glow.b(), 130,
+                            ),
+                            None => p.border,
+                        };
+                        let btn_text_color = match cyber_glow {
+                            Some(glow) => Color32::from_rgba_unmultiplied(
+                                glow.r(), glow.g(), glow.b(), 230,
+                            ),
+                            None => p.muted,
+                        };
+                        let search_resp = ui.add_sized(
+                            Vec2::new(search_w, 28.0),
+                            egui::TextEdit::singleline(&mut app.workspace_sidebar_search)
+                                .hint_text("\u{1F50D}  Search tabs…"),
+                        );
+                        // Visual-only for now — never persists or filters.
+                        let _ = search_resp;
+                        let _ = ui.add_sized(
+                            Vec2::new(28.0, 28.0),
+                            egui::Button::new(
+                                RichText::new("\u{2261}")
+                                    .size(13.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(btn_text_color),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, btn_stroke_color))
+                            .corner_radius(4.0),
+                        );
+                        let plus_resp = ui.add_sized(
+                            Vec2::new(28.0, 28.0),
+                            egui::Button::new(
+                                RichText::new("+")
+                                    .size(14.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(btn_text_color),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, btn_stroke_color))
+                            .corner_radius(4.0),
+                        );
+                        if plus_resp.on_hover_text("New workspace").clicked() {
+                            app.add_workspace_inherit_selected();
+                            changed = true;
+                        }
+                    });
+                });
+
+            ui.add_space(6.0);
+            if let Some(glow) = cyber_glow {
+                // Glowing cyan divider — matches the in-pane cyberpunk separator.
+                let sep_h = 1.5_f32;
+                let (sep_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), sep_h + 4.0),
+                    Sense::hover(),
+                );
+                let y = sep_rect.center().y;
+                ui.painter().line_segment(
+                    [Pos2::new(sep_rect.min.x, y), Pos2::new(sep_rect.max.x, y)],
+                    Stroke::new(
+                        sep_h,
+                        Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), 80),
+                    ),
+                );
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(sep_rect.min.x + 2.0, y - 1.5),
+                        Pos2::new(sep_rect.max.x - 2.0, y - 1.5),
+                    ],
+                    Stroke::new(
+                        1.0,
+                        Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), 35),
+                    ),
+                );
+            } else {
+                ui.separator();
+            }
+            ui.add_space(6.0);
+
+            // ── Tab list ──────────────────────────────────────────────────
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::default()
+                        .inner_margin(Margin::symmetric(8, 0))
+                        .show(ui, |ui| {
+                            let n = app.workspaces.len();
+                            for idx in 0..n {
+                                workspace_sidebar_row(
+                                    ui,
+                                    app,
+                                    idx,
+                                    p,
+                                    &mut changed,
+                                    &mut close_idx,
+                                );
+                                ui.add_space(6.0);
+                            }
+                        });
+                });
+        });
+
+    // Any click landing inside the sidebar removes focus from whichever
+    // terminal was focused at the moment of the click — so further keystrokes
+    // don't get routed to the terminal once the user is interacting with the
+    // workspace switcher.
+    if let Some(inner) = resp.as_ref() {
+        let panel_rect = inner.response.rect;
+        let clicked_in_panel = ctx.input(|i| {
+            i.pointer.any_click()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|pos| panel_rect.contains(pos))
+        });
+        if clicked_in_panel {
+            if let Some(rt) = app.workspace_runtime.get_mut(prev_active_ws) {
+                rt.active_terminal = None;
+                rt.active_terminal_rect = None;
+            }
+        }
+    }
+
+    // Persist the user's resized width — but only when the panel is fully
+    // expanded. While `show_animated` is animating, the rendered rect is
+    // narrower than the user's intended width and we'd otherwise overwrite
+    // the saved value with the animation's intermediate sample.
+    if app.workspace_sidebar_visible {
+        if let Some(inner) = resp.as_ref() {
+            let rendered = inner.response.rect.width();
+            // Only treat differences > 4 px as a real user drag, so the
+            // final frame of an expand animation (which lands right on
+            // `target_width`) doesn't trigger a redundant save.
+            if rendered >= WORKSPACE_SIDEBAR_MIN_WIDTH
+                && (rendered - app.workspace_sidebar_width).abs() > 4.0
+            {
+                app.workspace_sidebar_width = rendered
+                    .clamp(WORKSPACE_SIDEBAR_MIN_WIDTH, WORKSPACE_SIDEBAR_MAX_WIDTH);
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(idx) = close_idx {
+        changed |= app.close_workspace_at(idx);
+    }
+
+    if changed {
+        app.next_workspace_index = compute_next_workspace_index(&app.workspaces);
+        save_workspace_state(app);
+    }
+}
+
 fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
     ui.set_width(200.0);
     egui::ScrollArea::vertical()
@@ -8318,6 +8823,37 @@ fn settings_menu(ui: &mut egui::Ui, app: &mut MultermUi, changed: &mut bool) {
                 *changed |= ui
                     .selectable_value(&mut app.ui_theme, UiTheme::Cyberpunk, "Cyberpunk")
                     .clicked();
+            });
+
+            // ── Workspace placement ───────────────────────────────────────────
+            // Switches workspace navigation between the top tab strip and a
+            // left-side vertical sidebar.
+            ui.separator();
+            ui.label("Workspace placement");
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_value(
+                        &mut app.workspace_placement,
+                        WorkspacePlacement::Tabbed,
+                        "Tabbed",
+                    )
+                    .clicked()
+                {
+                    *changed = true;
+                }
+                if ui
+                    .selectable_value(
+                        &mut app.workspace_placement,
+                        WorkspacePlacement::Sidebar,
+                        "Sidebar",
+                    )
+                    .clicked()
+                {
+                    // Reopen the sidebar when switching into sidebar mode so the
+                    // user immediately sees the panel they just enabled.
+                    app.workspace_sidebar_visible = true;
+                    *changed = true;
+                }
             });
 
             // ── Style ─────────────────────────────────────────────────────────
@@ -9073,6 +9609,11 @@ fn save_workspace_state(app: &mut MultermUi) {
         show_multerm_only_status: app.show_multerm_only_status,
         cyberpunk_settings: app.cyberpunk_settings,
         performance_mode: app.performance_mode,
+        workspace_placement: app.workspace_placement,
+        workspace_sidebar_visible: app.workspace_sidebar_visible,
+        workspace_sidebar_width: app
+            .workspace_sidebar_width
+            .clamp(WORKSPACE_SIDEBAR_MIN_WIDTH, WORKSPACE_SIDEBAR_MAX_WIDTH),
     };
 
     let path = workspace_state_path();
@@ -9524,6 +10065,44 @@ impl MultermUi {
         self.selected_workspace = idx;
         self.next_workspace_index = compute_next_workspace_index(&self.workspaces);
         self.ensure_workspace_runtime_slots();
+    }
+
+    /// Append a fresh workspace, inheriting working_dir / panel_layout / size
+    /// flags from the currently selected workspace. Selects the new tab.
+    fn add_workspace_inherit_selected(&mut self) {
+        let title = format!("Workspace {}", self.next_workspace_index);
+        let inherit_dir = self
+            .workspaces
+            .get(self.selected_workspace)
+            .map(|w| w.working_dir.clone())
+            .unwrap_or_else(default_working_dir);
+        let inherit_layout = self
+            .workspaces
+            .get(self.selected_workspace)
+            .map(|w| w.panel_layout)
+            .unwrap_or_default();
+        let sync = self
+            .workspaces
+            .get(self.selected_workspace)
+            .map(|w| w.sync_terminals_to_columns)
+            .unwrap_or(false);
+        let uniform = self
+            .workspaces
+            .get(self.selected_workspace)
+            .map(|w| w.uniform_equal_terminals)
+            .unwrap_or(false);
+        self.next_workspace_index += 1;
+        self.workspaces.push(WorkspaceTab {
+            title,
+            badge: None,
+            color_rgba: None,
+            working_dir: inherit_dir,
+            panel_layout: inherit_layout,
+            sync_terminals_to_columns: sync,
+            uniform_equal_terminals: uniform,
+        });
+        self.workspace_runtime.push(WorkspaceRuntime::default());
+        self.selected_workspace = self.workspaces.len() - 1;
     }
 
     fn close_workspace_at(&mut self, idx: usize) -> bool {
