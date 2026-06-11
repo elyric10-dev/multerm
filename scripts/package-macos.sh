@@ -28,6 +28,12 @@ if [[ -x "$BIN_TERM" ]]; then
 fi
 chmod +x "$APP_DIR/Contents/MacOS/"*
 
+# Ad-hoc sign so Gatekeeper is less likely to report the app as "damaged".
+# This is not Apple notarization — browsers still quarantine downloaded files.
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+fi
+
 if [[ -f "$ICON" ]]; then
   cp "$ICON" "$APP_DIR/Contents/Resources/AppIcon.png"
 fi
