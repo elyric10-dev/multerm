@@ -1162,7 +1162,7 @@ impl TerminalAgentKind {
         match command {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
+            "cursor-agent" | "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -2051,6 +2051,15 @@ fn new_terminal_context_menu(
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
         if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
             app.launch_cli_tool(ui.ctx(), None, "codex");
+        }
+        app.pending_context_terminal = None;
+        ui.close();
+    }
+    if is_cli_command_available("cursor-agent") && ui.button("New Cursor Agent").clicked() {
+        let spawn_pos = app.pending_terminal_spawn_pos.take();
+        let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
+        if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
+            app.launch_cli_tool(ui.ctx(), None, "cursor-agent");
         }
         app.pending_context_terminal = None;
         ui.close();
