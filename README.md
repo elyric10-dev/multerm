@@ -130,17 +130,33 @@ Each agent pane gets a distinct badge and icon. Terminals spawned through the da
 
 ## Downloads
 
-Pre-built binaries are published on [GitHub Releases](https://github.com/elyric10-dev/multerm/releases) when a version tag is pushed (e.g. `v0.1.0`).
+Pre-built binaries are published on [GitHub Releases](https://github.com/elyric10-dev/multerm/releases) when a version tag is pushed (e.g. `v0.1.2`).
 
 | Platform | Artifact | How to run |
 |----------|----------|------------|
-| **macOS** (Apple Silicon) | `Multerm-*-macos-arm64.zip` or `.dmg` | Open `Multerm.app` |
+| **macOS** (Apple Silicon) | `Multerm-*-macos-arm64.zip` | Extract, drag **Multerm.app** → **Applications** |
 | **Linux** (x86_64) | `multerm-*-linux-x86_64.tar.gz` | Extract, then `./bin/multerm-ui` |
 | **Windows** (x86_64) | `multerm-*-windows-x86_64.zip` | Extract, then `.\bin\multerm-ui.exe` |
 
-### macOS first launch
+### macOS install (unsigned builds)
 
-Release builds are not code-signed. On first open, macOS may block the app — right-click `Multerm.app` → **Open**, or allow it in **System Settings → Privacy & Security**.
+Release builds are **not** Apple code-signed or notarized. macOS Gatekeeper often shows **"Multerm is damaged and can't be opened"** after downloading — that message is misleading; the app is not corrupt, it is blocked because it came from the internet without a developer signature.
+
+**Recommended install steps:**
+
+1. Download and extract `Multerm-*-macos-arm64.zip`
+2. Drag **Multerm.app** into **Applications**
+3. Open **Terminal** and run:
+
+```bash
+xattr -cr /Applications/Multerm.app
+```
+
+4. Open **Multerm** from Applications (or right-click → **Open** the first time)
+
+**Alternative (no Terminal):** Right-click `Multerm.app` → **Open** → confirm **Open** in the dialog. If you still see "damaged", use the `xattr` command above — that removes the browser quarantine flag.
+
+To ship builds that open without these steps, you need an [Apple Developer account](https://developer.apple.com) ($99/year) for code signing and notarization.
 
 ### Windows notes
 
@@ -155,18 +171,18 @@ Multerm runs on Windows with the full workspace UI, session daemon, and GPU rend
 ```bash
 cargo build --release -p multerm-app --bins
 
-# macOS → .app + .zip (+ .dmg when hdiutil is available)
-./scripts/package-macos.sh v0.1.0
+# macOS → Multerm.app + .zip
+./scripts/package-macos.sh v0.1.2
 
 # Linux → .tar.gz
-./scripts/package-linux.sh v0.1.0
+./scripts/package-linux.sh v0.1.2
 ```
 
 On Windows (PowerShell):
 
 ```powershell
 cargo build --release -p multerm-app --bins
-.\scripts\package-windows.ps1 v0.1.0
+.\scripts\package-windows.ps1 v0.1.2
 ```
 
 Outputs land in `dist/`.
@@ -176,8 +192,8 @@ Outputs land in `dist/`.
 Push a version tag to trigger the release workflow:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 GitHub Actions builds macOS, Linux, and Windows packages and attaches them to the release automatically.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a macOS .app bundle (and optional .dmg) from release binaries.
+# Build a macOS .app bundle and .zip from release binaries (no .dmg).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -70,12 +70,17 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 PLIST
 
 ZIP="${STAGING}/Multerm-${VERSION}-macos-${ARCH}.zip"
-ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
-echo "Created ${ZIP}"
+BUNDLE_DIR="${STAGING}/Multerm-${VERSION}-macos-${ARCH}"
+rm -rf "$BUNDLE_DIR"
+mkdir -p "$BUNDLE_DIR"
+cp -R "$APP_DIR" "$BUNDLE_DIR/"
+cat > "${BUNDLE_DIR}/INSTALL.txt" <<TXT
+Multerm ${VERSION#v} (macOS ${ARCH})
 
-if command -v hdiutil >/dev/null 2>&1; then
-  DMG="${STAGING}/Multerm-${VERSION}-macos-${ARCH}.dmg"
-  rm -f "$DMG"
-  hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG" >/dev/null
-  echo "Created ${DMG}"
-fi
+1. Drag Multerm.app into Applications
+2. Run in Terminal:
+     xattr -cr /Applications/Multerm.app
+3. Open Multerm from Applications
+TXT
+ditto -c -k --sequesterRsrc --keepParent "$BUNDLE_DIR" "$ZIP"
+echo "Created ${ZIP}"
