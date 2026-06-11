@@ -16,6 +16,9 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT"
+authors = ["elyric10-dev"]
+description = "GPU-accelerated, workspace-first terminal for shells and AI coding agents"
 
 [workspace.dependencies]
 # Windowing / GPU

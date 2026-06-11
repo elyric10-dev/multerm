@@ -2,6 +2,9 @@
 name    = "multerm-input"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
 
 [dependencies]
 multerm-core = { workspace = true }
