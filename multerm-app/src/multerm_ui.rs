@@ -30,6 +30,7 @@ use sysinfo::{
 
 mod clipboard;
 mod daemon;
+mod git_changes;
 mod icon;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1127,6 +1128,8 @@ struct TerminalPane {
     last_autoscroll_caret_v: Option<(usize, usize)>,
     /// Per-pane animated border-light position; only updated while this pane is active.
     border_light_pos: Option<Pos2>,
+    /// Git paths attributed to this terminal session.
+    git: git_changes::TerminalGitSession,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1394,6 +1397,10 @@ struct MultermUi {
     workspace_sidebar_width: f32,
     /// Sidebar search input (currently visual only — does not filter the list).
     workspace_sidebar_search: String,
+    /// Filesystem watchers for git repos (debounced path batches).
+    git_repo_watchers: git_changes::GitRepoWatcherHub,
+    /// VS Code–style source control panel (per-terminal or all terminals).
+    git_changes_panel: Option<git_changes::GitChangesPanelState>,
 }
 
 struct WorkspaceRuntime {
@@ -1631,6 +1638,8 @@ impl Default for MultermUi {
                     .workspace_sidebar_width
                     .clamp(WORKSPACE_SIDEBAR_MIN_WIDTH, WORKSPACE_SIDEBAR_MAX_WIDTH),
                 workspace_sidebar_search: String::new(),
+                git_repo_watchers: git_changes::GitRepoWatcherHub::default(),
+                git_changes_panel: None,
             };
             // Pre-warm the daemon once before the restore loop so each pane's
             // connect_daemon() call finds it already running instead of blocking
@@ -1663,6 +1672,9 @@ impl Default for MultermUi {
                             (Some(x), Some(y)) => Some(Pos2::new(x.max(0.0), y.max(0.0))),
                             _ => None,
                         };
+                        if let Some(root) = &pane.git.repo_root {
+                            app.git_repo_watchers.ensure_watching(root);
+                        }
                         restored.push(pane);
                     }
                     if let Some(runtime) = app.workspace_runtime.get_mut(idx) {
@@ -1794,6 +1806,8 @@ impl Default for MultermUi {
             workspace_sidebar_visible: true,
             workspace_sidebar_width: WORKSPACE_SIDEBAR_DEFAULT_WIDTH,
             workspace_sidebar_search: String::new(),
+            git_repo_watchers: git_changes::GitRepoWatcherHub::default(),
+            git_changes_panel: None,
         }
     }
 }
@@ -1928,6 +1942,76 @@ fn usage_meter_row(
                 .color(p.text),
         );
     });
+}
+
+/// Unified diff view (VS Code inline style) inside a scroll area.
+fn paint_unified_diff(ui: &mut egui::Ui, lines: &[git_changes::DiffLine], p: UiPalette) {
+    const LINE_H: f32 = 18.0;
+    let removed_bg = Color32::from_rgba_unmultiplied(180, 60, 60, 55);
+    let added_bg = Color32::from_rgba_unmultiplied(60, 160, 90, 55);
+    let hunk_bg = Color32::from_rgba_unmultiplied(80, 120, 200, 40);
+    let font = FontId::monospace(11.0);
+    let row_w = ui.available_width().max(200.0);
+
+    if lines.is_empty() {
+        ui.label(RichText::new("(no diff)").color(p.muted).size(12.0));
+        return;
+    }
+
+    for line in lines {
+        let (bg, fg, prefix, gutter) = match line.kind {
+            git_changes::DiffLineKind::Add => (
+                added_bg,
+                Color32::from_rgb(140, 230, 160),
+                "+",
+                line.new_line
+                    .map(|n| format!("{n:>5}"))
+                    .unwrap_or_else(|| "     ".to_string()),
+            ),
+            git_changes::DiffLineKind::Remove => (
+                removed_bg,
+                Color32::from_rgb(255, 150, 150),
+                "-",
+                line.old_line
+                    .map(|n| format!("{n:>5}"))
+                    .unwrap_or_else(|| "     ".to_string()),
+            ),
+            git_changes::DiffLineKind::Hunk => (
+                hunk_bg,
+                p.tab_active_indicator.unwrap_or(p.muted),
+                "@",
+                "     ".to_string(),
+            ),
+            git_changes::DiffLineKind::Context => (
+                Color32::TRANSPARENT,
+                p.text,
+                " ",
+                match (line.old_line, line.new_line) {
+                    (Some(o), Some(n)) => format!("{o:>5} {n:>5}"),
+                    (Some(o), None) => format!("{o:>5}"),
+                    (None, Some(n)) => format!("     {n:>5}"),
+                    _ => "          ".to_string(),
+                },
+            ),
+        };
+
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, LINE_H), Sense::hover());
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, 0.0, bg);
+        }
+        let display = if line.kind == git_changes::DiffLineKind::Hunk {
+            line.text.clone()
+        } else {
+            format!("{gutter} {prefix} {}", line.text)
+        };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(6.0, 2.0),
+            Align2::LEFT_TOP,
+            display,
+            font.clone(),
+            fg,
+        );
+    }
 }
 
 fn new_terminal_context_menu(
@@ -2105,11 +2189,13 @@ impl eframe::App for MultermUi {
         let agent_icon_cursor = self.agent_icon_cursor.clone();
 
         self.drain_terminals();
+        self.poll_git_file_events();
         self.tick_workspace_terminal_spawn_notice();
         self.tick_uploaded_images_no_terminal_hint();
         self.tick_workspace_history_overlay();
         self.handle_keyboard_input(ctx);
         self.render_image_gallery(ctx, p);
+        self.render_git_changes_panel(ctx, p);
         self.color_picker_rendered_this_frame = false;
         self.refresh_system_status_if_due();
 
@@ -2435,6 +2521,7 @@ impl eframe::App for MultermUi {
 
                             let mut close_idx: Option<usize> = None;
                             let mut clicked_on_pane = false;
+                            let git_changes_action = std::cell::Cell::new(None::<(u64, bool)>);
                             let fullscreen_title_open = std::cell::Cell::new(None::<u64>);
                             let fullscreen_title_close = std::cell::Cell::new(None::<u64>);
                             {
@@ -3454,6 +3541,34 @@ impl eframe::App for MultermUi {
                                                             },
                                                         );
                                                         ui.advance_cursor_after_rect(row_rect);
+                                                        let pane_menu_resp = ui.interact(
+                                                            row_rect,
+                                                            ui.id().with(("pane_git_ctx", pane.id)),
+                                                            Sense::click(),
+                                                        );
+                                                        let pane_id = pane.id;
+                                                        egui::Popup::context_menu(&pane_menu_resp)
+                                                            .close_behavior(
+                                                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                            )
+                                                            .show(|ui| {
+                                                                if !git_changes::git_is_available() {
+                                                                    ui.label(
+                                                                        RichText::new("git not found on PATH")
+                                                                            .small()
+                                                                            .color(ui.visuals().warn_fg_color),
+                                                                    );
+                                                                    return;
+                                                                }
+                                                                if ui.button("View changes (this terminal)").clicked() {
+                                                                    git_changes_action.set(Some((pane_id, false)));
+                                                                    ui.close();
+                                                                }
+                                                                if ui.button("Commit changes (this terminal)…").clicked() {
+                                                                    git_changes_action.set(Some((pane_id, true)));
+                                                                    ui.close();
+                                                                }
+                                                            });
                                                         if header_fs.double_clicked()
                                                             || drag_header_double_fullscreen
                                                         {
@@ -3972,6 +4087,14 @@ impl eframe::App for MultermUi {
                             if let Some(pid) = fullscreen_title_open.get() {
                                 self.fullscreen_terminal_ids.insert(pid);
                             }
+                            if let Some((term_id, show_commit)) = git_changes_action.get() {
+                                let ws = self.selected_workspace;
+                                self.open_git_changes_panel(
+                                    ws,
+                                    git_changes::GitChangesScope::Terminal(term_id),
+                                    show_commit,
+                                );
+                            }
 
                             if let Some(idx) = close_idx {
                                 if let Some(runtime) = self.active_workspace_runtime_mut() {
@@ -4291,6 +4414,7 @@ impl MultermUi {
             .unwrap_or_else(default_working_dir);
         let workspace_number = selected_workspace + 1;
 
+        let mut git_watch_root = None;
         {
             let Some(runtime) = self.active_workspace_runtime_mut() else {
                 return false;
@@ -4397,6 +4521,7 @@ impl MultermUi {
                 )
             };
             pane.position = Some(position);
+            git_watch_root = pane.git.repo_root.clone();
             runtime.terminals.push(pane);
             runtime.selections.push(None);
             runtime.line_editors.push(LineEditor::new());
@@ -4405,9 +4530,500 @@ impl MultermUi {
                 .push(ScrollbackSearchPaneState::default());
             runtime.active_terminal = Some(runtime.terminals.len() - 1);
         }
+        if let Some(root) = git_watch_root {
+            self.git_repo_watchers.ensure_watching(&root);
+        }
         self.next_terminal_id = next_terminal_id + 1;
         save_workspace_state(self);
         true
+    }
+
+    fn refresh_terminal_git_for_scope(&mut self, workspace_idx: usize, scope: git_changes::GitChangesScope) {
+        let working_dir = self
+            .workspaces
+            .get(workspace_idx)
+            .map(|w| w.working_dir.clone())
+            .unwrap_or_else(default_working_dir);
+        let Some(runtime) = self.workspace_runtime.get_mut(workspace_idx) else {
+            return;
+        };
+        match scope {
+            git_changes::GitChangesScope::Terminal(id) => {
+                if let Some(t) = runtime.terminals.iter_mut().find(|t| t.id == id) {
+                    t.git.refresh_repo(&working_dir);
+                }
+            }
+            git_changes::GitChangesScope::AllTerminals => {
+                for t in &mut runtime.terminals {
+                    t.git.refresh_repo(&working_dir);
+                }
+            }
+        }
+    }
+
+    fn open_git_changes_panel(
+        &mut self,
+        workspace_idx: usize,
+        scope: git_changes::GitChangesScope,
+        show_commit_section: bool,
+    ) {
+        self.refresh_terminal_git_for_scope(workspace_idx, scope);
+        let selected = self
+            .git_changes_panel
+            .as_ref()
+            .and_then(|p| p.selected_path.clone());
+        self.git_changes_panel = Some(git_changes::GitChangesPanelState {
+            workspace_idx,
+            scope,
+            selected_path: selected,
+            commit_message: String::new(),
+            show_commit_section,
+            status_message: None,
+        });
+        let repo_root = self
+            .git_repo_for_scope(workspace_idx, scope);
+        if let Some(root) = repo_root {
+            self.git_repo_watchers.ensure_watching(&root);
+        }
+    }
+
+    fn git_repo_for_scope(
+        &self,
+        workspace_idx: usize,
+        scope: git_changes::GitChangesScope,
+    ) -> Option<PathBuf> {
+        let ws_dir = self
+            .workspaces
+            .get(workspace_idx)
+            .map(|w| w.working_dir.as_str())
+            .unwrap_or("");
+        let runtime = self.workspace_runtime.get(workspace_idx)?;
+        match scope {
+            git_changes::GitChangesScope::Terminal(id) => runtime
+                .terminals
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.git.repo_root.clone())
+                .or_else(|| git_changes::git_repo_root(ws_dir)),
+            git_changes::GitChangesScope::AllTerminals => runtime
+                .terminals
+                .iter()
+                .find_map(|t| t.git.repo_root.clone())
+                .or_else(|| git_changes::git_repo_root(ws_dir)),
+        }
+    }
+
+    fn poll_git_file_events(&mut self) {
+        let events = self.git_repo_watchers.drain_events();
+        for (repo_root, paths) in events {
+            for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+                let Some(ws_root) = git_changes::git_repo_root(&ws.working_dir) else {
+                    continue;
+                };
+                if ws_root != repo_root {
+                    continue;
+                }
+                let Some(runtime) = self.workspace_runtime.get_mut(ws_idx) else {
+                    continue;
+                };
+                let term_idx = runtime
+                    .active_terminal
+                    .filter(|i| *i < runtime.terminals.len());
+                let Some(term_idx) = term_idx else {
+                    continue;
+                };
+                for path in &paths {
+                    runtime.terminals[term_idx].git.note_path(path.clone());
+                }
+            }
+        }
+    }
+
+    fn git_paths_for_scope(
+        &self,
+        workspace_idx: usize,
+        scope: git_changes::GitChangesScope,
+    ) -> (
+        Option<PathBuf>,
+        Option<String>,
+        std::collections::HashSet<PathBuf>,
+    ) {
+        use std::collections::HashSet;
+        let ws_dir = self
+            .workspaces
+            .get(workspace_idx)
+            .map(|w| w.working_dir.as_str())
+            .unwrap_or("");
+        let Some(runtime) = self.workspace_runtime.get(workspace_idx) else {
+            return (git_changes::git_repo_root(ws_dir), None, HashSet::new());
+        };
+        let mut paths = HashSet::new();
+        let mut baseline = None;
+        let mut repo_root = git_changes::git_repo_root(ws_dir);
+        match scope {
+            git_changes::GitChangesScope::Terminal(id) => {
+                if let Some(t) = runtime.terminals.iter().find(|t| t.id == id) {
+                    repo_root = t
+                        .git
+                        .repo_root
+                        .clone()
+                        .or_else(|| git_changes::git_repo_root(ws_dir));
+                    baseline = t.git.baseline_head.clone();
+                    paths = t.git.touched_paths.clone();
+                    if paths.is_empty() {
+                        if let Some(repo) = repo_root.as_ref() {
+                            paths = git_changes::changed_paths_since_baseline(
+                                repo,
+                                baseline.as_deref(),
+                            );
+                        }
+                    }
+                }
+            }
+            git_changes::GitChangesScope::AllTerminals => {
+                for t in &runtime.terminals {
+                    paths.extend(t.git.touched_paths.iter().cloned());
+                    if baseline.is_none() {
+                        baseline = t.git.baseline_head.clone();
+                    }
+                    if repo_root.is_none() {
+                        repo_root = t.git.repo_root.clone();
+                    }
+                }
+                repo_root = repo_root.or_else(|| git_changes::git_repo_root(ws_dir));
+                if paths.is_empty() {
+                    if let Some(repo) = repo_root.as_ref() {
+                        paths = git_changes::changed_paths_since_baseline(
+                            repo,
+                            baseline.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+        (repo_root, baseline, paths)
+    }
+
+    fn clear_git_paths_after_commit(
+        &mut self,
+        workspace_idx: usize,
+        scope: git_changes::GitChangesScope,
+        committed: &[PathBuf],
+    ) {
+        let Some(repo) = self.git_repo_for_scope(workspace_idx, scope) else {
+            return;
+        };
+        let new_head = git_changes::git_head_at(&repo);
+        let Some(runtime) = self.workspace_runtime.get_mut(workspace_idx) else {
+            return;
+        };
+        match scope {
+            git_changes::GitChangesScope::Terminal(id) => {
+                for t in &mut runtime.terminals {
+                    if t.id != id {
+                        continue;
+                    }
+                    for p in committed {
+                        t.git.touched_paths.remove(p);
+                    }
+                    t.git.baseline_head = new_head.clone();
+                }
+            }
+            git_changes::GitChangesScope::AllTerminals => {
+                for t in &mut runtime.terminals {
+                    for p in committed {
+                        t.git.touched_paths.remove(p);
+                    }
+                    t.git.baseline_head = new_head.clone();
+                }
+            }
+        }
+    }
+
+    fn render_git_changes_panel(&mut self, ctx: &egui::Context, p: UiPalette) {
+        let Some(panel) = self.git_changes_panel.clone() else {
+            return;
+        };
+
+        let workspace_idx = panel.workspace_idx;
+        let scope = panel.scope;
+        let (repo_root, baseline_head, paths) = self.git_paths_for_scope(workspace_idx, scope);
+
+        let viewport = ctx.viewport_rect();
+        let margin = 36.0;
+        let modal_size = (viewport.size() - egui::vec2(margin * 2.0, margin * 2.0))
+            .max(egui::vec2(320.0, 240.0));
+        let modal_size = egui::vec2(modal_size.x.min(980.0), modal_size.y.min(720.0));
+        let modal_rect = egui::Rect::from_center_size(viewport.center(), modal_size);
+        let backdrop_scrim = image_gallery_modal_scrim(self.ui_theme, p);
+        let rim = p.terminal_border_active;
+        let panel_bg = p.popover_fill;
+        let mut close_panel = false;
+        let mut do_commit = false;
+        let mut refresh_selection: Option<Option<PathBuf>> = None;
+
+        let backdrop_id = egui::Id::new("git_changes_backdrop");
+        let backdrop_resp = egui::Area::new(backdrop_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(viewport.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(viewport.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, backdrop_scrim);
+                resp
+            });
+        if backdrop_resp.inner.clicked() {
+            close_panel = true;
+        }
+
+        let title = match scope {
+            git_changes::GitChangesScope::Terminal(id) => {
+                let name = self
+                    .workspace_runtime
+                    .get(workspace_idx)
+                    .and_then(|r| r.terminals.iter().find(|t| t.id == id))
+                    .map(|t| t.title.as_str())
+                    .unwrap_or("Terminal");
+                format!("Changes — {name}")
+            }
+            git_changes::GitChangesScope::AllTerminals => "Changes — all terminals".to_string(),
+        };
+
+        let Some(repo) = repo_root.clone() else {
+            egui::Area::new(egui::Id::new("git_changes_panel_err"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(modal_rect.min)
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(panel_bg)
+                        .stroke(Stroke::new(1.5, rim))
+                        .inner_margin(Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&title).strong());
+                            let ws_path = self
+                                .workspaces
+                                .get(workspace_idx)
+                                .map(|w| w.working_dir.as_str())
+                                .unwrap_or("(unknown)");
+                            ui.label(format!(
+                                "No git repository found for this terminal session.\n\nWorkspace folder: {ws_path}\n\nSet the workspace path (top bar) to your project root, or use a path inside a git repo."
+                            ));
+                            if ui.button("Close").clicked() {
+                                close_panel = true;
+                            }
+                        });
+                });
+            if close_panel {
+                self.git_changes_panel = None;
+            }
+            return;
+        };
+
+        let entries = git_changes::collect_entries_for_paths(
+            &repo,
+            baseline_head.as_deref(),
+            &paths,
+        );
+        let selected_path = panel
+            .selected_path
+            .clone()
+            .filter(|p| entries.iter().any(|e| &e.path == p))
+            .or_else(|| entries.first().map(|e| e.path.clone()));
+
+        let diff_text = selected_path
+            .as_ref()
+            .map(|rel| {
+                git_changes::git_diff_for_file(&repo, baseline_head.as_deref(), rel)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let diff_lines = git_changes::parse_unified_diff(&diff_text);
+
+        let panel_id = egui::Id::new("git_changes_panel");
+        let mut commit_message = panel.commit_message.clone();
+        let show_commit = panel.show_commit_section;
+        let mut status_message = panel.status_message.clone();
+
+        egui::Area::new(panel_id)
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_rect.min)
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(panel_bg)
+                    .stroke(Stroke::new(1.5, rim))
+                    .corner_radius(8.0)
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        let panel_inner = egui::vec2(modal_size.x - 24.0, modal_size.y - 24.0);
+                        ui.set_min_size(panel_inner);
+                        ui.set_max_size(panel_inner);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&title).size(15.0).strong().color(p.text));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("✕").clicked() {
+                                    close_panel = true;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        if paths.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "No changes since this terminal session started, and no files were tracked yet. Make edits with this terminal focused, then open this view again.",
+                                )
+                                .color(p.muted)
+                                .size(12.0),
+                            );
+                        } else if matches!(scope, git_changes::GitChangesScope::Terminal(_)) {
+                            ui.label(
+                                RichText::new(
+                                    "Showing changes since this terminal session started (and files touched while it was focused).",
+                                )
+                                .color(p.muted)
+                                .size(11.0),
+                            );
+                        }
+                        if let Some(msg) = &status_message {
+                            ui.label(RichText::new(msg).size(12.0).color(p.tab_active_indicator.unwrap_or(rim)));
+                        }
+
+                        let commit_block_h = if show_commit { 108.0 } else { 0.0 };
+                        let body_h = (ui.available_height() - commit_block_h).max(160.0);
+                        let list_w = 200.0;
+
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(body_h);
+                            ui.set_max_height(body_h);
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(list_w, body_h),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("Changed files")
+                                            .small()
+                                            .strong()
+                                            .color(p.muted),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false; 2])
+                                        .show(ui, |ui| {
+                                            ui.set_width(list_w - 8.0);
+                                            if entries.is_empty() {
+                                                ui.label(RichText::new("(none)").small().color(p.muted));
+                                            }
+                                            for entry in &entries {
+                                                let selected = selected_path.as_deref()
+                                                    == Some(entry.path.as_path());
+                                                let label = format!(
+                                                    "{}  {}",
+                                                    entry.status.label(),
+                                                    entry.path.display()
+                                                );
+                                                if ui
+                                                    .selectable_label(
+                                                        selected,
+                                                        RichText::new(label)
+                                                            .family(FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(entry.status.color()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    refresh_selection =
+                                                        Some(Some(entry.path.clone()));
+                                                }
+                                            }
+                                        });
+                                },
+                            );
+
+                            ui.separator();
+
+                            let diff_w = (panel_inner.x - list_w - 24.0).max(200.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(diff_w, body_h),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    if let Some(rel) = &selected_path {
+                                        ui.label(
+                                            RichText::new(rel.display().to_string())
+                                                .family(FontFamily::Monospace)
+                                                .strong()
+                                                .color(p.text),
+                                        );
+                                    }
+                                    let diff_scroll_h = ui.available_height().max(80.0);
+                                    egui::ScrollArea::both()
+                                        .id_salt("git_diff_body")
+                                        .auto_shrink([false; 2])
+                                        .max_height(diff_scroll_h)
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(diff_w - 16.0);
+                                            paint_unified_diff(ui, &diff_lines, p);
+                                        });
+                                },
+                            );
+                        });
+
+                        if show_commit {
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(RichText::new("Commit message").small().strong());
+                            ui.add(
+                                TextEdit::multiline(&mut commit_message)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(2)
+                                    .hint_text("Describe changes made in this terminal…"),
+                            );
+                            ui.horizontal(|ui| {
+                                let can_commit = !entries.is_empty();
+                                if ui
+                                    .add_enabled(can_commit, egui::Button::new("Commit"))
+                                    .clicked()
+                                {
+                                    do_commit = true;
+                                }
+                            });
+                        }
+                    });
+            });
+
+        if let Some(sel) = refresh_selection {
+            if let Some(p) = self.git_changes_panel.as_mut() {
+                p.selected_path = sel;
+            }
+        }
+        if let Some(p) = self.git_changes_panel.as_mut() {
+            p.commit_message = commit_message;
+            p.status_message = status_message;
+        }
+        if do_commit {
+            let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+            let msg = self
+                .git_changes_panel
+                .as_ref()
+                .map(|p| p.commit_message.clone())
+                .unwrap_or_default();
+            match git_changes::git_commit_paths(&repo, &paths, &msg) {
+                Ok(()) => {
+                    self.clear_git_paths_after_commit(workspace_idx, scope, &paths);
+                    status_message = Some(format!("Committed {} file(s).", paths.len()));
+                    if let Some(p) = self.git_changes_panel.as_mut() {
+                        p.status_message = status_message.clone();
+                        p.commit_message.clear();
+                    }
+                }
+                Err(e) => {
+                    if let Some(p) = self.git_changes_panel.as_mut() {
+                        p.status_message = Some(e);
+                    }
+                }
+            }
+        }
+        if close_panel {
+            self.git_changes_panel = None;
+        }
     }
 
     fn tick_workspace_terminal_spawn_notice(&mut self) {
@@ -6465,6 +7081,7 @@ fn spawn_terminal_pane(
                                 pending_initial_scroll_to_bottom: true,
                                 last_autoscroll_caret_v: None,
                                 border_light_pos: None,
+                                git: git_changes::TerminalGitSession::begin(working_dir, None),
                             };
                         }
                     }
@@ -6486,6 +7103,7 @@ fn spawn_terminal_pane(
         None,
     )
     .expect("spawn terminal pty");
+    let shell_pid = pty.shell_pid;
 
     TerminalPane {
         id: next_terminal_id,
@@ -6499,6 +7117,7 @@ fn spawn_terminal_pane(
         pending_initial_scroll_to_bottom: true,
         last_autoscroll_caret_v: None,
         border_light_pos: None,
+        git: git_changes::TerminalGitSession::begin(working_dir, shell_pid),
     }
 }
 

@@ -15,6 +15,9 @@ pub struct PtyHandle {
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty>,
     pub stop_flag: Arc<AtomicBool>,
+    /// Shell process id when available (keeps the child alive).
+    pub shell_pid: Option<u32>,
+    _child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
 impl PtyHandle {
@@ -82,7 +85,8 @@ pub fn spawn_pty(
     if let Some(dir) = working_dir {
         cmd.cwd(dir);
     }
-    let _child = pair.slave.spawn_command(cmd).context("spawn_command")?;
+    let child = pair.slave.spawn_command(cmd).context("spawn_command")?;
+    let shell_pid = child.process_id();
 
     // Close slave side in this process after spawn
     drop(pair.slave);
@@ -120,5 +124,7 @@ pub fn spawn_pty(
         writer: Arc::new(Mutex::new(writer)),
         master: pair.master,
         stop_flag,
+        shell_pid,
+        _child: Some(child),
     })
 }
