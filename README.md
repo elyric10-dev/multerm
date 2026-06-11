@@ -128,13 +128,69 @@ Each agent pane gets a distinct badge and icon. Terminals spawned through the da
 
 ---
 
+## Downloads
+
+Pre-built binaries are published on [GitHub Releases](https://github.com/elyric10-dev/multerm/releases) when a version tag is pushed (e.g. `v0.1.0`).
+
+| Platform | Artifact | How to run |
+|----------|----------|------------|
+| **macOS** (Apple Silicon) | `Multerm-*-macos-arm64.zip` or `.dmg` | Open `Multerm.app` |
+| **Linux** (x86_64) | `multerm-*-linux-x86_64.tar.gz` | Extract, then `./bin/multerm-ui` |
+| **Windows** (x86_64) | `multerm-*-windows-x86_64.zip` | Extract, then `.\bin\multerm-ui.exe` |
+
+### macOS first launch
+
+Release builds are not code-signed. On first open, macOS may block the app — right-click `Multerm.app` → **Open**, or allow it in **System Settings → Privacy & Security**.
+
+### Windows notes
+
+Multerm runs on Windows with the full workspace UI, session daemon, and GPU rendering (DirectX 12 via wgpu). A few Unix-centric features are unavailable or differ:
+
+- **tmux integration** — not used on Windows (plain `cmd.exe` / PowerShell PTY sessions instead)
+- **Config path** — `%LOCALAPPDATA%\multerm\` (not `~/.multerm`)
+- **SmartScreen** — unsigned builds may show a one-time warning on first launch
+
+### Build a release package locally
+
+```bash
+cargo build --release -p multerm-app --bins
+
+# macOS → .app + .zip (+ .dmg when hdiutil is available)
+./scripts/package-macos.sh v0.1.0
+
+# Linux → .tar.gz
+./scripts/package-linux.sh v0.1.0
+```
+
+On Windows (PowerShell):
+
+```powershell
+cargo build --release -p multerm-app --bins
+.\scripts\package-windows.ps1 v0.1.0
+```
+
+Outputs land in `dist/`.
+
+### Publish a release (maintainers)
+
+Push a version tag to trigger the release workflow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions builds macOS, Linux, and Windows packages and attaches them to the release automatically.
+
+---
+
 ## Getting started
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (2021 edition)
-- A GPU with wgpu support
-- macOS or Linux recommended (Windows supported for the daemon path)
+- A GPU with wgpu support (Vulkan, Metal, or DirectX 12)
+- macOS, Linux, or Windows
 
 Optional but useful:
 
@@ -220,7 +276,10 @@ Environment variables:
 | `MULTERM_TMUX_AUTO_INSTALL` | `0` | Set to `1` to attempt `brew install tmux` on macOS when missing |
 | `RUST_LOG` | `multerm=debug` | Tracing filter (set before launch) |
 
-Persistent UI state: `~/.multerm/multerm-ui-workspaces.json`
+Persistent UI state:
+
+- **Unix:** `~/.multerm/multerm-ui-workspaces.json`
+- **Windows:** `%LOCALAPPDATA%\multerm\multerm-ui-workspaces.json`
 
 ---
 

@@ -142,13 +142,11 @@ pub struct GitChangesPanelCache {
 pub fn resolve_working_dir(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     let expanded = if trimmed == "~" {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("~"))
+        crate::platform::home_dir().unwrap_or_else(|| PathBuf::from("~"))
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        std::env::var("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|_| PathBuf::from(trimmed))
+        crate::platform::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(trimmed))
     } else {
         PathBuf::from(trimmed)
     };

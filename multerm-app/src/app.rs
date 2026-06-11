@@ -403,7 +403,7 @@ exec "${{SHELL:-/bin/zsh}}" -i
             let _ = proxy.send_event(UserEvent::PtyData);
         });
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let shell = crate::platform::default_shell();
         let pty = spawn_pty(&shell, rows as u16, cols as u16, tx, wake_up, None, None)
             .expect("spawn_pty");
 

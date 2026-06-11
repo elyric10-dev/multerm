@@ -81,18 +81,7 @@ fn write_frame(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> std::i
 }
 
 fn daemon_base_dir() -> anyhow::Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        let base = std::env::var("LOCALAPPDATA")
-            .or_else(|_| std::env::var("APPDATA"))
-            .unwrap_or_else(|_| ".".into());
-        Ok(PathBuf::from(base).join("multerm"))
-    }
-    #[cfg(not(windows))]
-    {
-        let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Ok(PathBuf::from(base).join(".multerm"))
-    }
+    Ok(crate::platform::data_dir())
 }
 
 pub fn daemon_port_file_path() -> anyhow::Result<PathBuf> {
@@ -100,14 +89,7 @@ pub fn daemon_port_file_path() -> anyhow::Result<PathBuf> {
 }
 
 fn default_shell() -> String {
-    #[cfg(windows)]
-    {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
-    }
+    crate::platform::default_shell()
 }
 
 fn parse_attach_request(payload: &[u8]) -> anyhow::Result<(String, u16, u16, Option<String>)> {

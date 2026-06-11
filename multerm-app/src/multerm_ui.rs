@@ -32,6 +32,7 @@ mod clipboard;
 mod daemon;
 mod git_changes;
 mod icon;
+mod platform;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -2055,7 +2056,7 @@ fn new_terminal_context_menu(
         app.pending_context_terminal = None;
         ui.close();
     }
-    if is_cli_command_available("cursor-agent") && ui.button("New Cursor Agent").clicked() {
+    if platform::is_command_available("cursor-agent") && ui.button("New Cursor Agent").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
         if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
@@ -2064,7 +2065,7 @@ fn new_terminal_context_menu(
         app.pending_context_terminal = None;
         ui.close();
     }
-    if is_cli_command_available("gemini") && ui.button("New Gemini").clicked() {
+    if platform::is_command_available("gemini") && ui.button("New Gemini").clicked() {
         let spawn_pos = app.pending_terminal_spawn_pos.take();
         let anchor_terminal = app.pending_context_terminal.take().or(target_terminal);
         if app.add_terminal(ui.ctx(), spawn_pos, anchor_terminal) {
@@ -7003,21 +7004,6 @@ impl MultermUi {
     }
 }
 
-fn is_cli_command_available(command: &str) -> bool {
-    if !command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return false;
-    }
-
-    Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn read_frame_tcp(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header)?;
@@ -7169,7 +7155,7 @@ fn spawn_terminal_pane(
     }
 
     // Fallback: local PTY (no persistence across restarts).
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = platform::default_shell();
     let wake_up: Box<dyn Fn() + Send + 'static> = Box::new(|| {});
     let pty = spawn_pty(
         &shell,
@@ -9844,16 +9830,7 @@ fn expand_tilde_in_working_dir_input(raw: &str) -> String {
     if t.is_empty() {
         return String::new();
     }
-    if t == "~" {
-        return std::env::var("HOME").unwrap_or_default();
-    }
-    if let Some(rest) = t.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME") {
-            let h = h.trim_end_matches('/');
-            return format!("{h}/{rest}");
-        }
-    }
-    t.to_string()
+    platform::expand_tilde(t)
 }
 
 /// Resolve `~`, join relative paths to the process cwd, for spawn and validation (matches user intent).
@@ -10235,12 +10212,7 @@ fn directory_path_bar(ui: &mut egui::Ui, app: &mut MultermUi, p: UiPalette) {
 }
 
 fn workspace_state_path() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".multerm")
-            .join("multerm-ui-workspaces.json");
-    }
-    PathBuf::from(".multerm-ui-workspaces.json")
+    platform::data_dir().join("multerm-ui-workspaces.json")
 }
 
 fn save_workspace_state(app: &mut MultermUi) {
