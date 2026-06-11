@@ -124,6 +124,20 @@ pub struct GitChangesPanelState {
     pub status_message: Option<String>,
 }
 
+/// Cached git lookup results so the modal does not re-shell to `git` every
+/// frame (subprocess-per-frame causes noticeable FPS drops while it's open).
+#[derive(Clone, Default)]
+pub struct GitChangesPanelCache {
+    pub workspace_idx: usize,
+    pub scope: Option<GitChangesScope>,
+    pub repo_root: Option<PathBuf>,
+    pub baseline_head: Option<String>,
+    pub paths: HashSet<PathBuf>,
+    pub entries: Vec<GitFileEntry>,
+    pub diff_path: Option<PathBuf>,
+    pub diff_lines: Vec<DiffLine>,
+}
+
 /// Expand `~` and resolve relative paths the same way workspace spawn does.
 pub fn resolve_working_dir(raw: &str) -> PathBuf {
     let trimmed = raw.trim();

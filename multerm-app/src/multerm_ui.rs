@@ -1401,6 +1401,12 @@ struct MultermUi {
     git_repo_watchers: git_changes::GitRepoWatcherHub,
     /// VS Code–style source control panel (per-terminal or all terminals).
     git_changes_panel: Option<git_changes::GitChangesPanelState>,
+    /// Frame cache for the changes panel — refreshed on open, on selection
+    /// change, on filesystem events, and after commits. Avoids re-shelling
+    /// out to `git` every frame while the modal is up.
+    git_changes_cache: Option<git_changes::GitChangesPanelCache>,
+    /// When true, the cache will be rebuilt on the next render.
+    git_changes_cache_dirty: bool,
 }
 
 struct WorkspaceRuntime {
@@ -1640,6 +1646,8 @@ impl Default for MultermUi {
                 workspace_sidebar_search: String::new(),
                 git_repo_watchers: git_changes::GitRepoWatcherHub::default(),
                 git_changes_panel: None,
+                git_changes_cache: None,
+                git_changes_cache_dirty: false,
             };
             // Pre-warm the daemon once before the restore loop so each pane's
             // connect_daemon() call finds it already running instead of blocking
@@ -1808,6 +1816,8 @@ impl Default for MultermUi {
             workspace_sidebar_search: String::new(),
             git_repo_watchers: git_changes::GitRepoWatcherHub::default(),
             git_changes_panel: None,
+            git_changes_cache: None,
+            git_changes_cache_dirty: false,
         }
     }
 }
@@ -3541,13 +3551,13 @@ impl eframe::App for MultermUi {
                                                             },
                                                         );
                                                         ui.advance_cursor_after_rect(row_rect);
-                                                        let pane_menu_resp = ui.interact(
-                                                            row_rect,
-                                                            ui.id().with(("pane_git_ctx", pane.id)),
-                                                            Sense::click(),
-                                                        );
+                                                        // Attach the right-click menu to the existing `header_fs`
+                                                        // response (registered *before* the close button is painted),
+                                                        // so the `×` button still receives primary clicks. A second
+                                                        // `ui.interact()` over `row_rect` here would be the topmost
+                                                        // widget in egui's hit-test order and swallow them.
                                                         let pane_id = pane.id;
-                                                        egui::Popup::context_menu(&pane_menu_resp)
+                                                        egui::Popup::context_menu(&header_fs)
                                                             .close_behavior(
                                                                 egui::PopupCloseBehavior::CloseOnClickOutside,
                                                             )
@@ -4580,6 +4590,8 @@ impl MultermUi {
             show_commit_section,
             status_message: None,
         });
+        self.git_changes_cache = None;
+        self.git_changes_cache_dirty = true;
         let repo_root = self
             .git_repo_for_scope(workspace_idx, scope);
         if let Some(root) = repo_root {
@@ -4615,7 +4627,14 @@ impl MultermUi {
 
     fn poll_git_file_events(&mut self) {
         let events = self.git_repo_watchers.drain_events();
+        let panel_repo = self
+            .git_changes_panel
+            .as_ref()
+            .and_then(|p| self.git_repo_for_scope(p.workspace_idx, p.scope));
         for (repo_root, paths) in events {
+            if panel_repo.as_ref() == Some(&repo_root) {
+                self.git_changes_cache_dirty = true;
+            }
             for (ws_idx, ws) in self.workspaces.iter().enumerate() {
                 let Some(ws_root) = git_changes::git_repo_root(&ws.working_dir) else {
                     continue;
@@ -4670,14 +4689,6 @@ impl MultermUi {
                         .or_else(|| git_changes::git_repo_root(ws_dir));
                     baseline = t.git.baseline_head.clone();
                     paths = t.git.touched_paths.clone();
-                    if paths.is_empty() {
-                        if let Some(repo) = repo_root.as_ref() {
-                            paths = git_changes::changed_paths_since_baseline(
-                                repo,
-                                baseline.as_deref(),
-                            );
-                        }
-                    }
                 }
             }
             git_changes::GitChangesScope::AllTerminals => {
@@ -4747,7 +4758,50 @@ impl MultermUi {
 
         let workspace_idx = panel.workspace_idx;
         let scope = panel.scope;
-        let (repo_root, baseline_head, paths) = self.git_paths_for_scope(workspace_idx, scope);
+
+        // Invalidate cache if the panel switched workspace or scope.
+        if let Some(cache) = self.git_changes_cache.as_ref() {
+            if cache.workspace_idx != workspace_idx || cache.scope != Some(scope) {
+                self.git_changes_cache_dirty = true;
+            }
+        } else {
+            self.git_changes_cache_dirty = true;
+        }
+
+        if self.git_changes_cache_dirty {
+            let (repo_root, baseline_head, paths) =
+                self.git_paths_for_scope(workspace_idx, scope);
+            let entries = repo_root
+                .as_ref()
+                .map(|repo| {
+                    git_changes::collect_entries_for_paths(
+                        repo,
+                        baseline_head.as_deref(),
+                        &paths,
+                    )
+                })
+                .unwrap_or_default();
+            self.git_changes_cache = Some(git_changes::GitChangesPanelCache {
+                workspace_idx,
+                scope: Some(scope),
+                repo_root,
+                baseline_head,
+                paths,
+                entries,
+                diff_path: None,
+                diff_lines: Vec::new(),
+            });
+            self.git_changes_cache_dirty = false;
+        }
+
+        let (repo_root, baseline_head, paths) = {
+            let cache = self.git_changes_cache.as_ref().expect("cache built above");
+            (
+                cache.repo_root.clone(),
+                cache.baseline_head.clone(),
+                cache.paths.clone(),
+            )
+        };
 
         let viewport = ctx.viewport_rect();
         let margin = 36.0;
@@ -4814,29 +4868,42 @@ impl MultermUi {
                 });
             if close_panel {
                 self.git_changes_panel = None;
+                self.git_changes_cache = None;
             }
             return;
         };
 
-        let entries = git_changes::collect_entries_for_paths(
-            &repo,
-            baseline_head.as_deref(),
-            &paths,
-        );
+        let entries: Vec<git_changes::GitFileEntry> = self
+            .git_changes_cache
+            .as_ref()
+            .map(|c| c.entries.clone())
+            .unwrap_or_default();
         let selected_path = panel
             .selected_path
             .clone()
             .filter(|p| entries.iter().any(|e| &e.path == p))
             .or_else(|| entries.first().map(|e| e.path.clone()));
 
-        let diff_text = selected_path
+        // Only re-run `git diff` when the selected file actually changed.
+        if let Some(cache) = self.git_changes_cache.as_mut() {
+            if cache.diff_path != selected_path {
+                cache.diff_lines = match selected_path.as_ref() {
+                    Some(rel) => {
+                        let text =
+                            git_changes::git_diff_for_file(&repo, baseline_head.as_deref(), rel)
+                                .unwrap_or_default();
+                        git_changes::parse_unified_diff(&text)
+                    }
+                    None => Vec::new(),
+                };
+                cache.diff_path = selected_path.clone();
+            }
+        }
+        let diff_lines: Vec<git_changes::DiffLine> = self
+            .git_changes_cache
             .as_ref()
-            .map(|rel| {
-                git_changes::git_diff_for_file(&repo, baseline_head.as_deref(), rel)
-                    .unwrap_or_default()
-            })
+            .map(|c| c.diff_lines.clone())
             .unwrap_or_default();
-        let diff_lines = git_changes::parse_unified_diff(&diff_text);
 
         let panel_id = egui::Id::new("git_changes_panel");
         let mut commit_message = panel.commit_message.clone();
@@ -5008,6 +5075,7 @@ impl MultermUi {
             match git_changes::git_commit_paths(&repo, &paths, &msg) {
                 Ok(()) => {
                     self.clear_git_paths_after_commit(workspace_idx, scope, &paths);
+                    self.git_changes_cache_dirty = true;
                     status_message = Some(format!("Committed {} file(s).", paths.len()));
                     if let Some(p) = self.git_changes_panel.as_mut() {
                         p.status_message = status_message.clone();
@@ -5023,6 +5091,7 @@ impl MultermUi {
         }
         if close_panel {
             self.git_changes_panel = None;
+            self.git_changes_cache = None;
         }
     }
 
